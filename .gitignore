@@ -1,0 +1,11 @@
+/node_modules/
+/composer/
+/build/
+/.php-cs-fixer.cache
+/tests/.phpunit.result.cache
+
+# Playwright E2E
+tests/e2e/.auth/
+test-results/
+playwright-report/
+playwright/.cache/

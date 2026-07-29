@@ -1,0 +1,42 @@
+<?xml version="1.0"?>
+<!--
+  - SPDX-License-Identifier: AGPL-3.0-or-later
+-->
+<info xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	  xsi:noNamespaceSchemaLocation="https://apps.nextcloud.com/schema/apps/info.xsd">
+	<id>music_radio</id>
+	<name>Music Radio</name>
+	<summary>Synchronized radio channels built from your own music</summary>
+	<description><![CDATA[
+Music Radio turns your Nextcloud files into radio stations.
+
+Create a **channel**, fill it with audio files from your Files app, and hit play. Everyone tuned in
+hears the same track at the same moment — the channel owner is the DJ, listeners just listen.
+
+- **Synchronized playback.** A server-authoritative timeline keeps every listener in sync, without
+  needing a streaming server.
+- **Contributors, not co-DJs.** Share a channel and grant "add tracks" separately from playback
+  control, so people can queue up music without hijacking what is playing.
+- **Share it your way.** Users, groups, teams, or a public link with an optional password and
+  expiry date.
+	]]></description>
+	<version>0.5.0</version>
+	<licence>agpl</licence>
+	<author>Jochen Roth</author>
+	<namespace>MusicRadio</namespace>
+	<category>multimedia</category>
+	<category>social</category>
+	<bugs>https://github.com/rothjochen/music_radio/issues</bugs>
+	<dependencies>
+		<nextcloud min-version="33" max-version="34"/>
+	</dependencies>
+	<navigations>
+		<navigation>
+			<id>music_radio</id>
+			<name>Music Radio</name>
+			<route>music_radio.page.index</route>
+			<icon>app.svg</icon>
+			<order>10</order>
+		</navigation>
+	</navigations>
+</info>

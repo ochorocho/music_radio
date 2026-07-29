@@ -1,0 +1,23 @@
+parameters:
+	level: 5
+	paths:
+		- lib
+	scanDirectories:
+		# The nextcloud/ocp package ships the OCP/NCU stubs without an autoloader.
+		- composer/nextcloud/ocp/OCP
+		- composer/nextcloud/ocp/NCU
+	ignoreErrors:
+		# Migrations call straight onto Doctrine's schema objects, which OCP's
+		# ISchemaWrapper returns without nextcloud/ocp depending on doctrine/dbal.
+		#
+		# Do NOT "fix" this by adding doctrine/dbal to require-dev. Nextcloud
+		# auto-requires <app>/composer/autoload.php, so anything installed there —
+		# dev dependencies included — is loaded into the server at runtime. A
+		# doctrine/dbal that does not match the version Nextcloud bundles (3.x as of
+		# NC 33) shadows core's copy and breaks the whole instance: it took out login
+		# server-wide with a TypeError deep inside core's PublicKeyTokenMapper.
+		#
+		# The classes are real at runtime; only phpstan cannot see them.
+		-
+			identifier: class.notFound
+			path: lib/Migration/*

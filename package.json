@@ -1,0 +1,44 @@
+{
+	"name": "music_radio",
+	"version": "0.5.0",
+	"description": "Synchronized radio channels built from your own music",
+	"type": "module",
+	"scripts": {
+		"build": "NODE_ENV=production vite --mode production build",
+		"dev": "NODE_ENV=development vite --mode development build",
+		"watch": "NODE_ENV=development vite --mode development build --watch",
+		"test:e2e": "playwright test"
+	},
+	"author": "Jochen Roth",
+	"license": "AGPL-3.0-or-later",
+	"browserslist": [
+		"extends @nextcloud/browserslist-config"
+	],
+	"engines": {
+		"node": "^20 || ^22 || ^24",
+		"npm": "^10 || ^11"
+	},
+	"dependencies": {
+		"@nextcloud/auth": "^2.4.0",
+		"@nextcloud/axios": "^2.1.0",
+		"@nextcloud/dialogs": "^7.0.0",
+		"@nextcloud/initial-state": "^3.0.0",
+		"@nextcloud/l10n": "^3.1.0",
+		"@nextcloud/router": "^3.0.0",
+		"@nextcloud/vue": "^9.0.0-rc.2",
+		"vue": "^3.5.17",
+		"vue-material-design-icons": "^5.1.2"
+	},
+	"devDependencies": {
+		"@axe-core/playwright": "^4.12.1",
+		"@nextcloud/babel-config": "^1.0.0",
+		"@nextcloud/browserslist-config": "^3.0.0",
+		"@nextcloud/vite-config": "^2.3.5",
+		"@ochorocho/playwright-db-connector": "^0.0.4",
+		"@playwright/test": "1.61.1",
+		"@types/node": "^22.0.0",
+		"axe-core": "^4.12.1",
+		"mysql2": "^3.23.0",
+		"typescript": "~5.5.0"
+	}
+}
