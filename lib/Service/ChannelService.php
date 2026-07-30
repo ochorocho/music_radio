@@ -10,6 +10,7 @@ namespace OCA\MusicRadio\Service;
 
 use OCA\MusicRadio\Db\Channel;
 use OCA\MusicRadio\Db\ChannelMapper;
+use OCA\MusicRadio\Db\ImportMapper;
 use OCA\MusicRadio\Db\ShareMapper;
 use OCA\MusicRadio\Db\TrackMapper;
 use OCA\MusicRadio\Exception\MusicRadioException;
@@ -29,6 +30,7 @@ class ChannelService {
 		private ChannelMapper $channelMapper,
 		private TrackMapper $trackMapper,
 		private ShareMapper $shareMapper,
+		private ImportMapper $importMapper,
 		private PermissionService $permissionService,
 		private Clock $clock,
 		private IDBConnection $db,
@@ -143,6 +145,9 @@ class ChannelService {
 		try {
 			$this->trackMapper->deleteAllForChannel($channel->getId());
 			$this->shareMapper->deleteAllForChannel($channel->getId());
+			// An import still running will find its channel gone and give up; removing the
+			// rows here keeps the queue from carrying work for a channel nobody can see.
+			$this->importMapper->deleteAllForChannel($channel->getId());
 			$this->channelMapper->delete($channel);
 			$this->db->commit();
 		} catch (\Throwable $e) {

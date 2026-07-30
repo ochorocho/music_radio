@@ -51,6 +51,7 @@
 				v-else-if="selectedChannel"
 				:key="selectedChannel.id"
 				:channel="selectedChannel"
+				:initial-import-capabilities="importCapabilities"
 				@updated="onChannelUpdated"
 				@deleted="onChannelDeleted" />
 
@@ -90,6 +91,8 @@ import PlusIcon from 'vue-material-design-icons/Plus.vue'
 import RadioIcon from 'vue-material-design-icons/Radio.vue'
 import { showError } from '@nextcloud/dialogs'
 
+import { loadState } from '@nextcloud/initial-state'
+
 import ChannelDialog from './components/ChannelDialog.vue'
 import ChannelView from './components/ChannelView.vue'
 import GlobalPlayer from './components/GlobalPlayer.vue'
@@ -122,6 +125,12 @@ export default {
 			selectedId: null,
 			loading: true,
 			showCreateDialog: false,
+			// Read once from the page, so a channel knows before its first paint whether
+			// this server can import at all. The imports endpoint returns a fresh copy on
+			// every poll, which is what picks up an administrator installing yt-dlp
+			// without a reload.
+			importCapabilities: loadState('music_radio', 'music_radio-initial-state', {})
+				.importCapabilities ?? {},
 		}
 	},
 

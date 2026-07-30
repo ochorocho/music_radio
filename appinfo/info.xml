@@ -20,7 +20,7 @@ hears the same track at the same moment — the channel owner is the DJ, listene
 - **Share it your way.** Users, groups, teams, or a public link with an optional password and
   expiry date.
 	]]></description>
-	<version>0.5.0</version>
+	<version>0.6.0</version>
 	<licence>agpl</licence>
 	<author>Jochen Roth</author>
 	<namespace>MusicRadio</namespace>
@@ -30,6 +30,33 @@ hears the same track at the same moment — the channel owner is the DJ, listene
 	<dependencies>
 		<nextcloud min-version="33" max-version="34"/>
 	</dependencies>
+	<!--
+	  Deliberately not declared as <command> dependencies. YouTube import needs yt-dlp and
+	  ffmpeg, but declaring them here would stop the app being enabled at all on a server
+	  that only wants to play its own files. They are detected at runtime instead, and
+	  reported through the admin Overview page.
+	-->
+	<commands>
+		<command>OCA\MusicRadio\Command\YtDlpInstall</command>
+		<command>OCA\MusicRadio\Command\YtDlpStatus</command>
+	</commands>
+	<!--
+	  Only the timed job belongs here. ImportYoutubeAudioJob is a QueuedJob added by the
+	  request that asks for an import; listing it would have Nextcloud run it on a schedule
+	  with no argument.
+	-->
+	<background-jobs>
+		<job>OCA\MusicRadio\BackgroundJob\ReapStaleImportsJob</job>
+	</background-jobs>
+	<!--
+	  The same section class in both lists: it is one "Music Radio" heading as far as
+	  anyone reading it is concerned, and which form appears inside it is decided by that
+	  form's own section_type. The forms themselves are registered in Application::register.
+	-->
+	<settings>
+		<admin-section>OCA\MusicRadio\Settings\Section</admin-section>
+		<personal-section>OCA\MusicRadio\Settings\Section</personal-section>
+	</settings>
 	<navigations>
 		<navigation>
 			<id>music_radio</id>

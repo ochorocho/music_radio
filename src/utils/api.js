@@ -45,6 +45,45 @@ export async function addTracks(channelId, fileIds, durationHints = {}) {
 }
 
 /**
+ * Ask the server to fetch the audio from a link and add it to the channel.
+ *
+ * Answers immediately with a queued import rather than a track: the download and the
+ * transcode take tens of seconds, so the work happens in a background job and progress is
+ * followed with fetchImports().
+ *
+ * @param {number} channelId
+ * @param {string} videoUrl a YouTube link. Only the video id survives the server's
+ *   parsing, so anything else in the string is discarded rather than rejected.
+ * @return {Promise<object>} the queued import
+ */
+export async function startImport(channelId, videoUrl) {
+	const { data } = await axios.post(url(`/channels/${channelId}/imports`), { url: videoUrl })
+	return data.import
+}
+
+/**
+ * @param {number} channelId
+ * @return {Promise<{imports: object[], capabilities: object}>} the imports plus whether
+ *   this server can import at all, so the UI can explain itself rather than offering a
+ *   button that will only ever fail
+ */
+export async function fetchImports(channelId) {
+	const { data } = await axios.get(url(`/channels/${channelId}/imports`))
+	return { imports: data.imports, capabilities: data.capabilities ?? {} }
+}
+
+/**
+ * Stop a running import, or clear a finished one off the list. The server decides which
+ * of those it is from the import's state.
+ *
+ * @param {number} channelId
+ * @param {number} importId
+ */
+export async function dismissImport(channelId, importId) {
+	await axios.delete(url(`/channels/${channelId}/imports/${importId}`))
+}
+
+/**
  * @param {number} channelId
  * @param {number[]} trackIds the complete playlist in its new order — the server rejects
  *   anything that is not a permutation of what it currently holds, which is how a

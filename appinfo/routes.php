@@ -23,6 +23,13 @@ return [
 		['name' => 'track#update', 'url' => '/api/v1/channels/{id}/tracks/{trackId}', 'verb' => 'PUT'],
 		['name' => 'track#destroy', 'url' => '/api/v1/channels/{id}/tracks/{trackId}', 'verb' => 'DELETE'],
 
+		// Importing audio from a link. No public-link equivalent on purpose: an anonymous
+		// visitor starting server-side downloads against the owner's quota is a different
+		// proposition from uploading a file they already have.
+		['name' => 'import#index', 'url' => '/api/v1/channels/{id}/imports', 'verb' => 'GET'],
+		['name' => 'import#create', 'url' => '/api/v1/channels/{id}/imports', 'verb' => 'POST'],
+		['name' => 'import#destroy', 'url' => '/api/v1/channels/{id}/imports/{importId}', 'verb' => 'DELETE'],
+
 		// Audio. Consumed by an <audio> element, so it carries no CSRF token — see
 		// StreamController for how access is checked instead.
 		['name' => 'stream#track', 'url' => '/api/v1/channels/{id}/tracks/{trackId}/stream', 'verb' => 'GET'],

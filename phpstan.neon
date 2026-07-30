@@ -21,3 +21,16 @@ parameters:
 		-
 			identifier: class.notFound
 			path: lib/Migration/*
+
+	excludePaths:
+		# occ commands extend Symfony's Console Command, which Nextcloud bundles and
+		# nextcloud/ocp ships no stubs for. Same hazard as the note above: adding
+		# symfony/console to require-dev would put a second copy in composer/, which
+		# Nextcloud loads into the running server.
+		#
+		# Excluded rather than ignored because phpstan refuses to ignore an unknown *base*
+		# class — with the parent unresolvable there is nothing left for it to check. The
+		# cost is bounded by keeping these two classes as thin as they are: they parse
+		# options and print, and every decision they report on is made in YtDlpLocator and
+		# YtDlpInstaller, which are analysed and unit-tested.
+		- lib/Command/*

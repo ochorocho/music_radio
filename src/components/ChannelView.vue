@@ -31,6 +31,17 @@
 				</NcButton>
 
 				<NcButton
+					v-if="canImport"
+					:aria-label="t('music_radio', 'Add a track from a YouTube link')"
+					data-testid="add-youtube"
+					@click="showImport = true">
+					<template #icon>
+						<YoutubeIcon :size="20" />
+					</template>
+					{{ t('music_radio', 'From YouTube') }}
+				</NcButton>
+
+				<NcButton
 					v-if="canShare"
 					:aria-label="t('music_radio', 'Share this channel')"
 					data-testid="open-sharing"
@@ -65,6 +76,11 @@
 			@playlist-changed="loadTracks"
 			@on-air-changed="onAirTrackId = $event"
 			@tuned-in-changed="onTunedInChanged" />
+
+		<ImportQueue
+			v-if="imports.length > 0"
+			:imports="imports"
+			@dismiss="onDismissImport" />
 
 		<NcNoteCard
 			v-if="pendingCount > 0"
@@ -113,6 +129,13 @@
 			:channel="channel"
 			@close="showSettings = false"
 			@saved="onSettingsSaved" />
+
+		<YoutubeImportDialog
+			v-if="showImport"
+			:channel-id="channel.id"
+			:capabilities="importCapabilities"
+			@close="showImport = false"
+			@started="onImportStarted" />
 	</div>
 </template>
 
@@ -127,15 +150,18 @@ import DeleteIcon from 'vue-material-design-icons/Delete.vue'
 import PencilIcon from 'vue-material-design-icons/Pencil.vue'
 import PlusIcon from 'vue-material-design-icons/Plus.vue'
 import ShareVariantIcon from 'vue-material-design-icons/ShareVariant.vue'
+import YoutubeIcon from 'vue-material-design-icons/Youtube.vue'
 import { showError, showSuccess, showWarning } from '@nextcloud/dialogs'
 
 import ChannelDialog from './ChannelDialog.vue'
+import ImportQueue from './ImportQueue.vue'
 import OnAir from './OnAir.vue'
 import Playlist from './Playlist.vue'
 import PreviewPlayer from './PreviewPlayer.vue'
 import SharingPanel from './SharingPanel.vue'
+import YoutubeImportDialog from './YoutubeImportDialog.vue'
 import { ADD_TRACKS, MANAGE, SHARE, can } from '../utils/permissions.js'
-import { addTracks, deleteChannel, deleteTrack, errorMessage, fetchTracks, reorderTracks, updateTrack } from '../utils/api.js'
+import { addTracks, deleteChannel, deleteTrack, dismissImport, errorMessage, fetchImports, fetchTracks, reorderTracks, updateTrack } from '../utils/api.js'
 import { formatDuration, totalDuration } from '../utils/format.js'
 import { measureDurations, pickAudioFiles } from '../utils/filePicker.js'
 
@@ -145,6 +171,7 @@ export default {
 	components: {
 		ChannelDialog,
 		DeleteIcon,
+		ImportQueue,
 		NcActionButton,
 		NcActions,
 		NcButton,
@@ -158,12 +185,23 @@ export default {
 		PreviewPlayer,
 		ShareVariantIcon,
 		SharingPanel,
+		YoutubeIcon,
+		YoutubeImportDialog,
 	},
 
 	props: {
 		channel: {
 			type: Object,
 			required: true,
+		},
+
+		/**
+		 * What the page said this server can import, before any request has been made.
+		 * Replaced by whatever the imports endpoint reports on the first poll.
+		 */
+		initialImportCapabilities: {
+			type: Object,
+			default: () => ({}),
 		},
 	},
 
@@ -179,6 +217,12 @@ export default {
 			onAirTrackId: null,
 			tunedIn: false,
 			previewTrack: null,
+			// Imports outlive the dialog that starts them, so they are held here — closing
+			// the dialog, or never opening it after a reload, must not lose track of one.
+			imports: [],
+			importCapabilities: this.initialImportCapabilities,
+			showImport: false,
+			importPoll: null,
 			ADD_TRACKS,
 		}
 	},
@@ -190,6 +234,16 @@ export default {
 
 		canShare() {
 			return can(this.channel.permissions, SHARE)
+		},
+
+		/**
+		 * Offered only when the permission allows it *and* the server can actually do it.
+		 * A button that always fails is worse than no button — though the dialog still
+		 * explains itself if the server loses the ability between page load and click.
+		 */
+		canImport() {
+			return can(this.channel.permissions, ADD_TRACKS)
+				&& this.importCapabilities.available !== false
 		},
 
 		/** Tracks the server could not measure, and which therefore do not play. */
@@ -210,6 +264,13 @@ export default {
 
 	async mounted() {
 		await this.loadTracks()
+		// Once on open, so an import started before a reload — or by somebody else — is
+		// picked up rather than appearing from nowhere when it finishes.
+		await this.refreshImports()
+	},
+
+	beforeUnmount() {
+		this.stopImportPoll()
 	},
 
 	methods: {
@@ -278,6 +339,115 @@ export default {
 			} finally {
 				this.adding = false
 			}
+		},
+
+		// ----------------------------------------------------------- importing
+
+		/**
+		 * Pull the current state of this channel's imports.
+		 *
+		 * Also refreshes what the server says it can do, so an administrator installing
+		 * yt-dlp mid-session makes the button appear without a reload.
+		 */
+		async refreshImports() {
+			const previous = this.imports
+
+			try {
+				const { imports, capabilities } = await fetchImports(this.channel.id)
+				this.imports = imports
+				this.importCapabilities = capabilities
+			} catch {
+				// Deliberately quiet. This runs on a timer, and a toast every two seconds
+				// because the network blipped would be worse than briefly stale progress.
+				this.stopImportPoll()
+				return
+			}
+
+			this.announceFinished(previous)
+			this.syncImportPoll()
+		},
+
+		/**
+		 * Say something when an import finishes, exactly once.
+		 *
+		 * Comparing against the previous snapshot rather than reacting to the current
+		 * state is what stops a completed import announcing itself on every poll.
+		 *
+		 * @param {object[]} previous the imports as they were before this refresh
+		 */
+		announceFinished(previous) {
+			const before = new Map(previous.map((item) => [item.id, item.status]))
+			let landed = false
+
+			for (const item of this.imports) {
+				const was = before.get(item.id)
+				if (was === undefined || was === item.status) {
+					continue
+				}
+
+				if (item.status === 'done') {
+					landed = true
+					showSuccess(t('music_radio', 'Added “{title}” to the playlist', { title: item.title }))
+				} else if (item.status === 'failed') {
+					showError(item.error || t('music_radio', 'An import failed'))
+				}
+			}
+
+			if (landed) {
+				// The track exists now, so the playlist is out of date.
+				this.loadTracks()
+				this.emitTrackCount()
+			}
+		},
+
+		/** Poll only while there is something to watch. */
+		syncImportPoll() {
+			if (this.imports.some((item) => item.active)) {
+				this.startImportPoll()
+			} else {
+				this.stopImportPoll()
+			}
+		},
+
+		startImportPoll() {
+			if (this.importPoll !== null) {
+				return
+			}
+			this.importPoll = setInterval(() => this.refreshImports(), 2000)
+		},
+
+		stopImportPoll() {
+			if (this.importPoll !== null) {
+				clearInterval(this.importPoll)
+				this.importPoll = null
+			}
+		},
+
+		/**
+		 * @param {object} started the queued import the server just accepted
+		 */
+		onImportStarted(started) {
+			// Shown immediately rather than waiting for the next poll, so pressing Add has
+			// a visible effect straight away.
+			this.imports = [started, ...this.imports]
+			this.startImportPoll()
+		},
+
+		/**
+		 * Stop a running import, or clear a finished one away.
+		 *
+		 * @param {object} item
+		 */
+		async onDismissImport(item) {
+			try {
+				await dismissImport(this.channel.id, item.id)
+			} catch (error) {
+				showError(errorMessage(error, t('music_radio', 'Could not stop that import')))
+				return
+			}
+
+			this.imports = this.imports.filter((existing) => existing.id !== item.id)
+			this.syncImportPoll()
 		},
 
 		async onReorder(trackIds) {

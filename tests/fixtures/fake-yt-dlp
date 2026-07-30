@@ -1,0 +1,119 @@
+#!/bin/sh
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# A yt-dlp that never touches the network.
+#
+# Real downloads are unusable as a test: they need egress the CI has not got, they are
+# rate-limited, they break whenever YouTube changes, and they cannot be made to fail on
+# demand. This stands in for the binary so the whole pipeline — endpoint, queue, job,
+# progress, the file landing in someone's music folder, the track appearing — can be
+# driven deterministically. Point the app at it with:
+#
+#   occ config:app:set music_radio ytdlp_path --value=<this file>
+#
+# What it does is chosen by the *video id* in the URL it is given, because that is the one
+# input that arrives with the request itself. The obvious alternatives are both broken
+# here: an environment variable never survives, since the import service hands its child a
+# replaced environment; and a control file written by the test races the worker reading it,
+# because the two run in different containers with a filesystem sync in between. Encoding
+# it in the id means the request and the behaviour cannot get out of step.
+#
+# Every id below is a real-shaped one — eleven characters of [A-Za-z0-9_-] — so it survives
+# the app's own URL parsing rather than being rejected before the stub is ever reached.
+set -eu
+
+DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+
+# `--version` is asked first, by the locator, and has to answer whatever else is going on.
+for arg in "$@"; do
+	if [ "$arg" = "--version" ]; then
+		echo "2026.07.04"
+		exit 0
+	fi
+done
+
+# The URL is always the last argument, after `--`.
+URL=""
+for arg in "$@"; do
+	URL="$arg"
+done
+
+case "$URL" in
+	*stubPRIVATE*) MODE=private ;;
+	*stubUNAVAIL*) MODE=unavailable ;;
+	*stubBROKEN0*) MODE=broken ;;
+	*stubGEOBLOK*) MODE=geo ;;
+	*stubLIVE000*) MODE=live ;;
+	*stubTOOLONG*) MODE=toolong ;;
+	*stubNOFILE0*) MODE=nofile ;;
+	*stubSLOW000*) MODE=slow ;;
+	*)             MODE=ok ;;
+esac
+
+fail() {
+	echo "ERROR: [youtube] stub: $1" >&2
+	exit 1
+}
+
+# --- the probe pass -----------------------------------------------------------
+for arg in "$@"; do
+	if [ "$arg" = "--dump-single-json" ]; then
+		case "$MODE" in
+			private)     fail "Private video. Sign in if you've been granted access to this video" ;;
+			unavailable) fail "Video unavailable" ;;
+			broken)      fail "nsig extraction failed: Some formats may be missing" ;;
+			geo)         fail "The uploader has not made this video available in your country" ;;
+			live)
+				echo '{"id":"stubLIVE000","title":"A Live Stream","duration":0,"is_live":true,"live_status":"is_live","availability":"public","age_limit":0}'
+				exit 0
+				;;
+			toolong)
+				echo '{"id":"stubTOOLONG","title":"A Very Long Set","duration":99999,"is_live":false,"live_status":"not_live","availability":"public","age_limit":0}'
+				exit 0
+				;;
+			*)
+				echo '{"id":"stubOK00000","title":"Stub Test Track","uploader":"Stub Artist","duration":1,"is_live":false,"live_status":"not_live","availability":"public","age_limit":0}'
+				exit 0
+				;;
+		esac
+	fi
+done
+
+# --- the download pass --------------------------------------------------------
+# Where the real thing would write, taken from the argv the service built — so if the
+# output arrangement ever changes this stops working rather than quietly passing.
+TARGET=""
+for arg in "$@"; do
+	case "$arg" in
+		home:*) TARGET=${arg#home:} ;;
+	esac
+done
+
+[ -n "$TARGET" ] || fail "the stub was given no --paths home: to write to"
+
+if [ "$MODE" = "nofile" ]; then
+	# Exits cleanly having produced nothing. A real yt-dlp outcome, and the one most
+	# likely to be mistaken for success by anything that trusts the exit code.
+	exit 0
+fi
+
+echo "mrprogress:0 1000 NA"
+echo "mrprogress:500 1000 NA"
+
+if [ "$MODE" = "slow" ]; then
+	# Long enough for a test to catch it running and stop it. If nothing does, the
+	# runner's own timeout ends it.
+	i=0
+	while [ $i -lt 120 ]; do
+		echo "mrprogress:500 1000 NA"
+		sleep 1
+		i=$((i + 1))
+	done
+fi
+
+echo "mrprogress:1000 1000 NA"
+
+cp "$DIR/tone-a.mp3" "$TARGET/audio.mp3"
+echo '{"id":"stubOK00000","title":"Stub Test Track","uploader":"Stub Artist"}' > "$TARGET/audio.info.json"
+
+exit 0
