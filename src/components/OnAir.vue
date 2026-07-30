@@ -106,6 +106,23 @@
 				</span>
 			</div>
 
+			<!--
+				Browsers refuse to start audio that no one asked for, and a resume can land
+				long after the gesture that tuned in. Asking is the only way out of that, and
+				it beats silence with nothing to click.
+			-->
+			<NcButton
+				v-if="needsGesture"
+				class="music-radio-onair__gesture"
+				variant="primary"
+				data-testid="tap-to-play"
+				@click="resumePlayback">
+				<template #icon>
+					<PlayIcon :size="20" />
+				</template>
+				{{ t('music_radio', 'Tap to play') }}
+			</NcButton>
+
 			<NcProgressBar
 				class="music-radio-onair__progress"
 				:value="progressPercent"
@@ -326,6 +343,15 @@ export default {
 			}
 		},
 
+		/**
+		 * Whether the player is waiting to be asked. Read off the store for the same reason
+		 * as liveSync: this component's own mixin owns no audio, so its answer would always
+		 * be no.
+		 */
+		needsGesture() {
+			return this.isListening && this.liveSync.needsGesture === true
+		},
+
 		syncLabel() {
 			const sync = this.liveSync
 			if (sync.error) {
@@ -410,6 +436,14 @@ export default {
 
 		stopListening() {
 			playerStore.tuneOut()
+		},
+
+		/**
+		 * Hand the browser the gesture it is holding out for. The player picks this up
+		 * synchronously, so play() still runs inside this click.
+		 */
+		resumePlayback() {
+			playerStore.requestResume()
 		},
 
 		toggleMuted() {

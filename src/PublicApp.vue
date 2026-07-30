@@ -11,12 +11,26 @@
 <template>
 	<div class="music-radio-public">
 		<header class="music-radio-public__header">
-			<h1 class="music-radio-public__title" data-testid="public-channel-title">
-				{{ channel.title }}
-			</h1>
-			<p v-if="channel.description" class="music-radio-public__description">
-				{{ channel.description }}
-			</p>
+			<div class="music-radio-public__heading">
+				<h1 class="music-radio-public__title" data-testid="public-channel-title">
+					{{ channel.title }}
+				</h1>
+				<p v-if="channel.description" class="music-radio-public__description">
+					{{ channel.description }}
+				</p>
+			</div>
+
+			<div v-if="canUpload" class="music-radio-public__actions">
+				<NcButton
+					variant="primary"
+					data-testid="public-upload-open"
+					@click="showUpload = true">
+					<template #icon>
+						<PlusIcon :size="20" />
+					</template>
+					{{ t('music_radio', 'Add a track') }}
+				</NcButton>
+			</div>
 		</header>
 
 		<OnAir
@@ -39,7 +53,11 @@
 			</ol>
 		</section>
 
-		<PublicUpload v-if="canUpload" :token="token" @uploaded="loadTracks" />
+		<PublicUpload
+			v-if="canUpload && showUpload"
+			:token="token"
+			@uploaded="loadTracks"
+			@close="showUpload = false" />
 
 		<!-- Renders nothing; it is what actually plays the audio. The signed-in app
 		     mounts one too, from App.vue. -->
@@ -50,6 +68,9 @@
 <script>
 import axios from '@nextcloud/axios'
 import { loadState } from '@nextcloud/initial-state'
+
+import NcButton from '@nextcloud/vue/components/NcButton'
+import PlusIcon from 'vue-material-design-icons/Plus.vue'
 
 import GlobalPlayer from './components/GlobalPlayer.vue'
 import OnAir from './components/OnAir.vue'
@@ -63,7 +84,9 @@ export default {
 
 	components: {
 		GlobalPlayer,
+		NcButton,
 		OnAir,
+		PlusIcon,
 		PublicUpload,
 	},
 
@@ -79,6 +102,7 @@ export default {
 			token: initial.token,
 			channel: initial.channel,
 			tracks: [],
+			showUpload: false,
 		}
 	},
 
@@ -145,7 +169,24 @@ export default {
 }
 
 .music-radio-public__header {
+	/* The same arrangement as the signed-in channel header: the text takes the room it
+	   needs and the actions sit beside it, wrapping underneath when there is not enough. */
+	display: flex;
+	align-items: flex-start;
+	gap: 1rem;
+	flex-wrap: wrap;
 	margin-block-end: 1.5rem;
+}
+
+.music-radio-public__heading {
+	flex: 1 1 20rem;
+	min-width: 0;
+}
+
+.music-radio-public__actions {
+	display: flex;
+	align-items: center;
+	gap: 0.5rem;
 }
 
 .music-radio-public__title {

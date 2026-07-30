@@ -207,13 +207,32 @@ test('the public page is still accessible once listening', async ({ browser }) =
 	}
 })
 
+/**
+ * Wait for a dialog to finish appearing.
+ *
+ * NcModal fades in, and Playwright considers an element visible as soon as it has a box —
+ * opacity is not part of that. Scanning too early measures text against a wrapper that is
+ * still fully transparent, and every contrast check fails, including the dialog's own
+ * title and buttons.
+ *
+ * @param page playwright page
+ */
+async function dialogSettled(page: Page) {
+	await expect
+		.poll(async () => await page.locator('.modal-wrapper').first()
+			.evaluate((el) => getComputedStyle(el).opacity), { timeout: 10_000 })
+		.toBe('1')
+}
+
 test('the public upload panel has no accessibility violations', async ({ browser }) => {
 	const context = await browser.newContext({ ignoreHTTPSErrors: true, storageState: undefined })
 	const anon = await context.newPage()
 
 	try {
 		await anon.goto(`${APP_PATH}s/${uploadToken}`)
+		await anon.getByTestId('public-upload-open').click()
 		await expect(anon.getByTestId('public-upload-input')).toBeVisible({ timeout: 20_000 })
+		await dialogSettled(anon)
 
 		// The file field is labelled rather than left to be announced as just "file".
 		const id = await anon.getByTestId('public-upload-input').getAttribute('id')
@@ -233,7 +252,9 @@ test('a failed upload is announced, not just shown', async ({ browser }) => {
 
 	try {
 		await anon.goto(`${APP_PATH}s/${uploadToken}`)
+		await anon.getByTestId('public-upload-open').click()
 		await expect(anon.getByTestId('public-upload-input')).toBeVisible({ timeout: 20_000 })
+		await dialogSettled(anon)
 
 		await anon.getByTestId('public-upload-input').setInputFiles({
 			name: 'not-really.mp3',

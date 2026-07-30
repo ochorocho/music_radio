@@ -33,7 +33,18 @@ export const playerStore = reactive({
 		clockRttMs: 0,
 		driftMs: 0,
 		error: null,
+		/** The browser refused to start playback until something is pressed. */
+		needsGesture: false,
 	},
+
+	/**
+	 * Bumped when the listener presses "Tap to play".
+	 *
+	 * A counter rather than a flag because the same request can be made twice, and because
+	 * the player watches it synchronously: play() has to run in the same task as the click
+	 * or the gesture it needs is already gone.
+	 */
+	resumeRequest: 0,
 
 	/**
 	 * @param {object} channel
@@ -49,7 +60,12 @@ export const playerStore = reactive({
 		this.channel = null
 		this.token = null
 		this.muted = false
-		this.sync = { clockReady: false, clockRttMs: 0, driftMs: 0, error: null }
+		this.sync = { clockReady: false, clockRttMs: 0, driftMs: 0, error: null, needsGesture: false }
+	},
+
+	/** Ask the player — which lives in a different component — to start again. */
+	requestResume() {
+		this.resumeRequest++
 	},
 
 	toggleMute() {

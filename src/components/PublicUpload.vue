@@ -6,58 +6,75 @@
   - Only rendered when the link its visitor followed says uploading is allowed; the server
   - checks the same thing again on every request. Whoever uploads has no account, so there
   - is no library to pick from — a file off their device is the only thing they can offer.
+  -
+  - A dialog rather than a panel on the page, for two reasons. It matches the signed-in
+  - view, where adding music is a button beside the channel title. And a public page is a
+  - fixed-height shell whose `#content` is `position: fixed` with `overflow: clip`, so a
+  - panel below the playlist is the first thing to be cut off — while a dialog is teleported
+  - to `<body>` and is unaffected by any of that.
+  -
+  - The upload button deliberately sits in the body rather than in the dialog's own button
+  - row: NcDialog closes on any footer button that does not return exactly false, and the
+  - result of an upload — "Added …" or why it was refused — is the whole point of pressing
+  - it. Keeping the action inside the body means the outcome cannot disappear with the
+  - dialog that was showing it.
 -->
 <template>
-	<section class="music-radio-upload">
-		<h2 class="music-radio-upload__heading">
-			{{ t('music_radio', 'Add a track') }}
-		</h2>
+	<NcDialog
+		:name="t('music_radio', 'Add a track')"
+		:buttons="buttons"
+		size="normal"
+		@closing="$emit('close')">
+		<!-- The hook is on an element this component owns: NcDialog does not pass
+		     attributes through to what it renders. -->
+		<div class="music-radio-upload" data-testid="public-upload-dialog">
+			<p class="music-radio-upload__hint">
+				{{ t('music_radio', 'Anyone listening will hear it. It joins the end of the playlist and cannot be taken back off.') }}
+			</p>
 
-		<p class="music-radio-upload__hint">
-			{{ t('music_radio', 'Anyone listening will hear it. It joins the end of the playlist and cannot be taken back off.') }}
-		</p>
+			<label class="music-radio-upload__label" :for="inputId">
+				{{ t('music_radio', 'Choose an audio file') }}
+			</label>
+			<input
+				:id="inputId"
+				ref="input"
+				class="music-radio-upload__input"
+				type="file"
+				accept="audio/*"
+				:disabled="uploading"
+				data-testid="public-upload-input"
+				@change="onPick">
 
-		<label class="music-radio-upload__label" :for="inputId">
-			{{ t('music_radio', 'Choose an audio file') }}
-		</label>
-		<input
-			:id="inputId"
-			ref="input"
-			class="music-radio-upload__input"
-			type="file"
-			accept="audio/*"
-			:disabled="uploading"
-			data-testid="public-upload-input"
-			@change="onPick">
+			<NcButton
+				variant="primary"
+				:disabled="uploading || file === null"
+				data-testid="public-upload-submit"
+				@click="upload">
+				{{ uploading
+					? t('music_radio', 'Uploading…')
+					: t('music_radio', 'Add to the channel') }}
+			</NcButton>
 
-		<NcButton
-			variant="primary"
-			:disabled="uploading || file === null"
-			data-testid="public-upload-submit"
-			@click="upload">
-			{{ uploading
-				? t('music_radio', 'Uploading…')
-				: t('music_radio', 'Add to the channel') }}
-		</NcButton>
-
-		<!--
-			Assertive rather than polite: the outcome is the whole point of pressing the
-			button, and a failure needs to interrupt rather than queue behind whatever
-			the player is announcing.
-		-->
-		<p
-			v-if="message !== ''"
-			class="music-radio-upload__message"
-			:class="{ 'music-radio-upload__message--error': failed }"
-			role="alert"
-			data-testid="public-upload-message">
-			{{ message }}
-		</p>
-	</section>
+			<!--
+				Assertive rather than polite: the outcome is the whole point of pressing the
+				button, and a failure needs to interrupt rather than queue behind whatever
+				the player is announcing.
+			-->
+			<p
+				v-if="message !== ''"
+				class="music-radio-upload__message"
+				:class="{ 'music-radio-upload__message--error': failed }"
+				role="alert"
+				data-testid="public-upload-message">
+				{{ message }}
+			</p>
+		</div>
+	</NcDialog>
 </template>
 
 <script>
 import NcButton from '@nextcloud/vue/components/NcButton'
+import NcDialog from '@nextcloud/vue/components/NcDialog'
 
 import { errorMessage, uploadToPublicChannel } from '../utils/api.js'
 
@@ -66,6 +83,7 @@ export default {
 
 	components: {
 		NcButton,
+		NcDialog,
 	},
 
 	props: {
@@ -75,7 +93,7 @@ export default {
 		},
 	},
 
-	emits: ['uploaded'],
+	emits: ['uploaded', 'close'],
 
 	data() {
 		return {
@@ -90,6 +108,19 @@ export default {
 		/** The page can only ever show one of these, but an id must still be unique. */
 		inputId() {
 			return 'music-radio-upload-input'
+		},
+
+		/**
+		 * Only a way out. Uploading is done from the body, so there is no action here that
+		 * could close the dialog out from under its own result.
+		 */
+		buttons() {
+			return [
+				{
+					label: t('music_radio', 'Close'),
+					callback: () => this.$emit('close'),
+				},
+			]
 		},
 	},
 
@@ -120,6 +151,8 @@ export default {
 				if (this.$refs.input) {
 					this.$refs.input.value = ''
 				}
+				// Deliberately left open, showing what happened. Someone adding one track
+				// often has another.
 				this.$emit('uploaded')
 			} catch (error) {
 				this.failed = true
@@ -138,14 +171,7 @@ export default {
 	flex-direction: column;
 	align-items: start;
 	gap: 0.5rem;
-	margin-block-start: 1.5rem;
-	padding-block-start: 1rem;
-	border-top: 1px solid var(--color-border);
-}
-
-.music-radio-upload__heading {
-	font-size: 1rem;
-	margin: 0;
+	padding-block: 0.5rem;
 }
 
 .music-radio-upload__hint,

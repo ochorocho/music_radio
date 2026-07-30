@@ -54,7 +54,12 @@ export default {
 				clockRttMs: this.clockRttMs,
 				driftMs: this.driftMs,
 				error: this.syncError,
+				needsGesture: this.needsGesture,
 			}
+		},
+
+		resumeRequest() {
+			return playerStore.resumeRequest
 		},
 	},
 
@@ -89,6 +94,22 @@ export default {
 			deep: true,
 			handler(value) {
 				playerStore.sync = value
+			},
+		},
+
+		/**
+		 * The listener pressed "Tap to play" somewhere else in the tree.
+		 *
+		 * `flush: 'sync'` is the whole point: the handler has to run in the same task as
+		 * the click that bumped the counter, because the gesture the browser is waiting
+		 * for does not survive being deferred to the next tick.
+		 */
+		resumeRequest: {
+			flush: 'sync',
+			handler() {
+				if (this.tunedIn) {
+					this.resume()
+				}
 			},
 		},
 	},

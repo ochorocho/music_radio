@@ -56,6 +56,15 @@ async function anonymous(browser: Browser): Promise<[BrowserContext, Page]> {
 	return [context, await context.newPage()]
 }
 
+/**
+ * Uploading lives behind a button beside the channel title now, mirroring the signed-in
+ * view, so the file field only exists once the dialog is open.
+ */
+async function openUploadDialog(page: Page) {
+	await page.getByTestId('public-upload-open').click()
+	await expect(page.getByTestId('public-upload-input')).toBeVisible({ timeout: 20_000 })
+}
+
 async function allowUploads(page: Page, allow: boolean) {
 	const result = await api(page, 'PUT', `${API}/channels/${channelId}/shares/${shareId}`, {
 		permissions: allow ? LISTEN | ADD_TRACKS : LISTEN,
@@ -131,7 +140,7 @@ test('a link grants listening only until the owner says otherwise', async ({ db 
 	await expect(anonPage.getByTestId('public-channel-title')).toBeVisible({ timeout: 20_000 })
 
 	// Nothing is offered, because nothing is allowed.
-	await expect(anonPage.getByTestId('public-upload-input')).toHaveCount(0)
+	await expect(anonPage.getByTestId('public-upload-open')).toHaveCount(0)
 })
 
 test('the server refuses an upload on a listen-only link, page or no page', async () => {
@@ -154,6 +163,7 @@ test('with uploads switched on, a visitor can put a track on the channel', async
 	await anonPage.goto(`${APP_PATH}s/${token}`)
 	await expect(anonPage.getByTestId('public-channel-title')).toBeVisible({ timeout: 20_000 })
 
+	await openUploadDialog(anonPage)
 	await anonPage.getByTestId('public-upload-input').setInputFiles('tests/fixtures/tone-a.mp3')
 	await anonPage.getByTestId('public-upload-submit').click()
 
@@ -177,6 +187,7 @@ test('the uploaded file lands in the channel owner\'s Music folder', async ({ pa
 	await allowUploads(page, true)
 
 	await anonPage.goto(`${APP_PATH}s/${token}`)
+	await openUploadDialog(anonPage)
 	await anonPage.getByTestId('public-upload-input').setInputFiles('tests/fixtures/tone-b.mp3')
 	await anonPage.getByTestId('public-upload-submit').click()
 	await expect(anonPage.getByTestId('public-upload-message')).toContainText(/added/i, { timeout: 30_000 })
@@ -206,6 +217,7 @@ test('an upload never overwrites a file the owner already has', async ({ page, d
 	expect(before.length).toBeGreaterThan(0)
 
 	await anonPage.goto(`${APP_PATH}s/${token}`)
+	await openUploadDialog(anonPage)
 	await anonPage.getByTestId('public-upload-input').setInputFiles('tests/fixtures/tone-c.mp3')
 	await anonPage.getByTestId('public-upload-submit').click()
 	await expect(anonPage.getByTestId('public-upload-message')).toContainText(/added/i, { timeout: 30_000 })
@@ -230,6 +242,7 @@ test('something that is not audio is refused however it is labelled', async ({ p
 
 	// An .mp3 name and an audio content type over a PHP script — the two things a
 	// client controls, both lying.
+	await openUploadDialog(anonPage)
 	await anonPage.getByTestId('public-upload-input').setInputFiles({
 		name: 'totally-a-song.mp3',
 		mimeType: 'audio/mpeg',
@@ -249,6 +262,7 @@ test('an empty file is refused rather than becoming a silent track', async ({ pa
 	await allowUploads(page, true)
 
 	await anonPage.goto(`${APP_PATH}s/${token}`)
+	await openUploadDialog(anonPage)
 	await anonPage.getByTestId('public-upload-input').setInputFiles({
 		name: 'nothing.mp3',
 		mimeType: 'audio/mpeg',
@@ -267,7 +281,7 @@ test('an empty file is refused rather than becoming a silent track', async ({ pa
 test('switching uploads back off takes the ability away again', async ({ page }) => {
 	await allowUploads(page, true)
 	await anonPage.goto(`${APP_PATH}s/${token}`)
-	await expect(anonPage.getByTestId('public-upload-input')).toBeVisible({ timeout: 20_000 })
+	await expect(anonPage.getByTestId('public-upload-open')).toBeVisible({ timeout: 20_000 })
 
 	await allowUploads(page, false)
 
@@ -282,7 +296,7 @@ test('switching uploads back off takes the ability away again', async ({ page })
 
 	await anonPage.reload()
 	await expect(anonPage.getByTestId('public-channel-title')).toBeVisible({ timeout: 20_000 })
-	await expect(anonPage.getByTestId('public-upload-input')).toHaveCount(0)
+	await expect(anonPage.getByTestId('public-upload-open')).toHaveCount(0)
 })
 
 test('a link still cannot be given anything beyond listening and uploading', async ({ page }) => {

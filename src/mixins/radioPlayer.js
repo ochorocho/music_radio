@@ -69,6 +69,11 @@ export default {
 			 * readout are rendered from it; it advances locally between polls.
 			 */
 			localTrack: null,
+			/**
+			 * The browser refused to start playback without something being pressed.
+			 * Surfaced so the listener is asked, rather than left with silence.
+			 */
+			needsGesture: false,
 		}
 	},
 
@@ -396,8 +401,57 @@ export default {
 			if (trackChanged || options.force) {
 				this.loadTrack(this.activeAudio, state.current)
 				this.hardSeek(this.targetOffsetMs())
-				this.activeAudio.play().catch(() => {})
+				this.resume()
+				return
 			}
+
+			// Whether this element should be making sound is a property of `status`, not a
+			// consequence of the track changing — and getting that backwards is what left a
+			// resumed channel silent.
+			//
+			// The branch above only fires on a new track or a forced apply. A resume is
+			// neither: the track is the same, and the state arrives on an ordinary poll,
+			// because the instance that has the audio is not the one that pressed the
+			// button (see the note on this mixin). So nothing started the element again,
+			// and it stayed on the pause that the paused branch above had given it —
+			// indefinitely, while the rest of the UI reported a healthy broadcast.
+			if (this.activeAudio?.paused) {
+				// It froze where it was while the broadcast moved on, so put it back in
+				// step before starting.
+				this.hardSeek(this.targetOffsetMs())
+				this.resume()
+			}
+		},
+
+		/**
+		 * Start the active element, and notice when the browser will not let us.
+		 *
+		 * play() rejects rather than throwing, and a rejection here is indistinguishable
+		 * from silence unless somebody looks — which is why both call sites used to discard
+		 * it. Autoplay rules mean a refusal is a real possibility on a resume, since by
+		 * then the tune-in gesture is long gone.
+		 */
+		resume() {
+			const audio = this.activeAudio
+			if (!audio) {
+				return
+			}
+
+			audio.play().then(() => {
+				this.needsGesture = false
+			}).catch((error) => {
+				if (error?.name === 'NotAllowedError') {
+					// Recoverable, but only by the listener: something has to be pressed.
+					this.needsGesture = true
+					return
+				}
+
+				// AbortError is routine — a load() or a new src while play() was pending
+				// aborts it, and the next state application starts it again.
+				if (error?.name !== 'AbortError') {
+					this.syncError = t('music_radio', 'This browser would not start playback')
+				}
+			})
 		},
 
 		/**
@@ -503,7 +557,7 @@ export default {
 
 			this.loadTrack(this.activeAudio, this.localTrack)
 			this.hardSeek(this.targetOffsetMs())
-			this.activeAudio.play().catch(() => {})
+			this.resume()
 
 			// Re-derive from the server rather than trusting the local step.
 			//
@@ -546,7 +600,12 @@ export default {
 		 */
 		correctDrift(target) {
 			const audio = this.activeAudio
-			if (!audio || audio.readyState < 2 || this.pendingSeek) {
+			// A paused element is deliberately not corrected. While one is stopped the
+			// broadcast keeps moving, so the drift grows without limit and every correction
+			// past MAX_NUDGE_MS hard-seeks — and each hard seek mutes for up to a second.
+			// A player that had stopped was therefore also being re-muted roughly once a
+			// second, which would have kept it silent even once it was started again.
+			if (!audio || audio.paused || audio.readyState < 2 || this.pendingSeek) {
 				return
 			}
 
