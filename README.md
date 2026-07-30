@@ -25,7 +25,9 @@ The music folder is `Music` by default, and each person can change theirs under
 
 ## YouTube import
 
-Off unless the server can do it, which needs two things that Nextcloud does not ship.
+Off unless the server can do it, which needs two things that Nextcloud does not ship. The
+short version is below; **[docs/INSTALL.md](docs/INSTALL.md)** has the full setup, including
+background jobs, updating, and what to do when something is not working.
 
 ### ffmpeg
 
