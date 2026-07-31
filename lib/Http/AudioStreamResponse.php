@@ -28,6 +28,16 @@ class AudioStreamResponse extends Response implements ICallbackResponse {
 	 */
 	private const CHUNK_SIZE = 512 * 1024;
 
+	/**
+	 * How long a browser may keep the bytes without asking again.
+	 *
+	 * An hour is far longer than a listening session and far shorter than "for ever", which
+	 * is the balance that matters: the point is that a media element can hold on to what it
+	 * has already fetched, not that the file is unchanging. The ETag below is what catches
+	 * a track whose file was replaced under the same id.
+	 */
+	private const CACHE_SECONDS = 3600;
+
 	public function __construct(
 		private File $file,
 		private ByteRange $range,
@@ -42,6 +52,27 @@ class AudioStreamResponse extends Response implements ICallbackResponse {
 		// learns it is allowed to seek at all.
 		$this->addHeader('Accept-Ranges', 'bytes');
 		$this->addHeader('X-Content-Type-Options', 'nosniff');
+
+		// Cacheable, and with something to revalidate against.
+		//
+		// Without these a Response carries Nextcloud's default — `no-cache, no-store,
+		// must-revalidate` — which is right for JSON and wrong for a nine-megabyte audio
+		// file. `no-store` forbids keeping the bytes at all, and with no ETag and no
+		// Last-Modified there is nothing for `If-Range` to work against, so a media element
+		// cannot reuse or revalidate a single byte it has already been given. Safari on iOS
+		// fetches a track as a long series of small ranges and leans on exactly that, so it
+		// re-fetched continuously and every hiccup on the connection became a dropout.
+		//
+		// Private, not public: a track is somebody's file, and this same response is served
+		// to anonymous visitors holding a link. Shared caches have no business keeping it.
+		//
+		// must-revalidate rather than immutable, because a file can be replaced under a
+		// stable id — the ETag is what notices.
+		$this->cacheFor(self::CACHE_SECONDS, public: false);
+		$this->setETag($this->file->getEtag());
+		$this->setLastModified(
+			(new \DateTime())->setTimestamp($this->file->getMTime()),
+		);
 
 		if ($this->range->isUnsatisfiable()) {
 			// 416 carries `bytes * /size` so the client can retry against the real length.

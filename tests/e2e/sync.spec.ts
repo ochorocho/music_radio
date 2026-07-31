@@ -310,3 +310,73 @@ test('someone without control gets no player controls', async ({ page, db }) => 
 		await api(page, 'DELETE', `${API}/channels/${channelId}`)
 	}
 })
+
+/**
+ * Nothing touches the playback rate.
+ *
+ * Drift used to be corrected by nudging `playbackRate` a few percent. That is inaudible on
+ * Chromium and interrupts playback on the other two engines — measured over forty seconds
+ * of the same track: Chromium 15 rate changes and no interruptions, Firefox 11 changes and
+ * 14 interruptions of 60–281 ms, WebKit a `waiting` event 15 ms after one. So the nudging
+ * was removed, and mid-track correction with it; see RESEEK_MS.
+ *
+ * This is the tripwire. The counter behind it is fed by the element's own `ratechange`
+ * event rather than by whatever code might assign a rate, so it stays honest regardless of
+ * who does the assigning — and it is worth running under `pw-engines.config.ts`, where the
+ * engines that actually suffer can say so.
+ *
+ * Measured on a long track on purpose. The 3–8 second fixtures turn any run of useful
+ * length into a sequence of track boundaries, which exercises the load-and-seek path
+ * rather than the steady-state playback this is about — a distinction that produced a
+ * reading of 1.9 s buffered and four stalls before it was noticed.
+ */
+test('the playback rate is never touched while a track plays', async ({ page, db }) => {
+	test.setTimeout(120_000)
+
+	await page.goto(APP_PATH)
+	await expect(page.getByTestId('new-channel')).toBeVisible({ timeout: 20_000 })
+
+	const title = `Rate Churn ${Math.random().toString(36).slice(2, 8)}`
+	const created = await api(page, 'POST', `${API}/channels`, { title })
+	const channelId = created.body.id as number
+
+	try {
+		const long = await db.query<Array<{ file_id: number }>>(
+			'select file_id from oc_music_radio_tracks where duration_ms > 300000 and unavailable = 0 limit 1',
+		)
+		if (long.length === 0) {
+			test.skip(true, 'no track long enough to measure steady-state playback')
+		}
+
+		await api(page, 'POST', `${API}/channels/${channelId}/tracks`, {
+			fileIds: long.map((r) => r.file_id),
+		})
+		await api(page, 'POST', `${API}/channels/${channelId}/control`, { action: 'play' })
+
+		await openChannel(page, title)
+		await tuneIn(page)
+		await page.waitForTimeout(20_000)
+
+		await page.getByTestId('diagnostics-toggle').click()
+		const panel = await page.getByTestId('diagnostics').innerText()
+
+		const rateChanges = Number(panel.match(/Rate changes\s+(\d+)/)?.[1] ?? -1)
+		expect(rateChanges, `rate must never be assigned (panel: ${panel})`).toBe(0)
+
+		// And it really is still 1, not merely unchanged from something else.
+		const rates = await page.evaluate(() =>
+			Array.from(document.querySelectorAll('audio')).map((a) => (a as HTMLAudioElement).playbackRate))
+		expect(rates.length).toBeGreaterThan(0)
+		expect(rates.every((r) => r === 1)).toBe(true)
+	} finally {
+		await api(page, 'DELETE', `${API}/channels/${channelId}`)
+	}
+})
+
+/*
+ * There is deliberately no iOS test, and there cannot be one: Nextcloud's
+ * unsupported-browser gate rejects a spoofed iOS user agent both server-side and in the
+ * page, so mobile Safari never reaches the app. WebKit under `pw-engines.config.ts` is the
+ * nearest stand-in — it shares the media stack — and the diagnostic panel this test reads
+ * is what a real phone can be asked to report.
+ */

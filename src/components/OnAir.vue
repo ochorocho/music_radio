@@ -167,7 +167,40 @@
 
 			<p class="music-radio-onair__sync" data-testid="sync-status">
 				{{ isMuted ? t('music_radio', 'Muted — the channel is still playing') : syncLabel }}
+				<!--
+					Playback problems on a phone can only be diagnosed from the phone: iOS
+					cannot be driven from the test suite, because Nextcloud's
+					unsupported-browser gate rejects a spoofed user agent both server-side
+					and in the page. So the device is given a way to say what it is seeing.
+
+					Behind a toggle and closed by default — this is for the one conversation
+					in fifty that starts "it keeps breaking up", not for everyone else.
+				-->
+				<button
+					class="music-radio-onair__diagnostics-toggle"
+					type="button"
+					:aria-expanded="showDiagnostics"
+					data-testid="diagnostics-toggle"
+					@click="showDiagnostics = !showDiagnostics">
+					{{ showDiagnostics
+						? t('music_radio', 'Hide playback details')
+						: t('music_radio', 'Playback details') }}
+				</button>
 			</p>
+
+			<div v-if="showDiagnostics" class="music-radio-onair__diagnostics" data-testid="diagnostics">
+				<dl class="music-radio-onair__diagnostics-list">
+					<div v-for="row in diagnosticRows" :key="row.label">
+						<dt>{{ row.label }}</dt>
+						<dd>{{ row.value }}</dd>
+					</div>
+				</dl>
+				<!-- Copyable, because the useful thing to do with these is paste them into
+				     a message to whoever is looking at the bug. -->
+				<NcButton data-testid="diagnostics-copy" @click="copyDiagnostics">
+					{{ t('music_radio', 'Copy') }}
+				</NcButton>
+			</div>
 		</template>
 
 		<NcDialog
@@ -247,6 +280,7 @@ import radioPlayer from '../mixins/radioPlayer.js'
 import { playerStore } from '../utils/playerStore.js'
 import { CONTROL, can } from '../utils/permissions.js'
 import { formatDuration } from '../utils/format.js'
+import { showError, showSuccess } from '@nextcloud/dialogs'
 
 export default {
 	name: 'OnAir',
@@ -294,6 +328,7 @@ export default {
 			displayOffsetMs: 0,
 			displayTimer: null,
 			confirmTuneOut: false,
+			showDiagnostics: false,
 		}
 	},
 
@@ -451,6 +486,38 @@ export default {
 		 *
 		 * @return {string}
 		 */
+		/**
+		 * The readout, as label/value pairs.
+		 *
+		 * Ordered by what to look at first when a phone stutters: the buffer margin says
+		 * whether audio is arriving fast enough, the stall count says whether it ran out,
+		 * and the rate changes say whether the correction is fighting the browser. Drift
+		 * and the round trip are the context for all three.
+		 *
+		 * @return {Array<{label: string, value: string}>}
+		 */
+		diagnosticRows() {
+			const sync = this.liveSync
+
+			return [
+				{
+					label: t('music_radio', 'Buffered ahead'),
+					value: `${((sync.bufferedAheadMs ?? 0) / 1000).toFixed(1)} s`,
+				},
+				{ label: t('music_radio', 'Drift'), value: `${Math.round(sync.driftMs ?? 0)} ms` },
+				{ label: t('music_radio', 'Ran out of audio'), value: `${sync.stallCount ?? 0}×` },
+				{ label: t('music_radio', 'Rate changes'), value: `${sync.rateChanges ?? 0}×` },
+				{ label: t('music_radio', 'Speed'), value: (sync.playbackRate ?? 1).toFixed(3) },
+				{ label: t('music_radio', 'Re-seeks'), value: `${sync.hardSeeks ?? 0}×` },
+				{ label: t('music_radio', 'Track changes'), value: `${sync.boundaries ?? 0}×` },
+				{
+					label: t('music_radio', 'Playback refused'),
+					value: `${sync.playRefusals ?? 0}× (${sync.playRetries ?? 0} retried)`,
+				},
+				{ label: t('music_radio', 'Clock round trip'), value: `${Math.round(sync.clockRttMs ?? 0)} ms` },
+			]
+		},
+
 		debugJson() {
 			return JSON.stringify({
 				trackId: this.localTrack?.trackId ?? null,
@@ -508,6 +575,27 @@ export default {
 
 	methods: {
 		formatDuration,
+
+		/**
+		 * Put the readout on the clipboard.
+		 *
+		 * The point of the panel is that these numbers reach whoever is looking at the
+		 * bug, and retyping seven figures off a phone screen is how that stops happening.
+		 * The user agent goes along with them: which iOS, and which Safari, is the first
+		 * thing anybody would ask.
+		 */
+		async copyDiagnostics() {
+			const lines = this.diagnosticRows.map((row) => `${row.label}: ${row.value}`)
+			lines.push(`User agent: ${navigator.userAgent}`)
+
+			try {
+				await navigator.clipboard.writeText(lines.join('\n'))
+				showSuccess(t('music_radio', 'Playback details copied'))
+			} catch (error) {
+				// Clipboard access can be refused; the panel is selectable as a fallback.
+				showError(t('music_radio', 'Could not copy — select the text and copy it manually'))
+			}
+		},
 
 		/**
 		 * There is no playhead per track to move — the channel holds one position over the
@@ -716,6 +804,50 @@ export default {
 	margin: 0.5rem 0 0;
 	font-size: 0.8em;
 	color: var(--color-text-maxcontrast);
+}
+
+/* A link in prose rather than a button that looks like one: it sits at the end of the
+   status line, and anything button-shaped there would read as an action on the broadcast. */
+.music-radio-onair__diagnostics-toggle {
+	background: none;
+	border: 0;
+	padding: 0;
+	margin-inline-start: 0.5rem;
+	font: inherit;
+	color: var(--color-text-maxcontrast);
+	text-decoration: underline;
+	cursor: pointer;
+}
+
+.music-radio-onair__diagnostics {
+	margin-block-start: 0.5rem;
+	padding: 0.5rem 0.75rem;
+	border: 1px solid var(--color-border);
+	border-radius: var(--border-radius-large, 0.5rem);
+	background-color: var(--color-background-hover);
+	font-size: 0.8em;
+	/* Selectable, so the numbers can still be got at if the clipboard is refused. */
+	user-select: text;
+}
+
+.music-radio-onair__diagnostics-list {
+	display: grid;
+	grid-template-columns: auto auto;
+	gap: 0.15rem 0.75rem;
+	margin: 0 0 0.5rem;
+}
+
+.music-radio-onair__diagnostics-list > div {
+	display: contents;
+}
+
+.music-radio-onair__diagnostics-list dt {
+	color: var(--color-text-maxcontrast);
+}
+
+.music-radio-onair__diagnostics-list dd {
+	margin: 0;
+	font-variant-numeric: tabular-nums;
 }
 
 .music-radio-onair__controls {

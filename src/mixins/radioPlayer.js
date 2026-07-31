@@ -25,18 +25,12 @@ import {
 	CLOCK_BURST,
 	CLOCK_BURST_SPACING_MS,
 	CLOCK_REFRESH_MS,
-	DEADBAND_MS,
-	MAX_NUDGE_MS,
 	PRELOAD_LEAD_MS,
-	RATE_CHANGE_SETTLE_MS,
-	RATE_CLAMP,
+	RESEEK_MS,
 	STALL_RECOVERY_MS,
-	SYNC_SPEED_TIME,
 	TICK_MS,
 	WATCH_CLOCK_BURST,
 } from '../utils/syncConstants.js'
-
-const clamp = (value, min, max) => Math.min(max, Math.max(min, value))
 
 /**
  * Whether this is an iOS device, including an iPad reporting itself as a Mac.
@@ -105,6 +99,36 @@ export default {
 			 * Surfaced so the listener is asked, rather than left with silence.
 			 */
 			needsGesture: false,
+			/**
+			 * Counters for the diagnostic readout.
+			 *
+			 * iOS cannot be driven from the test suite — Nextcloud's unsupported-browser
+			 * gate rejects a spoofed user agent both server-side and in the page — so the
+			 * only way to tell a stuttering phone from a healthy one is to have the phone
+			 * say. These are what it says. Cheap enough to keep always rather than behind
+			 * a flag: three integers and an arithmetic mean.
+			 */
+			rateChanges: 0,
+			stallCount: 0,
+			hardSeeks: 0,
+			/**
+			 * Track boundaries crossed, and what happened when the next track was started.
+			 *
+			 * "It never plays the next song" could be several different faults — the
+			 * boundary never firing, the browser refusing the play(), or the play losing a
+			 * race with the load it was issued against. These three tell them apart from
+			 * the phone, which is the only place the fault has ever been seen.
+			 */
+			boundaries: 0,
+			playRefusals: 0,
+			playRetries: 0,
+			/**
+			 * Seconds of audio downloaded beyond the play position.
+			 *
+			 * The number that predicts a dropout *before* it is audible: a healthy element
+			 * sits comfortably ahead, and one about to stutter hovers near zero.
+			 */
+			bufferedAheadMs: 0,
 		}
 	},
 
@@ -147,7 +171,6 @@ export default {
 		this.activeAudio = null
 		this.idleAudio = null
 		this.preloadedTrackId = null
-		this.lastRateChangeAt = 0
 		this.pendingSeek = false
 		// performance.now() at which the active element last ran out of data, or 0 when it
 		// has not. Everything about stall handling hangs off this one value.
@@ -247,6 +270,18 @@ export default {
 			for (const audio of [this.audioA, this.audioB]) {
 				this.watchForStalls(audio)
 				audio.preload = 'auto'
+				// Resample rather than time-stretch when the rate is nudged.
+				//
+				// Browsers preserve pitch by default, which means every rate change engages
+				// a time-stretcher — expensive on a phone and audibly grainy. The correction
+				// here never goes past ±5 %, which as a pure resample is a pitch shift of
+				// well under a semitone: on music, next to nothing. The artefacts it
+				// replaces were not.
+				//
+				// `webkitPreservesPitch` is still what older Safari reads; assigning both is
+				// how one line covers the browsers this actually matters on.
+				audio.preservesPitch = false
+				audio.webkitPreservesPitch = false
 				audio.hidden = true
 				audio.dataset.musicRadioPlayer = 'true'
 				// Attached rather than left detached: a detached element still plays, but
@@ -266,7 +301,7 @@ export default {
 		 * phone unusable. The only acknowledgement a stall got was `readyState < 2` in
 		 * correctDrift, which returns without doing anything — so the broadcast walked away
 		 * from a stalled element, and by the time it recovered the gap was past
-		 * MAX_NUDGE_MS and the correction was a seek. A seek re-requests the audio, which
+		 * RESEEK_MS and the correction was a seek. A seek re-requests the audio, which
 		 * on a weak connection stalls again, which widens the gap again. That loop is
 		 * exactly what "the song gets stuck" describes.
 		 *
@@ -281,6 +316,7 @@ export default {
 				if (audio === this.activeAudio && this.stalledSince === 0) {
 					this.stalledSince = performance.now()
 					this.stalled = true
+					this.stallCount++
 				}
 			}
 			const recovered = () => {
@@ -294,6 +330,18 @@ export default {
 			audio.addEventListener('stalled', stalled)
 			audio.addEventListener('playing', recovered)
 			audio.addEventListener('canplay', recovered)
+
+			// Counted from the browser's own event rather than from wherever a rate might be
+			// assigned, so it stays true no matter who does the assigning.
+			//
+			// Nothing should: correcting drift by nudging the rate is what broke playback on
+			// Firefox and WebKit, and it was removed — see RESEEK_MS. This is the tripwire.
+			// If it ever reads anything but zero, something has started nudging again.
+			audio.addEventListener('ratechange', () => {
+				if (audio === this.activeAudio) {
+					this.rateChanges++
+				}
+			})
 		},
 
 		/**
@@ -554,15 +602,60 @@ export default {
 				if (error?.name === 'NotAllowedError') {
 					// Recoverable, but only by the listener: something has to be pressed.
 					this.needsGesture = true
+					this.playRefusals++
 					return
 				}
 
 				// AbortError is routine — a load() or a new src while play() was pending
-				// aborts it, and the next state application starts it again.
-				if (error?.name !== 'AbortError') {
-					this.syncError = t('music_radio', 'This browser would not start playback')
+				// aborts it. It is *not* routine at a track boundary, which is exactly when
+				// it happens: advanceLocally assigns a new src, seeks, and calls play() in
+				// the same breath, so the play is racing the load it was issued against.
+				//
+				// One retry when the element is actually ready. Without it the only thing
+				// that could start the track was the forced state refresh straight
+				// afterwards, which fires just as early and loses the same race — and if
+				// both lose, nothing else ever tries and the channel simply stops between
+				// songs. Cheap, idempotent, and harmless where the first attempt worked.
+				if (error?.name === 'AbortError') {
+					this.playWhenReady(audio)
+					return
 				}
+
+				this.syncError = t('music_radio', 'This browser would not start playback')
 			})
+		},
+
+		/**
+		 * Try again once the element has enough data to start.
+		 *
+		 * `once` on both, and guarded on the element still being the active one: a boundary
+		 * that arrives while this is pending must not have a stale listener start the track
+		 * that has since been swapped away.
+		 *
+		 * @param {HTMLAudioElement} audio the element the failed play() belonged to
+		 */
+		playWhenReady(audio) {
+			const attempt = () => {
+				audio.removeEventListener('canplay', attempt)
+				audio.removeEventListener('loadeddata', attempt)
+
+				if (audio !== this.activeAudio || !audio.paused || this.syncState?.status !== 'playing') {
+					return
+				}
+
+				this.playRetries++
+				audio.play().then(() => {
+					this.needsGesture = false
+				}).catch((error) => {
+					if (error?.name === 'NotAllowedError') {
+						this.needsGesture = true
+						this.playRefusals++
+					}
+				})
+			}
+
+			audio.addEventListener('canplay', attempt, { once: true })
+			audio.addEventListener('loadeddata', attempt, { once: true })
 		},
 
 		/**
@@ -653,8 +746,38 @@ export default {
 				return
 			}
 
+			this.sampleBuffer()
 			this.preloadNextIfDue(target)
 			this.correctDrift(target)
+		},
+
+		/**
+		 * How much audio is downloaded beyond where the element is playing.
+		 *
+		 * Sampled on the tick rather than computed on demand, because the interesting
+		 * reading is the one taken *while* it is playing badly — by the time somebody looks
+		 * at a readout, a phone that stuttered a moment ago has usually recovered.
+		 *
+		 * Only the range containing the play position counts. A media element can hold
+		 * several disjoint ranges after seeking, and the ones behind or ahead of a gap say
+		 * nothing about whether the next second of audio is there.
+		 */
+		sampleBuffer() {
+			const audio = this.activeAudio
+			if (!audio) {
+				return
+			}
+
+			const at = audio.currentTime
+			for (let i = 0; i < audio.buffered.length; i++) {
+				if (at >= audio.buffered.start(i) && at <= audio.buffered.end(i)) {
+					this.bufferedAheadMs = Math.round((audio.buffered.end(i) - at) * 1000)
+					return
+				}
+			}
+
+			// Playing from a position nothing covers: about to stall, if it has not already.
+			this.bufferedAheadMs = 0
 		},
 
 		/**
@@ -696,6 +819,7 @@ export default {
 			}
 			this.preloadedTrackId = null
 			this.advancedAtServerMs = startedAtMs
+			this.boundaries++
 
 			this.loadTrack(this.activeAudio, this.localTrack)
 			this.hardSeek(this.targetOffsetMs())
@@ -759,9 +883,9 @@ export default {
 			const audio = this.activeAudio
 			// A paused element is deliberately not corrected. While one is stopped the
 			// broadcast keeps moving, so the drift grows without limit and every correction
-			// past MAX_NUDGE_MS hard-seeks — and each hard seek mutes for up to a second.
-			// A player that had stopped was therefore also being re-muted roughly once a
-			// second, which would have kept it silent even once it was started again.
+			// past RESEEK_MS hard-seeks — and each hard seek mutes across the seek. A player
+			// that had stopped was therefore also being re-muted roughly once a second,
+			// which would have kept it silent even once it was started again.
 			if (!audio || audio.paused || audio.readyState < 2 || this.pendingSeek) {
 				return
 			}
@@ -777,36 +901,17 @@ export default {
 				return
 			}
 
-			// Safari stalls `currentTime` briefly after a rate change, so anything
-			// measured in that window is not a real drift reading.
-			if (performance.now() - this.lastRateChangeAt < RATE_CHANGE_SETTLE_MS) {
-				return
-			}
-
 			const actual = audio.currentTime * 1000
 			const diff = target - actual
 			this.driftMs = Math.round(diff)
 
-			if (Math.abs(diff) <= DEADBAND_MS) {
-				this.setRate(1)
-				return
-			}
-
-			if (Math.abs(diff) < MAX_NUDGE_MS) {
-				this.setRate(clamp(1 + diff / SYNC_SPEED_TIME, 1 - RATE_CLAMP, 1 + RATE_CLAMP))
+			// Anything short of RESEEK_MS is left alone. Nothing at all happens to the
+			// element — see the note on RESEEK_MS for why "do nothing" is the correction.
+			if (Math.abs(diff) < RESEEK_MS) {
 				return
 			}
 
 			this.hardSeek(target)
-		},
-
-		setRate(rate) {
-			const audio = this.activeAudio
-			if (!audio || Math.abs(audio.playbackRate - rate) < 0.001) {
-				return
-			}
-			audio.playbackRate = rate
-			this.lastRateChangeAt = performance.now()
 		},
 
 		hardSeek(targetMs) {
@@ -826,6 +931,7 @@ export default {
 
 			audio.muted = true
 			this.pendingSeek = true
+			this.hardSeeks++
 
 			const onSeeked = () => {
 				// Back to whatever the listener chose, never unconditionally unmuted.
@@ -844,7 +950,6 @@ export default {
 				this.pendingSeek = false
 				audio.muted = this.muted
 			}
-			this.setRate(1)
 		},
 
 		// --------------------------------------------------------------- control

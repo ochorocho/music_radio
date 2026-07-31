@@ -37,6 +37,23 @@ export const playerStore = reactive({
 		error: null,
 		/** The browser refused to start playback until something is pressed. */
 		needsGesture: false,
+		/**
+		 * What the diagnostic panel reads.
+		 *
+		 * iOS cannot be exercised from the test suite, so when somebody reports that a
+		 * phone stutters there is otherwise nothing to go on but the description. These
+		 * are the four numbers that distinguish the possible causes: a starved buffer, an
+		 * element repeatedly running dry, a seek storm, or a rate being changed so often
+		 * that the browser never settles.
+		 */
+		bufferedAheadMs: 0,
+		rateChanges: 0,
+		stallCount: 0,
+		hardSeeks: 0,
+		boundaries: 0,
+		playRefusals: 0,
+		playRetries: 0,
+		playbackRate: 1,
 	},
 
 	/**

@@ -56,6 +56,17 @@ export default {
 				stalled: this.stalled,
 				error: this.syncError,
 				needsGesture: this.needsGesture,
+				// For the diagnostic panel. Published from here for the same reason
+				// everything else is: this component owns the audio, and the component
+				// drawing the readout does not.
+				bufferedAheadMs: this.bufferedAheadMs,
+				rateChanges: this.rateChanges,
+				stallCount: this.stallCount,
+				hardSeeks: this.hardSeeks,
+				boundaries: this.boundaries,
+				playRefusals: this.playRefusals,
+				playRetries: this.playRetries,
+				playbackRate: this.activeAudio?.playbackRate ?? 1,
 			}
 		},
 

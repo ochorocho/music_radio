@@ -45,6 +45,9 @@ async function fetchRange(page: Page, url: string, range?: string) {
 				contentLength: response.headers.get('content-length'),
 				acceptRanges: response.headers.get('accept-ranges'),
 				contentType: response.headers.get('content-type'),
+				cacheControl: response.headers.get('cache-control'),
+				etag: response.headers.get('etag'),
+				lastModified: response.headers.get('last-modified'),
 				byteLength: buffer.byteLength,
 			}
 		},
@@ -90,6 +93,39 @@ test('a request without a Range header returns the whole file', async ({ page })
 	expect(result.acceptRanges).toBe('bytes')
 	// A whole-file response must not claim to be partial.
 	expect(result.contentRange).toBeNull()
+})
+
+/**
+ * The audio has to be keepable.
+ *
+ * A Response carries Nextcloud's default of `no-cache, no-store, must-revalidate` unless it
+ * says otherwise, which is right for JSON and wrong for a nine-megabyte media file:
+ * `no-store` forbids holding on to the bytes at all, and with no ETag and no Last-Modified
+ * there is nothing for `If-Range` to validate against. A media element fetches a track as a
+ * long series of small ranges and relies on both, so it re-fetched continuously — and on a
+ * phone, every hiccup on the connection became an audible dropout.
+ *
+ * Asserted on the range response specifically: that is the one a media element actually
+ * makes, over and over.
+ */
+test('the audio is cacheable and carries validators', async ({ page }) => {
+	const url = `${API}/channels/${channelId}/tracks/${trackId}/stream`
+	const result = await fetchRange(page, url, 'bytes=0-1023')
+
+	expect(result.status).toBe(206)
+
+	// The regression that matters. `no-store` is what made every byte unkeepable.
+	expect(result.cacheControl).not.toContain('no-store')
+	expect(result.cacheControl).toContain('private')
+	expect(result.cacheControl).toMatch(/max-age=\d+/)
+
+	// Both validators, so a revalidation has something to be conditional on.
+	expect(result.etag ?? '').toMatch(/\S/)
+	expect(result.lastModified ?? '').toMatch(/\S/)
+
+	// Private, never public: a track is somebody's file, and this same endpoint serves
+	// anonymous link visitors. No shared cache has any business keeping it.
+	expect(result.cacheControl).not.toContain('public')
 })
 
 test('Safari\'s opening two-byte probe is answered with a 206', async ({ page }) => {
