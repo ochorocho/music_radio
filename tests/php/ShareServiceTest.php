@@ -281,21 +281,100 @@ class ShareServiceTest extends TestCase {
 	}
 
 	/**
-	 * Anyone at all can follow a link, so the bits that decide what the channel *is* are
-	 * never on offer — and asking for them fails loudly rather than quietly granting less.
+	 * A link can be handed the broadcast itself: play, pause, skip, and the running order.
+	 * Which of those it gets is the owner's decision per link, made in the same list of
+	 * switches as for a named person.
 	 */
-	public function testALinkCannotBeCreatedWithAnythingElse(): void {
+	public function testALinkMayAlsoBeGivenControlAndCuration(): void {
+		$share = $this->service->create(
+			self::channel(), 'alice', Share::TYPE_LINK, null,
+			Permission::LISTEN | Permission::CONTROL | Permission::EDIT_PLAYLIST,
+		);
+
+		// EDIT_PLAYLIST implies ADD_TRACKS, as it does for any other share — normalize()
+		// folds that in, so a curator is never left unable to add what they may reorder.
+		self::assertSame(
+			Permission::LISTEN | Permission::ADD_TRACKS | Permission::CONTROL | Permission::EDIT_PLAYLIST,
+			$share->getPermissions(),
+		);
+	}
+
+	/**
+	 * Sharing the channel on and managing it are the two that decide what the channel *is*
+	 * rather than what it is playing, so they are never on offer to whoever holds a URL —
+	 * and asking for them fails loudly rather than quietly granting less.
+	 */
+	public function testALinkCannotBeCreatedWithSharingOrManagement(): void {
 		$this->expectException(MusicRadioException::class);
 		$this->service->create(self::channel(), 'alice', Share::TYPE_LINK, null, Permission::ALL);
 	}
 
-	public function testALinkCannotBeUpgradedPastUploadingLater(): void {
+	public function testALinkCannotBeGivenSharingLater(): void {
 		$share = new Share();
 		$share->setShareType(Share::TYPE_LINK);
 		$share->setPermissions(Permission::LISTEN);
 
 		$this->expectException(MusicRadioException::class);
-		$this->service->update($share, Permission::CONTROL, null, null);
+		$this->service->update($share, Permission::LISTEN | Permission::SHARE, null, null);
+	}
+
+	public function testALinkCanBeGivenControlLater(): void {
+		$share = new Share();
+		$share->setShareType(Share::TYPE_LINK);
+		$share->setPermissions(Permission::LISTEN);
+
+		$this->service->update($share, Permission::LISTEN | Permission::CONTROL, null, null);
+
+		self::assertSame(Permission::LISTEN | Permission::CONTROL, $share->getPermissions());
+	}
+
+	// --------------------------------------------------------- the rules a share carries
+
+	/**
+	 * The four booleans the share dialog writes. Null leaves each alone, so one switch can
+	 * be flipped without restating the rest — which is how the dialog uses this, one PUT
+	 * per switch.
+	 */
+	public function testEachRuleCanBeSetOnItsOwn(): void {
+		$share = new Share();
+		$share->setShareType(Share::TYPE_USER);
+		$share->setPermissions(Permission::PRESET_CONTRIBUTOR);
+		$share->setRequireApproval(true);
+		$share->setAllowVoting(false);
+		$share->setShowListenerCount(true);
+		$share->setAllowImport(false);
+
+		$this->service->update($share, null, null, null, allowVoting: true);
+
+		self::assertTrue($share->getAllowVoting());
+		// Untouched, because they were not mentioned.
+		self::assertTrue($share->getRequireApproval());
+		self::assertTrue($share->getShowListenerCount());
+		self::assertFalse($share->getAllowImport());
+
+		$this->service->update($share, null, null, null, requireApproval: false, allowImport: true);
+
+		self::assertFalse($share->getRequireApproval());
+		self::assertTrue($share->getAllowImport());
+		self::assertTrue($share->getAllowVoting());
+	}
+
+	/**
+	 * The rules are not permissions and travel separately, so changing one must not
+	 * disturb the mask — nor may writing the mask reset the rules.
+	 */
+	public function testTheRulesAndTheMaskDoNotDisturbEachOther(): void {
+		$share = new Share();
+		$share->setShareType(Share::TYPE_LINK);
+		$share->setPermissions(Permission::LISTEN);
+		$share->setAllowVoting(true);
+
+		$this->service->update($share, Permission::LISTEN | Permission::CONTROL, null, null);
+		self::assertTrue($share->getAllowVoting());
+
+		$this->service->update($share, null, null, null, showListenerCount: false);
+		self::assertSame(Permission::LISTEN | Permission::CONTROL, $share->getPermissions());
+		self::assertFalse($share->getShowListenerCount());
 	}
 
 	public function testUploadingCanBeSwitchedOnAndOffAfterwards(): void {

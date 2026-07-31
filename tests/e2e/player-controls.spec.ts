@@ -69,7 +69,7 @@ test.beforeEach(async ({ page, db }) => {
 	channelId = created.body.id
 
 	const fileRows = await db.query<Array<{ fileid: number }>>(
-		"select fileid from oc_filecache where name in ('tone-a.mp3','tone-b.mp3','tone-c.mp3') and path like 'files/Music/%' order by name",
+		"select fileid from oc_filecache where name in ('tone-a.mp3','tone-b.mp3','tone-c.mp3') and path like 'files/Music/%' and path not like 'files/Music/%/%' order by name",
 	)
 	await api(page, 'POST', `${API}/channels/${channelId}/tracks`, {
 		fileIds: fileRows.map((r) => r.fileid),
@@ -354,6 +354,169 @@ test('nothing is left playing after tuning out', async ({ page }) => {
 		Array.from(document.querySelectorAll('audio')).filter((a) => !a.paused && !a.ended).length,
 	)
 	expect(stillPlaying).toBe(0)
+})
+
+// -------------------------------------------------------------------- seeking
+
+/**
+ * Pause through the interface, not through the API.
+ *
+ * Every control here carries the state version the page last saw, so that two people (or
+ * two tabs) cannot silently overwrite each other. Changing the channel behind the page's
+ * back therefore makes its *next* action a conflict — which is correct behaviour and
+ * useless as a starting position for a test about seeking.
+ *
+ * @param page playwright page
+ */
+async function pauseFromTheInterface(page: Page) {
+	// Wait for the state to have arrived before pressing anything. The button is a toggle
+	// that reads the state it has, and with none it reads as stopped — so an early press
+	// asks the server to start a channel rather than to stop it.
+	await expect
+		.poll(async () => (await readSync(page)).status, { timeout: 20_000 })
+		.toMatch(/^(playing|paused)$/)
+
+	if ((await readSync(page)).status === 'playing') {
+		await page.getByTestId('control-playpause').click()
+	}
+
+	await expect.poll(async () => (await readSync(page)).status, { timeout: 20_000 }).toBe('paused')
+}
+
+/**
+ * Dragging the progress bar.
+ *
+ * Paused first, deliberately. The fixtures are three to eight seconds long, so against a
+ * running programme the position asserted here would have moved on before the assertion
+ * read it, and the test would be measuring the clock rather than the seek.
+ */
+test('dragging the progress bar moves the broadcast', async ({ page }) => {
+	await openChannel(page, channelTitle)
+	await expect(page.getByTestId('seek-bar')).toBeVisible({ timeout: 20_000 })
+	await pauseFromTheInterface(page)
+
+	const bar = page.getByTestId('seek-bar')
+	const box = await bar.boundingBox()
+	if (box === null) {
+		throw new Error('the seek bar has no geometry')
+	}
+
+	// A real gesture: press on the handle, move across, release. Not a synthesised value
+	// change — that dragging works is the whole claim.
+	await page.mouse.move(box.x + 4, box.y + box.height / 2)
+	await page.mouse.down()
+	await page.mouse.move(box.x + box.width * 0.6, box.y + box.height / 2, { steps: 10 })
+	await page.mouse.up()
+
+	// Generous bounds: where a drag lands depends on the thumb's width and the browser's
+	// rounding, and the claim is "it moved to roughly there", not to the millisecond. The
+	// track playing is whichever the channel had reached, so the figure is checked against
+	// its own length rather than against a number written here.
+	await expect
+		.poll(async () => {
+			const sync = await readSync(page)
+			return sync.offsetMs
+		}, { timeout: 20_000 })
+		.toBeGreaterThan(900)
+
+	const state = await api(page, 'GET', `${API}/channels/${channelId}/state`)
+	expect(state.body.current.offsetMs, 'the server moved, not just the page')
+		.toBeGreaterThan(900)
+})
+
+/**
+ * A control only reachable by dragging is not reachable at all for some people, which is
+ * why this is a native range input rather than a div with pointer handlers.
+ *
+ * Two presses, one seek: a burst of key repeats is one intention, and sending a request
+ * per repeat would re-anchor the timeline repeatedly and race its own state version.
+ */
+test('the progress bar can be moved from the keyboard', async ({ page }) => {
+	await openChannel(page, channelTitle)
+	await expect(page.getByTestId('seek-bar')).toBeVisible({ timeout: 20_000 })
+	await pauseFromTheInterface(page)
+
+	let seeks = 0
+	page.on('request', (request) => {
+		if (request.method() === 'POST' && (request.postData() ?? '').includes('"seek"')) {
+			seeks++
+		}
+	})
+
+	await page.getByTestId('seek-bar').focus()
+	await page.keyboard.press('End')
+
+	// End goes to the end of the track, whatever that track's length is — the fixtures
+	// differ, and the channel is wherever it had got to.
+	await expect
+		.poll(async () => {
+			const sync = await readSync(page)
+			return sync.offsetMs
+		}, { timeout: 20_000 })
+		.toBeGreaterThan(1500)
+
+	await page.keyboard.press('Home')
+	await expect
+		.poll(async () => (await readSync(page)).offsetMs, { timeout: 20_000 })
+		.toBeLessThan(500)
+
+	expect(seeks, 'one request per gesture').toBe(2)
+})
+
+/**
+ * The handle and the fill behind it must agree.
+ *
+ * A range input snaps whatever value it is given to its step and draws the handle there,
+ * so a fill drawn from the unrounded position lands somewhere the handle is not — which is
+ * exactly what happened: the handle two thirds along, the blue two fifths. Nothing failed;
+ * it just looked wrong, which is why this is asserted rather than left to be noticed.
+ */
+test('the handle and the filled part of the bar are in the same place', async ({ page }) => {
+	await openChannel(page, channelTitle)
+	await expect(page.getByTestId('seek-bar')).toBeVisible({ timeout: 20_000 })
+	await pauseFromTheInterface(page)
+
+	// Somewhere deliberately not on a whole second, which is where the two used to part.
+	await page.getByTestId('seek-bar').focus()
+	await page.keyboard.press('Home')
+	await expect.poll(async () => (await readSync(page)).offsetMs, { timeout: 20_000 }).toBeLessThan(500)
+	await api(page, 'POST', `${API}/channels/${channelId}/control`, { action: 'seek', offsetMs: 1500 })
+
+	await expect
+		.poll(async () => {
+			const bar = await page.getByTestId('seek-bar').evaluate((el: any) => ({
+				value: Number(el.value),
+				max: Number(el.max),
+				fill: parseFloat(getComputedStyle(el).getPropertyValue('--music-radio-scrub-fill')),
+			}))
+			if (!bar.max || bar.value === 0) {
+				return null
+			}
+			return Math.abs((bar.value / bar.max) * 100 - bar.fill)
+		}, { timeout: 20_000 })
+		.toBeLessThan(0.5)
+})
+
+test('someone who may only listen gets a readout, not a control', async ({ page, browser }) => {
+	await openChannel(page, channelTitle)
+
+	const created = await api(page, 'POST', `${API}/channels/${channelId}/shares`, { shareType: 3 })
+	const token = created.body.token as string
+
+	const context = await browser.newContext({ ignoreHTTPSErrors: true, storageState: undefined })
+	const visitor = await context.newPage()
+	try {
+		await visitor.goto(`${APP_PATH}s/${token}`)
+		await expect(visitor.getByTestId('public-channel-title')).toBeVisible({ timeout: 20_000 })
+		// Something from the player is on the page, so the absence below is about the
+		// control and not about the card having failed to render.
+		await expect(visitor.getByTestId('now-playing-title')).toBeVisible({ timeout: 20_000 })
+
+		await expect(visitor.getByTestId('seek-bar'), 'a link never controls anything').toHaveCount(0)
+	} finally {
+		await visitor.close()
+		await context.close()
+	}
 })
 
 // ------------------------------------------------------------------- app icon

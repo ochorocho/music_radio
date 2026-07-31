@@ -53,6 +53,7 @@ export default {
 				clockReady: this.clockReady,
 				clockRttMs: this.clockRttMs,
 				driftMs: this.driftMs,
+				stalled: this.stalled,
 				error: this.syncError,
 				needsGesture: this.needsGesture,
 			}

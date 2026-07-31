@@ -109,6 +109,32 @@ class ShareMapper extends QBMapper {
 	}
 
 	/**
+	 * Whether anybody this channel is shared with may vote.
+	 *
+	 * Drives `music_radio_channels.allow_voting`, which is no longer a switch an owner
+	 * sets but a fact about the shares — see ChannelService::syncVotingMode for why the
+	 * channel still needs to hold the answer. Expiry is deliberately not considered: a
+	 * share that lapses does not reorder the playlist behind anyone's back, and the value
+	 * is recomputed the next time any share is touched.
+	 *
+	 * @throws Exception
+	 */
+	public function anyAllowsVoting(int $channelId): bool {
+		$qb = $this->db->getQueryBuilder();
+		$qb->select('id')
+			->from($this->getTableName())
+			->where($qb->expr()->eq('channel_id', $qb->createNamedParameter($channelId, IQueryBuilder::PARAM_INT)))
+			->andWhere($qb->expr()->eq('allow_voting', $qb->createNamedParameter(true, IQueryBuilder::PARAM_BOOL)))
+			->setMaxResults(1);
+
+		$result = $qb->executeQuery();
+		$row = $result->fetch();
+		$result->closeCursor();
+
+		return $row !== false;
+	}
+
+	/**
 	 * @throws Exception
 	 */
 	public function deleteAllForChannel(int $channelId): void {

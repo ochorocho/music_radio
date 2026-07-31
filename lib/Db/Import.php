@@ -32,8 +32,12 @@ use OCP\DB\Types;
  * @method void setDurationMs(?int $durationMs)
  * @method int|null getTrackId()
  * @method void setTrackId(?int $trackId)
+ * @method bool getApproved()
+ * @method void setApproved(bool $approved)
  * @method string|null getErrorCode()
  * @method void setErrorCode(?string $errorCode)
+ * @method string|null getErrorDetail()
+ * @method void setErrorDetail(?string $errorDetail)
  * @method int getAttempts()
  * @method void setAttempts(int $attempts)
  * @method int getCreatedAt()
@@ -79,6 +83,8 @@ class Import extends Entity implements \JsonSerializable {
 	protected $durationMs;
 	protected $trackId;
 	protected $errorCode;
+	protected $errorDetail;
+	protected $approved;
 	protected $attempts;
 	protected $createdAt;
 	protected $startedAt;
@@ -97,6 +103,11 @@ class Import extends Entity implements \JsonSerializable {
 		$this->addType('durationMs', Types::INTEGER);
 		$this->addType('trackId', Types::BIGINT);
 		$this->addType('errorCode', Types::STRING);
+		$this->addType('errorDetail', Types::STRING);
+		// Decided when the import is asked for, because the job that files it cannot work
+		// it out: it holds only this row, and a link's requester is `?link:<key>` rather
+		// than an account that could be resolved back to a share.
+		$this->addType('approved', Types::BOOLEAN);
 		$this->addType('attempts', Types::SMALLINT);
 		$this->addType('createdAt', Types::BIGINT);
 		$this->addType('startedAt', Types::BIGINT);

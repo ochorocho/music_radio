@@ -74,6 +74,7 @@
 			:channel="channel"
 			:playable-count="playableCount"
 			@playlist-changed="loadTracks"
+			@votes-changed="loadTracks"
 			@on-air-changed="onAirTrackId = $event"
 			@tuned-in-changed="onTunedInChanged" />
 
@@ -81,6 +82,15 @@
 			v-if="imports.length > 0"
 			:imports="imports"
 			@dismiss="onDismissImport" />
+
+		<NcNoteCard
+			v-if="heldCount > 0"
+			type="info"
+			data-testid="held-note"
+			:text="n('music_radio',
+				'%n track is waiting for you to let it play.',
+				'%n tracks are waiting for you to let them play.',
+				heldCount)" />
 
 		<NcNoteCard
 			v-if="pendingCount > 0"
@@ -97,11 +107,15 @@
 			:on-air-track-id="onAirTrackId"
 			:can-preview="!tunedIn"
 			:preview-track-id="previewTrack?.id ?? null"
+			:show-votes="votingEnabled"
+			:can-vote="canVote"
+			@vote="onVote"
 			@reorder="onReorder"
 			@remove="onRemove"
 			@play="onPlayTrack"
 			@preview="onPreview"
-			@toggle-disabled="onToggleDisabled" />
+			@toggle-disabled="onToggleDisabled"
+			@approve="onApprove" />
 
 		<PreviewPlayer
 			v-if="previewTrack"
@@ -120,7 +134,11 @@
 			     close button. Guarded on defaultPrevented so a widget that legitimately
 			     consumes Escape first — a combobox closing its dropdown — still wins. -->
 			<div @keydown.esc="onSharingEscape">
-				<SharingPanel :channel="channel" />
+				<SharingPanel
+					:channel="channel"
+					:import-capabilities="importCapabilities"
+					@rules-changed="loadTracks"
+					@channel-gone="onChannelGone" />
 			</div>
 		</NcDialog>
 
@@ -161,9 +179,17 @@ import PreviewPlayer from './PreviewPlayer.vue'
 import SharingPanel from './SharingPanel.vue'
 import YoutubeImportDialog from './YoutubeImportDialog.vue'
 import { ADD_TRACKS, MANAGE, SHARE, can } from '../utils/permissions.js'
-import { addTracks, deleteChannel, deleteTrack, dismissImport, errorMessage, fetchImports, fetchTracks, reorderTracks, updateTrack } from '../utils/api.js'
+import { addTracks, deleteChannel, deleteTrack, dismissImport, errorMessage, fetchImports, fetchTracks, reorderTracks, updateTrack, voteForTrack } from '../utils/api.js'
 import { formatDuration, totalDuration } from '../utils/format.js'
 import { measureDurations, pickAudioFiles } from '../utils/filePicker.js'
+
+/**
+ * How long a finished import stays on the list before tidying itself away.
+ *
+ * Long enough to notice and read, short enough that a session's worth of imports does not
+ * pile up into a panel nobody asked for. Failures are exempt — see scheduleAutoDismiss.
+ */
+const AUTO_DISMISS_MS = 5000
 
 export default {
 	name: 'ChannelView',
@@ -210,6 +236,11 @@ export default {
 	data() {
 		return {
 			tracks: [],
+			// Both come from the server with the playlist rather than being worked out
+			// here: whether the channel allows voting, and whether this person may.
+			votingEnabled: false,
+			canVote: false,
+			mayImport: false,
 			loadingTracks: true,
 			adding: false,
 			showSettings: false,
@@ -223,6 +254,8 @@ export default {
 			importCapabilities: this.initialImportCapabilities,
 			showImport: false,
 			importPoll: null,
+			/** Import id → the timer that will clear it away. See scheduleAutoDismiss. */
+			autoDismissTimers: {},
 			ADD_TRACKS,
 		}
 	},
@@ -237,18 +270,34 @@ export default {
 		},
 
 		/**
-		 * Offered only when the permission allows it *and* the server can actually do it.
-		 * A button that always fails is worse than no button — though the dialog still
-		 * explains itself if the server loses the ability between page load and click.
+		 * Offered only when the server says this viewer may import *and* it can actually
+		 * do it. A button that always fails is worse than no button.
+		 *
+		 * The permission half is not worked out here. Importing now depends on the channel's
+		 * switch and on the share that let this viewer in, and deriving that in the page
+		 * would be a second implementation of a rule the endpoint already applies — which
+		 * is precisely how a button comes to promise what the server refuses. So the
+		 * playlist payload answers it and this reads the answer; only the server's ability,
+		 * which the payload does not carry, is added on top.
 		 */
 		canImport() {
-			return can(this.channel.permissions, ADD_TRACKS)
-				&& this.importCapabilities.available !== false
+			return this.mayImport && this.importCapabilities.available !== false
 		},
 
-		/** Tracks the server could not measure, and which therefore do not play. */
+		/**
+		 * Tracks the server could not measure, and which therefore do not play.
+		 *
+		 * Counted on the *reason*, not on `playable`. Anything unplayable used to land in
+		 * this number, so a track the owner had deliberately skipped was reported back to
+		 * them as one whose length could not be read.
+		 */
 		pendingCount() {
-			return this.tracks.filter((track) => !track.playable).length
+			return this.tracks.filter((track) => !track.durationMs).length
+		},
+
+		/** Added by somebody else, waiting for the owner to let it play. */
+		heldCount() {
+			return this.tracks.filter((track) => track.awaitingApproval).length
 		},
 
 		/** Tracks that actually take part in the broadcast. */
@@ -271,6 +320,7 @@ export default {
 
 	beforeUnmount() {
 		this.stopImportPoll()
+		this.clearAutoDismissTimers()
 	},
 
 	methods: {
@@ -286,6 +336,9 @@ export default {
 			try {
 				const data = await fetchTracks(this.channel.id)
 				this.tracks = data.tracks
+				this.votingEnabled = data.votingEnabled === true
+				this.canVote = data.canVote === true
+				this.mayImport = data.canImport === true
 			} catch (error) {
 				showError(errorMessage(error, t('music_radio', 'Could not load the playlist')))
 			} finally {
@@ -296,15 +349,12 @@ export default {
 		async addTracks() {
 			let nodes
 			try {
+				// Dismissing the picker comes back as an empty array, not a rejection —
+				// pickAudioFiles absorbs that. So anything caught here is a real fault and
+				// is surfaced, rather than being guessed at from the message.
 				nodes = await pickAudioFiles()
 			} catch (error) {
-				// Closing the picker without choosing rejects, and that is not a failure.
-				// Anything else is, and must be surfaced — swallowing every rejection here
-				// is what made a genuinely broken picker look like a button that simply
-				// did nothing.
-				if (error?.name !== 'FilePickerClosed' && !/cancel|close/i.test(error?.message ?? '')) {
-					showError(errorMessage(error, t('music_radio', 'Could not open the file picker')))
-				}
+				showError(errorMessage(error, t('music_radio', 'Could not open the file picker')))
 				return
 			}
 			if (!nodes || nodes.length === 0) {
@@ -364,7 +414,59 @@ export default {
 			}
 
 			this.announceFinished(previous)
+			this.scheduleAutoDismiss()
 			this.syncImportPoll()
+		},
+
+		/**
+		 * Clear finished imports off the list a few seconds after they land.
+		 *
+		 * The queue exists to say "this is coming"; once the track is on the playlist it has
+		 * said it, and a row reading "Added to the playlist" for the rest of the session is
+		 * a box that has to be tidied up by hand. The delay is what makes it an answer
+		 * rather than a flicker — long enough to read, short enough not to accumulate.
+		 *
+		 * Only `done`. A failure has to stay: it is the only place the reason is written,
+		 * and taking it away after five seconds would be taking away the explanation.
+		 *
+		 * Driven off the current list rather than off the transition, so an import already
+		 * finished when the page loaded is tidied away too.
+		 */
+		scheduleAutoDismiss() {
+			for (const item of this.imports) {
+				if (item.status !== 'done' || this.autoDismissTimers[item.id] !== undefined) {
+					continue
+				}
+
+				this.autoDismissTimers[item.id] = setTimeout(() => {
+					delete this.autoDismissTimers[item.id]
+					this.autoDismiss(item)
+				}, AUTO_DISMISS_MS)
+			}
+		},
+
+		/**
+		 * Quietly, unlike the button: nobody asked for this one, so a toast explaining that
+		 * tidying up did not work would be noise about something they were not doing.
+		 *
+		 * @param {object} item the finished import to clear away
+		 */
+		async autoDismiss(item) {
+			this.imports = this.imports.filter((i) => i.id !== item.id)
+			try {
+				await dismissImport(this.channel.id, item.id)
+			} catch {
+				// It stays gone from the list either way; the next poll would bring it back
+				// only if something else starts an import, by which time it is stale anyway.
+			}
+		},
+
+		/** Timers outlive the component otherwise, and fire against a dead channel. */
+		clearAutoDismissTimers() {
+			for (const handle of Object.values(this.autoDismissTimers)) {
+				clearTimeout(handle)
+			}
+			this.autoDismissTimers = {}
 		},
 
 		/**
@@ -448,6 +550,50 @@ export default {
 
 			this.imports = this.imports.filter((existing) => existing.id !== item.id)
 			this.syncImportPoll()
+		},
+
+		/**
+		 * Let a held track into the rotation.
+		 *
+		 * @param {object} track
+		 */
+		async onApprove(track) {
+			try {
+				const updated = await updateTrack(this.channel.id, track.id, { approved: true })
+				const index = this.tracks.findIndex((existing) => existing.id === track.id)
+				if (index !== -1) {
+					this.tracks.splice(index, 1, updated)
+				}
+				this.emitTrackCount()
+			} catch (error) {
+				showError(errorMessage(error, t('music_radio', 'Could not approve that track')))
+			}
+		},
+
+		/**
+		 * Cast or withdraw a vote.
+		 *
+		 * The row is updated from the server's answer rather than guessed at, because the
+		 * count includes everyone else's votes and this browser cannot know them. The
+		 * playlist is deliberately *not* reloaded: casting a vote does not reorder
+		 * anything by itself — the running order is recomputed on the server's own
+		 * schedule, and the poll's playlistVersion is what tells this page it moved.
+		 *
+		 * @param {object} track the row that was pressed
+		 */
+		async onVote(track) {
+			let result
+			try {
+				result = await voteForTrack(this.channel.id, track.id)
+			} catch (error) {
+				showError(errorMessage(error, t('music_radio', 'Your vote could not be recorded')))
+				return
+			}
+
+			const index = this.tracks.findIndex((existing) => existing.id === track.id)
+			if (index !== -1) {
+				this.tracks.splice(index, 1, { ...this.tracks[index], votes: result.votes, voted: result.voted })
+			}
 		},
 
 		async onReorder(trackIds) {
@@ -545,6 +691,29 @@ export default {
 			this.$emit('updated', channel)
 		},
 
+		/**
+		 * A switch in the share dialog changed the channel.
+		 *
+		 * The playlist is reloaded as well as the channel emitted upwards, because whether
+		 * a row shows a vote control is decided by the tracks endpoint rather than by the
+		 * channel — so without this, turning voting on left the rows unchanged until
+		 * something else happened to refetch them.
+		 *
+		 * @param {object} channel the channel as saved
+		 */
+		/**
+		 * The channel this view is showing is not there any more.
+		 *
+		 * Reported by the sharing panel, which is the first thing to find out — it is the
+		 * only part of this view that keeps talking to the server about the channel itself.
+		 * Closing the dialog and telling the app is what stops the page sitting on a
+		 * channel that has been gone for some time.
+		 */
+		onChannelGone() {
+			this.showSharing = false
+			this.$emit('deleted', this.channel.id)
+		},
+
 		async confirmDelete() {
 			const ok = await new Promise((resolve) => {
 				window.OC.dialogs.confirmDestructive(
@@ -582,7 +751,7 @@ export default {
 
 <style scoped>
 .music-radio-channel {
-	padding: 1rem 1.5rem 3rem;
+	padding: 1rem 3rem 3rem;
 	max-width: 60rem;
 	margin-inline: auto;
 }

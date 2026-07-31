@@ -15,36 +15,60 @@
 			<!-- What the channel is doing, whether or not this person is listening to it.
 			     Someone running a channel wants to see it is on air without having to
 			     hear it. -->
-			<div v-if="localTrack" class="music-radio-onair__now" data-testid="off-air-status">
-				<span class="music-radio-onair__badge" :class="{ 'music-radio-onair__badge--live': isBroadcasting }">
-					{{ statusLabel }}
-				</span>
-
-				<div class="music-radio-onair__text">
-					<span class="music-radio-onair__title" data-testid="now-playing-title">
-						{{ localTrack.title }}
+			<div class="music-radio-onair__status">
+				<div v-if="localTrack" class="music-radio-onair__now" data-testid="off-air-status">
+					<span class="music-radio-onair__badge" :class="{ 'music-radio-onair__badge--live': isBroadcasting }">
+						{{ statusLabel }}
 					</span>
-					<span v-if="localTrack.artist" class="music-radio-onair__artist">
-						{{ localTrack.artist }}
+
+					<!-- Zero is a real answer and is shown; "we cannot know" is null and shows
+					     nothing at all. See the listenerCount computed. -->
+					<span
+						v-if="listenerCount !== null"
+						class="music-radio-onair__listeners"
+						data-testid="listener-count"
+						:title="listenersLabel">
+						<HeadphonesIcon :size="16" />
+						<span aria-hidden="true">{{ listenerCount }}</span>
+						<!-- Named with real text rather than an aria-label: a bare <span> has no
+						     role, and ARIA forbids naming an element that cannot have a name. -->
+						<span class="music-radio-onair__sr-only">{{ listenersLabel }}</span>
+					</span>
+
+					<div class="music-radio-onair__text">
+						<span class="music-radio-onair__title" data-testid="now-playing-title">
+							{{ localTrack.title }}
+						</span>
+						<span v-if="localTrack.artist" class="music-radio-onair__artist">
+							{{ localTrack.artist }}
+						</span>
+					</div>
+
+					<span class="music-radio-onair__time" data-testid="now-playing-time">
+						{{ formatDuration(displayOffsetMs) }} / {{ formatDuration(localTrack.durationMs) }}
 					</span>
 				</div>
 
-				<span class="music-radio-onair__time" data-testid="now-playing-time">
-					{{ formatDuration(displayOffsetMs) }} / {{ formatDuration(localTrack.durationMs) }}
-				</span>
+				<ProgressScrubber
+					v-if="localTrack"
+					class="music-radio-onair__progress"
+					:offset-ms="displayOffsetMs"
+					:duration-ms="localTrack.durationMs || 0"
+					:seekable="canSeek"
+					@seek="seekTo" />
+
+				<p v-if="localTrack" class="music-radio-onair__hint" data-testid="off-air-note">
+					{{ t('music_radio', 'You are not listening. The channel is playing without you.') }}<br>
+					{{ tuneInHint }}
+				</p>
 			</div>
 
-			<NcProgressBar
-				v-if="localTrack"
-				class="music-radio-onair__progress"
-				:value="progressPercent"
-				size="medium" />
-
-			<p v-if="localTrack" class="music-radio-onair__hint" data-testid="off-air-note">
-				{{ t('music_radio', 'You are not listening. The channel is playing without you.') }}
-			</p>
-
+			<!-- Beside the readout rather than under it: the status, the progress bar and
+			     the hint are all one thing to read, and the button is the one thing to do.
+			     Stacking them made the card tall enough to matter, which is awkward now
+			     that it is sticky. -->
 			<NcButton
+				class="music-radio-onair__tunein-button"
 				variant="primary"
 				size="large"
 				data-testid="tune-in"
@@ -55,15 +79,26 @@
 				</template>
 				{{ t('music_radio', 'Tune in') }}
 			</NcButton>
-			<p class="music-radio-onair__hint">
-				{{ tuneInHint }}
-			</p>
 		</div>
 
 		<template v-else>
 			<div class="music-radio-onair__now">
 				<span class="music-radio-onair__badge" :class="{ 'music-radio-onair__badge--live': isBroadcasting }">
 					{{ statusLabel }}
+				</span>
+
+				<!-- Zero is a real answer and is shown; "we cannot know" is null and shows
+				     nothing at all. See the listenerCount computed. -->
+				<span
+					v-if="listenerCount !== null"
+					class="music-radio-onair__listeners"
+					data-testid="listener-count"
+					:title="listenersLabel">
+					<HeadphonesIcon :size="16" />
+					<span aria-hidden="true">{{ listenerCount }}</span>
+					<!-- Named with real text rather than an aria-label: a bare <span> has no
+					     role, and ARIA forbids naming an element that cannot have a name. -->
+					<span class="music-radio-onair__sr-only">{{ listenersLabel }}</span>
 				</span>
 
 				<div class="music-radio-onair__text">
@@ -123,10 +158,12 @@
 				{{ t('music_radio', 'Tap to play') }}
 			</NcButton>
 
-			<NcProgressBar
+			<ProgressScrubber
 				class="music-radio-onair__progress"
-				:value="progressPercent"
-				size="medium" />
+				:offset-ms="displayOffsetMs"
+				:duration-ms="localTrack ? (localTrack.durationMs || 0) : 0"
+				:seekable="canSeek"
+				@seek="seekTo" />
 
 			<p class="music-radio-onair__sync" data-testid="sync-status">
 				{{ isMuted ? t('music_radio', 'Muted — the channel is still playing') : syncLabel }}
@@ -195,7 +232,7 @@
 import NcButton from '@nextcloud/vue/components/NcButton'
 import NcCheckboxRadioSwitch from '@nextcloud/vue/components/NcCheckboxRadioSwitch'
 import NcDialog from '@nextcloud/vue/components/NcDialog'
-import NcProgressBar from '@nextcloud/vue/components/NcProgressBar'
+import HeadphonesIcon from 'vue-material-design-icons/Headphones.vue'
 import PauseIcon from 'vue-material-design-icons/Pause.vue'
 import PlayIcon from 'vue-material-design-icons/Play.vue'
 import PowerIcon from 'vue-material-design-icons/Power.vue'
@@ -205,6 +242,7 @@ import SkipPreviousIcon from 'vue-material-design-icons/SkipPrevious.vue'
 import VolumeHighIcon from 'vue-material-design-icons/VolumeHigh.vue'
 import VolumeOffIcon from 'vue-material-design-icons/VolumeOff.vue'
 
+import ProgressScrubber from './ProgressScrubber.vue'
 import radioPlayer from '../mixins/radioPlayer.js'
 import { playerStore } from '../utils/playerStore.js'
 import { CONTROL, can } from '../utils/permissions.js'
@@ -214,13 +252,14 @@ export default {
 	name: 'OnAir',
 
 	components: {
+		HeadphonesIcon,
 		NcButton,
 		NcCheckboxRadioSwitch,
 		NcDialog,
-		NcProgressBar,
 		PauseIcon,
 		PlayIcon,
 		PowerIcon,
+		ProgressScrubber,
 		RadioTowerIcon,
 		SkipNextIcon,
 		SkipPreviousIcon,
@@ -247,7 +286,7 @@ export default {
 		},
 	},
 
-	emits: ['playlist-changed', 'on-air-changed', 'tuned-in-changed'],
+	emits: ['playlist-changed', 'votes-changed', 'on-air-changed', 'tuned-in-changed'],
 
 	data() {
 		return {
@@ -261,6 +300,21 @@ export default {
 	computed: {
 		canControl() {
 			return can(this.channel.permissions, CONTROL)
+		},
+
+		/**
+		 * Seeking is controlling: it moves the broadcast for everybody, exactly as the skip
+		 * buttons do. `canControl` therefore answers it for a link visitor too — a link can
+		 * be granted CONTROL now, and a scrubber that reads but will not move would be an
+		 * odd thing to hand somebody who has the skip buttons beside it.
+		 *
+		 * There is still nothing to move to on a channel with no measured track, so that
+		 * stays excluded before the control is offered rather than after it is pressed.
+		 */
+		canSeek() {
+			return this.canControl
+				&& !!this.localTrack
+				&& !!this.localTrack.durationMs
 		},
 
 		/**
@@ -305,7 +359,7 @@ export default {
 			if (!this.canTuneIn) {
 				return t('music_radio', 'Add some music before going on air.')
 			}
-			return t('music_radio', 'You will hear whatever is playing right now, in step with everyone else listening.')
+			return ''
 		},
 
 		statusLabel() {
@@ -317,11 +371,36 @@ export default {
 			}
 		},
 
-		progressPercent() {
-			if (!this.localTrack || !this.localTrack.durationMs) {
-				return 0
-			}
-			return Math.min(100, (this.displayOffsetMs / this.localTrack.durationMs) * 100)
+		/**
+		 * How many people are tuned in, or null when there is no number to show.
+		 *
+		 * Null covers two different situations that both mean "say nothing": the server
+		 * has no distributed cache and genuinely cannot count, and the channel is not
+		 * publishing the figure to this viewer. Neither is zero, which is a real answer
+		 * and is shown as one.
+		 *
+		 * @return {number|null}
+		 */
+		listenerCount() {
+			const count = this.syncState?.listenerCount
+
+			return typeof count === 'number' ? count : null
+		},
+
+		/**
+		 * The pill shows a bare number beside a headphones icon, which says nothing on its
+		 * own to somebody using a screen reader — so the whole sentence goes in the label,
+		 * and the digit is hidden from the accessibility tree rather than read twice.
+		 *
+		 * @return {string}
+		 */
+		listenersLabel() {
+			return n(
+				'music_radio',
+				'%n person listening',
+				'%n people listening',
+				this.listenerCount ?? 0,
+			)
 		},
 
 		/**
@@ -380,8 +459,10 @@ export default {
 				stateVersion: this.syncState?.stateVersion ?? null,
 				clockOffsetMs: Math.round(this.clock?.offset ?? 0),
 				driftMs: this.liveSync.driftMs,
+				stalled: this.liveSync.stalled === true,
 				tunedIn: this.isListening,
 				muted: this.isMuted,
+				listenerCount: this.listenerCount,
 			})
 		},
 	},
@@ -428,6 +509,18 @@ export default {
 	methods: {
 		formatDuration,
 
+		/**
+		 * There is no playhead per track to move — the channel holds one position over the
+		 * whole programme, and which track that lands in is worked out by walking the
+		 * durations. So "go to 1:05 of this track" is the existing seek action, which does
+		 * that sum on the server where the playlist is authoritative.
+		 *
+		 * @param {number} offsetMs where in the current track to go
+		 */
+		seekTo(offsetMs) {
+			this.sendControl('seek', { offsetMs: Math.round(offsetMs) })
+		},
+
 		startListening() {
 			// The token goes into the store because the player is mounted elsewhere and
 			// has no other way to learn it exists.
@@ -455,11 +548,38 @@ export default {
 
 <style scoped>
 .music-radio-onair {
+	/*
+	 * Kept in view while the playlist scrolls under it: what is on air, and the controls
+	 * for it, are the things you want to reach without scrolling back up.
+	 *
+	 * This works in both places the card is mounted, and for different reasons. Signed in,
+	 * the scroller is `.app-content` (@nextcloud/vue gives it `overflow: auto` when there
+	 * is no list slot, which this app does not use); on a public page core's `#content` is
+	 * fixed and clipped, so `.music-radio-public` scrolls itself instead. Neither has an
+	 * `overflow: clip` between here and the scroller, which is what sticky would not
+	 * survive.
+	 *
+	 * `top` is not 0: both containers have top padding that scrolls away, so a card stuck
+	 * flush against the scrollport reads as clipped. Sitting it just below leaves the gap
+	 * the layout already has.
+	 */
+	position: sticky;
+  top: 0;
+	/* Above the playlist rows, and well below the 2000 @nextcloud/vue uses for its own
+	   sticky affordances. */
+	z-index: 10;
+
 	border: 1px solid var(--color-border);
 	border-radius: var(--border-radius-large, 0.5rem);
 	padding: 1rem;
 	margin-block-end: 1.5rem;
+	/*
+	 * Opaque, or rows would show through as they pass underneath. The shadow is what
+	 * separates it from them once it is overlapping rather than sitting in the flow — the
+	 * same pairing PreviewPlayer uses for the card stuck to the bottom.
+	 */
 	background-color: var(--color-background-hover);
+	box-shadow: 0 0 10px var(--color-box-shadow);
 }
 
 .music-radio-onair__debug {
@@ -471,20 +591,34 @@ export default {
 	white-space: nowrap;
 }
 
+/*
+ * A row: everything there is to read on the left, the one thing to do on the right.
+ *
+ * This used to be a centred column with the button underneath, which made the not-listening
+ * state markedly taller than the listening one — noticeable now that the card is sticky and
+ * sits over the playlist. Wraps on a narrow viewport, where a row would squeeze both.
+ */
 .music-radio-onair__tunein {
 	display: flex;
-	flex-direction: column;
 	align-items: center;
-	gap: 0.5rem;
+	flex-wrap: wrap;
+	gap: 0.75rem 1rem;
 	padding-block: 0.5rem;
-	text-align: center;
 }
 
-.music-radio-onair__hint {
-	margin: 0;
-	color: var(--color-text-maxcontrast);
-	font-size: 0.9em;
-	max-inline-size: 32rem;
+.music-radio-onair__status {
+	display: flex;
+	flex-direction: column;
+	/* Takes the leftover width; min-width lets the text inside ellipsise rather than
+	   pushing the button out of the row. */
+	flex: 1 1 20rem;
+	min-inline-size: 0;
+	gap: 0.35rem;
+}
+
+/* Never the flexible item — that is what truncates a label to fit. */
+.music-radio-onair__tunein-button {
+	flex: none;
 }
 
 .music-radio-onair__now {
@@ -511,6 +645,39 @@ export default {
 	background-color: var(--color-error);
 	color: var(--color-error-text);
 	font-weight: bold;
+}
+
+/*
+ * Deliberately quieter than the status badge beside it: which channel is on air is the
+ * thing to read at a glance, and how many people are listening is a detail next to it.
+ */
+.music-radio-onair__listeners {
+	flex: none;
+	display: flex;
+	align-items: center;
+	gap: 0.2rem;
+	font-size: 0.8em;
+	font-variant-numeric: tabular-nums;
+	color: var(--color-text-maxcontrast);
+	/* The figure changes every few seconds as people come and go; without a floor the
+	   row would shuffle sideways each time it crosses a digit. */
+	min-inline-size: 2.5rem;
+}
+
+/*
+ * Read aloud, never drawn. Defined here rather than borrowing core's `.hidden-visually`,
+ * which is not part of any interface this app is promised.
+ */
+.music-radio-onair__sr-only {
+	position: absolute;
+	inline-size: 1px;
+	block-size: 1px;
+	margin: -1px;
+	padding: 0;
+	overflow: hidden;
+	clip-path: inset(50%);
+	white-space: nowrap;
+	border: 0;
 }
 
 .music-radio-onair__text {
@@ -542,7 +709,7 @@ export default {
 }
 
 .music-radio-onair__progress {
-	margin-block-start: 0.75rem;
+	inline-size: 100%;
 }
 
 .music-radio-onair__sync {
@@ -559,5 +726,28 @@ export default {
 	margin-block-start: 1rem;
 	padding-block-start: 1rem;
 	border-top: 1px solid var(--color-border);
+}
+
+/*
+ * On a narrow screen the title gets its own line, above everything else.
+ *
+ * `__now` is a single row of badge, listener count, title and elapsed time. The first two
+ * and the last are all `flex: none`, so the title is the only thing that can give — and on
+ * a phone it gives everything, ellipsising to a word or two while a LIVE badge and a
+ * timestamp sit beside it at full width. Which track is playing is the one thing this row
+ * exists to say, so it goes first and takes the whole line; the rest wraps underneath and
+ * stays perfectly readable.
+ */
+@media (max-width: 600px) {
+	.music-radio-onair__now {
+		flex-wrap: wrap;
+		/* Tighter than the row gap: these are now two lines, not two columns. */
+		row-gap: 0.35rem;
+	}
+
+	.music-radio-onair__text {
+		order: -1;
+		flex: 1 0 100%;
+	}
 }
 </style>

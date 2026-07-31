@@ -142,6 +142,74 @@ final class YtDlpFailure {
 	}
 
 	/**
+	 * What yt-dlp said, cut down to the part worth showing someone.
+	 *
+	 * The classifier above recognises about ten causes. Everything else became `unknown`,
+	 * and the interface answered "The import failed." — which tells the person who asked
+	 * for it nothing, and leaves them nothing to do next. The real reason went only to the
+	 * Nextcloud log, where a user cannot look.
+	 *
+	 * So the reason comes back with the row, having been cut down three ways:
+	 *
+	 *  - **the first error line only**, because yt-dlp repeats itself and the first line is
+	 *    the cause;
+	 *  - **without its prefix**. `ERROR: [youtube] dQw4w9WgXcQ: Video unavailable` says the
+	 *    extractor and the id twice over — the row already knows both;
+	 *  - **without anything path-shaped**. Postprocessing failures quote temporary
+	 *    directories, and a server's filesystem layout is not the requester's business.
+	 *    This is also why {@see \OCA\MusicRadio\Controller\PublicApiController} does not
+	 *    show it at all: a stranger holding a link gets the generic sentence.
+	 *
+	 * @return string|null null when there is nothing worth adding
+	 */
+	public static function detail(ProcessResult $result): ?string {
+		foreach (preg_split('/\R/', $result->stderr) ?: [] as $line) {
+			$line = trim($line);
+			if (stripos($line, 'ERROR:') !== 0 && stripos($line, 'ERROR ') !== 0) {
+				continue;
+			}
+
+			// `ERROR: [youtube] <id>: <reason>` → `<reason>`. The extractor tag and the id
+			// are both optional; yt-dlp omits them for failures that happen before it has
+			// worked out which extractor to use.
+			$reason = preg_replace('/^ERROR:?\s*(\[[^\]]+\]\s*)?([\w-]{5,15}:\s*)?/i', '', $line) ?? $line;
+
+			// URLs are held aside before paths are stripped, and put back afterwards.
+			// Without this the path pattern eats the middle of every link — a message
+			// naming the video becomes "https:/…?v=abc", which is worse than useless. A
+			// URL is safe to show: it is the one the person asked for in the first place.
+			$urls = [];
+			$reason = preg_replace_callback(
+				'#\bhttps?://\S+#i',
+				static function (array $match) use (&$urls): string {
+					$urls[] = $match[0];
+
+					return "\x00" . count($urls) . "\x00";
+				},
+				$reason,
+			) ?? $reason;
+
+			// Absolute paths, and Windows drive letters for good measure. Replaced rather
+			// than dropped, so a sentence built around one still reads.
+			$reason = preg_replace('#(/[\w.@+-]+){2,}/?|[A-Za-z]:\\\\[\\\\\w.@+-]+#', '…', $reason) ?? $reason;
+
+			foreach ($urls as $index => $url) {
+				$reason = str_replace("\x00" . ($index + 1) . "\x00", $url, $reason);
+			}
+
+			$reason = trim(preg_replace('/\s+/', ' ', $reason) ?? $reason);
+
+			if ($reason === '') {
+				continue;
+			}
+
+			return mb_strimwidth($reason, 0, 240, '…');
+		}
+
+		return null;
+	}
+
+	/**
 	 * Only the lines yt-dlp marked as errors, lowercased for matching.
 	 *
 	 * Dropping warnings is not tidiness. yt-dlp warns on every run about JavaScript

@@ -1,7 +1,7 @@
 /**
  * SPDX-License-Identifier: AGPL-3.0-or-later
  */
-import { getFilePickerBuilder } from '@nextcloud/dialogs'
+import { FilePickerClosed, getFilePickerBuilder } from '@nextcloud/dialogs'
 import { translate as t, translatePlural as n } from '@nextcloud/l10n'
 
 /**
@@ -28,7 +28,15 @@ const MEASURE_CONCURRENCY = 4
 /**
  * Open the Files picker filtered to audio.
  *
- * @return {Promise<Array<{fileid: number, source: string, basename: string}>>}
+ * Closing it without choosing returns an empty array rather than throwing. The picker
+ * reports that case as an exception — `pickNodes()` throws `FilePickerClosed("FilePicker:
+ * No nodes selected")` — but from here it is an ordinary outcome, and every caller
+ * treating it as one is what keeps "I changed my mind" from being reported as a failure.
+ *
+ * Callers should therefore treat a rejection as a real fault and surface it.
+ *
+ * @return {Promise<Array<{fileid: number, source: string, basename: string}>>} empty when
+ *   the picker was dismissed
  */
 export async function pickAudioFiles() {
 	const picker = getFilePickerBuilder(t('music_radio', 'Add music to this channel'))
@@ -48,7 +56,56 @@ export async function pickAudioFiles() {
 		}])
 		.build()
 
-	return await picker.pickNodes()
+	try {
+		return await picker.pickNodes()
+	} catch (error) {
+		// Matched by type, not by name or message. `FilePickerClosed` is declared as an
+		// empty `extends Error`, which never sets `.name` — so it reads as plain `'Error'`,
+		// and its message ("FilePicker: No nodes selected") says nothing about closing or
+		// cancelling. Testing either of those was what put a red "FilePicker: No nodes
+		// selected" toast in front of anyone who opened the picker and thought better of it.
+		if (error instanceof FilePickerClosed) {
+			return []
+		}
+
+		throw error
+	}
+}
+
+/**
+ * Choose a folder from the user's files.
+ *
+ * Directories only, which the picker expresses as a mime-type filter — there is no
+ * "folders" mode. Single selection, since this names one place.
+ *
+ * @param {string} title shown as the dialog's heading
+ * @return {Promise<string|null>} the chosen path, or null if the picker was dismissed
+ */
+export async function pickFolder(title) {
+	const picker = getFilePickerBuilder(title)
+		.setMimeTypeFilter(['httpd/unix-directory'])
+		.allowDirectories(true)
+		.setMultiSelect(false)
+		// Same reason as above: the picker renders exactly the buttons it is given, and
+		// with none it opens a dialog that cannot be completed.
+		.setButtonFactory(() => [{
+			label: t('music_radio', 'Choose'),
+			variant: 'primary',
+			callback: () => {},
+		}])
+		.build()
+
+	try {
+		const nodes = await picker.pickNodes()
+
+		return nodes[0]?.path ?? null
+	} catch (error) {
+		if (error instanceof FilePickerClosed) {
+			return null
+		}
+
+		throw error
+	}
 }
 
 /**

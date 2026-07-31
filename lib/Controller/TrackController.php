@@ -14,6 +14,8 @@ use OCA\MusicRadio\Permission;
 use OCA\MusicRadio\Service\ChannelService;
 use OCA\MusicRadio\Service\PermissionService;
 use OCA\MusicRadio\Service\TrackService;
+use OCA\MusicRadio\Service\VoteService;
+use OCA\MusicRadio\Service\YoutubeImportService;
 use OCP\AppFramework\Controller;
 use OCP\AppFramework\Http;
 use OCP\AppFramework\Http\Attribute\NoAdminRequired;
@@ -28,6 +30,8 @@ class TrackController extends Controller {
 		private ChannelService $channelService,
 		private TrackService $trackService,
 		private PermissionService $permissionService,
+		private VoteService $voteService,
+		private YoutubeImportService $importService,
 		private ?string $userId,
 	) {
 		parent::__construct($appName, $request);
@@ -37,13 +41,40 @@ class TrackController extends Controller {
 	public function index(int $id): DataResponse {
 		try {
 			$channel = $this->channelService->findReadable($id, $this->userId);
+			$permissions = $this->permissionService->resolve($channel, $this->userId);
 		} catch (MusicRadioException $e) {
 			return new DataResponse(['error' => $e->getMessage()], $e->getStatus());
 		}
 
+		$rules = $this->permissionService->shareRulesFor($channel, $this->userId);
+		$voting = $this->voteService->stateFor($channel, $this->userId);
+		$mine = array_flip($voting['mine']);
+
+		$tracks = array_map(
+			static fn (array $track): array => array_merge($track, [
+				'votes' => $voting['counts'][$track['id']] ?? 0,
+				'voted' => isset($mine[$track['id']]),
+			]),
+			array_map(
+				static fn (\JsonSerializable $track): array => $track->jsonSerialize(),
+				$this->trackService->listForChannel($channel),
+			),
+		);
+
 		return new DataResponse([
-			'tracks' => $this->trackService->listForChannel($channel),
+			'tracks' => $tracks,
 			'playlistVersion' => $channel->getPlaylistVersion(),
+			'votingEnabled' => $channel->getAllowVoting(),
+			'canVote' => $rules['allowVoting'],
+			// Answered here rather than derived in the page, so the button and the endpoint
+			// cannot disagree about who may import.
+			//
+			// The administrator's switch sits above the share's: if this server will not
+			// fetch from YouTube at all, nobody may, whatever any share was granted. Cheap
+			// to ask — two config reads, and the detected yt-dlp version is cached.
+			'canImport' => Permission::has($permissions, Permission::ADD_TRACKS)
+				&& $rules['allowImport']
+				&& $this->importService->availability()->available,
 		]);
 	}
 
@@ -120,7 +151,13 @@ class TrackController extends Controller {
 	}
 
 	#[NoAdminRequired]
-	public function update(int $id, int $trackId, ?int $durationMs = null, ?bool $disabled = null): DataResponse {
+	public function update(
+		int $id,
+		int $trackId,
+		?int $durationMs = null,
+		?bool $disabled = null,
+		?bool $approved = null,
+	): DataResponse {
 		try {
 			$channel = $this->channelService->findReadable($id, $this->userId);
 			$this->permissionService->requirePermission($channel, $this->userId, Permission::EDIT_PLAYLIST);
@@ -132,6 +169,11 @@ class TrackController extends Controller {
 
 			if ($disabled !== null) {
 				$track = $this->trackService->setDisabled($channel, $track, $disabled);
+			}
+
+			// Curation, like skipping — so the same EDIT_PLAYLIST gate above covers it.
+			if ($approved !== null) {
+				$track = $this->trackService->setApproved($channel, $track, $approved);
 			}
 		} catch (MusicRadioException $e) {
 			return new DataResponse(['error' => $e->getMessage()], $e->getStatus());

@@ -8,6 +8,8 @@ const isProduction = process.env.NODE_ENV === 'production'
 export default createAppConfig({
 	main: 'src/main.js',
 	public: 'src/public.js',
+	adminSettings: 'src/adminSettings.js',
+	personalSettings: 'src/personalSettings.js',
 }, {
 	config: {
 		css: {

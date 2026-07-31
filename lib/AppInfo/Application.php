@@ -10,8 +10,6 @@ namespace OCA\MusicRadio\AppInfo;
 
 use OCA\MusicRadio\Process\IProcessRunner;
 use OCA\MusicRadio\Process\ProcOpenRunner;
-use OCA\MusicRadio\Settings\AdminSettings;
-use OCA\MusicRadio\Settings\PersonalSettings;
 use OCA\MusicRadio\SetupCheck\YoutubeImportSetupCheck;
 use OCP\AppFramework\App;
 use OCP\AppFramework\Bootstrap\IBootContext;
@@ -36,10 +34,9 @@ class Application extends App implements IBootstrap {
 		// the failure that actually happens in practice.
 		$context->registerSetupCheck(YoutubeImportSetupCheck::class);
 
-		// Described rather than built: both are a handful of fields, and a declarative
-		// form needs no Vue bundle to keep in step with @nextcloud/vue.
-		$context->registerDeclarativeSettings(PersonalSettings::class);
-		$context->registerDeclarativeSettings(AdminSettings::class);
+		// The settings pages are ordinary ISettings classes, declared in info.xml. They
+		// were declarative forms until that API's two limits became the two things needed:
+		// no save button, and no way to pick a folder.
 	}
 
 	public function boot(IBootContext $context): void {

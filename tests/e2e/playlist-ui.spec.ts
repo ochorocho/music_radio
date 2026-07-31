@@ -176,6 +176,58 @@ test('music can be added through the file picker', async ({ page, db }) => {
 	}
 })
 
+/**
+ * Changing your mind is not a failure.
+ *
+ * The picker reports "closed without choosing" by throwing, and the exception it throws is
+ * an empty `extends Error` whose message reads "FilePicker: No nodes selected". Anything
+ * that tries to recognise it by name or message fails to — which put that string in front
+ * of the user, in red, every time they opened the picker and backed out.
+ */
+test('closing the file picker without choosing reports nothing', async ({ page }) => {
+	await page.goto(APP_PATH)
+	await expect(page.getByTestId('new-channel')).toBeVisible({ timeout: 20_000 })
+
+	const title = uniqueTitle('Picker Cancel Channel')
+	const created = await api(page, 'POST', `${API}/channels`, { title })
+	const id = created.body.id as number
+
+	try {
+		await openChannel(page, title)
+
+		await page.getByTestId('add-tracks').click()
+		const picker = page.getByRole('dialog')
+		await expect(picker).toBeVisible({ timeout: 20_000 })
+
+		await page.keyboard.press('Escape')
+		await expect(picker).toBeHidden({ timeout: 20_000 })
+
+		// Give the toast time to appear before asserting it did not.
+		//
+		// Not optional: a toast lands a moment after the picker closes, so checking
+		// straight away passes whether or not the bug is present.
+		await page.waitForTimeout(2000)
+
+		// Snapshotted, not asserted through a live locator.
+		//
+		// `expect(locator).toHaveCount(0)` retries until it succeeds, and a toast dismisses
+		// itself after a few seconds — so it waits for the toast to vanish and then reports
+		// success. That assertion passed against a build with the bug deliberately put back,
+		// which is how this was caught. Reading the DOM once and asserting on the value does
+		// not retry, and so cannot be satisfied by simply waiting.
+		const toasts = await page.locator('.toastify').evaluateAll(
+			(els) => els.map((el) => (el.textContent ?? '').trim()),
+		)
+		expect(toasts).toEqual([])
+
+		// And the channel is untouched and still usable.
+		await expect(page.getByTestId('track')).toHaveCount(0)
+		await expect(page.getByTestId('add-tracks')).toBeEnabled()
+	} finally {
+		await api(page, 'DELETE', `${API}/channels/${id}`)
+	}
+})
+
 test('a channel and its playlist render, and tracks can be reordered and removed', async ({ page, db }) => {
 	await page.goto(APP_PATH)
 	await expect(page.getByTestId('new-channel')).toBeVisible({ timeout: 20_000 })
@@ -186,7 +238,7 @@ test('a channel and its playlist render, and tracks can be reordered and removed
 
 	try {
 		const fileRows = await db.query<Array<{ fileid: number, name: string }>>(
-			"select fileid, name from oc_filecache where name in ('tone-a.mp3','tone-b.mp3','tone-c.mp3') and path like 'files/Music/%' order by name",
+			"select fileid, name from oc_filecache where name in ('tone-a.mp3','tone-b.mp3','tone-c.mp3') and path like 'files/Music/%' and path not like 'files/Music/%/%' order by name",
 		)
 		await api(page, 'POST', `${API}/channels/${id}/tracks`, {
 			fileIds: fileRows.map((r) => r.fileid),
@@ -246,7 +298,7 @@ test('a track whose length could not be read is flagged and left out of the broa
 
 	try {
 		const fileRows = await db.query<Array<{ fileid: number }>>(
-			"select fileid from oc_filecache where name = 'tone-a.mp3' and path like 'files/Music/%' limit 1",
+			"select fileid from oc_filecache where name = 'tone-a.mp3' and path like 'files/Music/%' and path not like 'files/Music/%/%' limit 1",
 		)
 		await api(page, 'POST', `${API}/channels/${id}/tracks`, { fileIds: [fileRows[0].fileid] })
 

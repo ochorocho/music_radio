@@ -52,7 +52,14 @@ class MusicLibraryFolderTest extends TestCase {
 			'surrounding whitespace is trimmed' => ['  Music  ', 'Music'],
 			'only slashes' => ['///', 'Music'],
 			'a doubled slash' => ['Media//Music', 'Music'],
-			'too deep' => ['a/b/c/d/e', 'Music'],
+
+			// Depth is not limited. The folder is picked from the user's own files, so
+			// whatever nesting they already keep music in is legitimate.
+			'five levels' => ['a/b/c/d/e', 'a/b/c/d/e'],
+			'deeper still' => ['a/b/c/d/e/f/g/h', 'a/b/c/d/e/f/g/h'],
+
+			// The whole path is still bounded, because it ends up in a filesystem call.
+			'an absurdly long path' => [str_repeat('ab/', 400) . 'Music', 'Music'],
 
 			// Rejected — characters a filesystem or Nextcloud refuses.
 			'a null byte' => ["Mu\0sic", 'Music'],

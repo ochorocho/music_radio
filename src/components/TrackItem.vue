@@ -7,6 +7,7 @@
 		:class="{
 			'music-radio-track--muted': !track.playable,
 			'music-radio-track--disabled': track.disabled,
+			'music-radio-track--held': track.awaitingApproval,
 			'music-radio-track--onair': isOnAir,
 			'music-radio-track--dragging': isDragging,
 			'music-radio-track--drop-before': dropEdge === 'before',
@@ -44,8 +45,11 @@
 				</template>
 			</NcButton>
 		</span>
+		<!-- The words as well as the icon: the row is also tinted, and neither a tint nor a
+		     glyph is anything a screen reader announces. -->
 		<span v-else-if="isOnAir" class="music-radio-track__onair-icon" data-testid="track-onair">
 			<VolumeHighIcon :size="20" />
+			<span class="music-radio-track__sr-only">{{ t('music_radio', 'Playing now') }}</span>
 		</span>
 		<span v-else class="music-radio-track__index">{{ index + 1 }}</span>
 
@@ -54,7 +58,30 @@
 			<span v-if="subtitle" class="music-radio-track__subtitle">{{ subtitle }}</span>
 		</div>
 
-		<span v-if="statusLabel" class="music-radio-track__status">{{ statusLabel }}</span>
+		<span v-if="statusLabel" class="music-radio-track__status" data-testid="track-status">{{ statusLabel }}</span>
+
+		<!--
+			Shown to everyone who can see votes, pressable only by those who may cast one —
+			a listener with no vote still wants to see what the room has asked for. The
+			count is hidden from the accessibility tree and restated in the label, so it is
+			not read out as a bare number next to an unexplained icon.
+		-->
+		<span v-if="showVotes" class="music-radio-track__votes" data-testid="track-votes">
+			<NcButton
+				variant="tertiary"
+				:disabled="!canVote || !track.playable"
+				:pressed="canVote ? Boolean(track.voted) : undefined"
+				:aria-label="voteLabel"
+				:title="voteLabel"
+				data-testid="vote-track"
+				@click="$emit('vote')">
+				<template #icon>
+					<HeartIcon v-if="track.voted" :size="20" />
+					<HeartOutlineIcon v-else :size="20" />
+				</template>
+			</NcButton>
+			<span class="music-radio-track__vote-count" aria-hidden="true">{{ track.votes || 0 }}</span>
+		</span>
 
 		<span class="music-radio-track__duration" data-testid="track-duration">
 			{{ formatDuration(track.durationMs) }}
@@ -92,7 +119,10 @@
 				</template>
 				{{ t('music_radio', 'Move down') }}
 			</NcActionButton>
-			<NcActionButton v-if="canReorder" data-testid="toggle-disabled" @click="choose('toggle-disabled')">
+			<!-- Curating rather than reordering: both of these change whether a track plays
+			     at all, and both go through the track-update endpoint, which a link visitor
+			     has no counterpart for. See `canCurate`. -->
+			<NcActionButton v-if="canCurate" data-testid="toggle-disabled" @click="choose('toggle-disabled')">
 				<template #icon>
 					<PlayCircleOutlineIcon v-if="track.disabled" :size="20" />
 					<CancelIcon v-else :size="20" />
@@ -101,7 +131,17 @@
 					? t('music_radio', 'Put back in the rotation')
 					: t('music_radio', 'Skip for now') }}
 			</NcActionButton>
-			<NcActionButton v-if="canRemove" @click="choose('remove')">
+			<NcActionButton
+				v-if="canCurate && track.awaitingApproval"
+				data-testid="approve-track"
+				@click="choose('approve')">
+				<template #icon>
+					<CheckIcon :size="20" />
+				</template>
+				{{ t('music_radio', 'Let it play') }}
+			</NcActionButton>
+
+			<NcActionButton v-if="canRemove" data-testid="remove-track" @click="choose('remove')">
 				<template #icon>
 					<DeleteIcon :size="20" />
 				</template>
@@ -118,9 +158,12 @@ import NcButton from '@nextcloud/vue/components/NcButton'
 import ArrowDownIcon from 'vue-material-design-icons/ArrowDown.vue'
 import ArrowUpIcon from 'vue-material-design-icons/ArrowUp.vue'
 import CancelIcon from 'vue-material-design-icons/Cancel.vue'
+import CheckIcon from 'vue-material-design-icons/Check.vue'
 import DeleteIcon from 'vue-material-design-icons/Delete.vue'
 import DragIcon from 'vue-material-design-icons/Drag.vue'
 import HeadphonesIcon from 'vue-material-design-icons/Headphones.vue'
+import HeartIcon from 'vue-material-design-icons/Heart.vue'
+import HeartOutlineIcon from 'vue-material-design-icons/HeartOutline.vue'
 import PlayCircleOutlineIcon from 'vue-material-design-icons/PlayCircleOutline.vue'
 import PlayIcon from 'vue-material-design-icons/Play.vue'
 import VolumeHighIcon from 'vue-material-design-icons/VolumeHigh.vue'
@@ -137,9 +180,12 @@ export default {
 		ArrowDownIcon,
 		ArrowUpIcon,
 		CancelIcon,
+		CheckIcon,
 		DeleteIcon,
 		DragIcon,
 		HeadphonesIcon,
+		HeartIcon,
+		HeartOutlineIcon,
 		NcActionButton,
 		NcActions,
 		NcButton,
@@ -165,7 +211,19 @@ export default {
 			type: Boolean,
 			default: false,
 		},
+		/** Whether the running order can be changed from this row: drag, or move up/down. */
 		canReorder: {
+			type: Boolean,
+			default: false,
+		},
+		/**
+		 * Whether the two actions that decide if a track plays at all — skip it, let a held
+		 * one play — are on offer. Normally the same answer as `canReorder`, and separate
+		 * only because the public page cannot have them: approving is the owner's review of
+		 * what strangers uploaded, and a link curator waving through another visitor's held
+		 * track would quietly undo it.
+		 */
+		canCurate: {
 			type: Boolean,
 			default: false,
 		},
@@ -198,9 +256,19 @@ export default {
 			type: Boolean,
 			default: false,
 		},
+		/** Whether the channel has voting switched on at all. */
+		showVotes: {
+			type: Boolean,
+			default: false,
+		},
+		/** Whether this particular person may cast one. */
+		canVote: {
+			type: Boolean,
+			default: false,
+		},
 	},
 
-	emits: ['move-up', 'move-down', 'remove', 'play', 'preview', 'toggle-disabled', 'drag-start', 'drag-end', 'drop-on'],
+	emits: ['move-up', 'move-down', 'remove', 'play', 'preview', 'toggle-disabled', 'approve', 'vote', 'drag-start', 'drag-end', 'drop-on'],
 
 	data() {
 		return {
@@ -233,11 +301,35 @@ export default {
 				: t('music_radio', 'Play {title} for everyone', { title: this.track.title })
 		},
 
+		/**
+		 * Says what pressing it does *and* what the number means, because the number
+		 * itself is hidden from screen readers — a bare digit beside a heart is not
+		 * something that reads as anything.
+		 *
+		 * @return {string}
+		 */
+		voteLabel() {
+			const votes = this.track.votes || 0
+
+			if (!this.canVote) {
+				return n('music_radio', '%n vote', '%n votes', votes)
+			}
+
+			return this.track.voted
+				? t('music_radio', 'Remove your vote ({votes} so far)', { votes })
+				: t('music_radio', 'Vote for this track ({votes} so far)', { votes })
+		},
+
 		statusLabel() {
 			// Checked before the others: a deliberately skipped track is not broken, and
 			// saying "length unknown" about one would be misleading.
 			if (this.track.disabled) {
 				return t('music_radio', 'Skipped')
+			}
+			// Someone is waiting on an answer, which is worth saying before anything about
+			// the file itself.
+			if (this.track.awaitingApproval) {
+				return t('music_radio', 'Waiting for approval')
 			}
 			if (this.track.unavailable) {
 				return t('music_radio', 'File missing')
@@ -313,6 +405,11 @@ export default {
 
 /* Out of the rotation — skipped by the owner, or unreadable. Dimmed, never hidden: a
    row you cannot read is a row you cannot put back. */
+.music-radio-track--held .music-radio-track__status {
+	/* Something to act on, not something that went wrong. */
+	color: var(--color-warning-text, var(--color-text-maxcontrast));
+}
+
 .music-radio-track--muted .music-radio-track__title {
 	color: var(--color-text-maxcontrast);
 }
@@ -376,6 +473,19 @@ export default {
 	color: var(--color-primary-element);
 }
 
+/* Read aloud, never drawn. */
+.music-radio-track__sr-only {
+	position: absolute;
+	inline-size: 1px;
+	block-size: 1px;
+	margin: -1px;
+	padding: 0;
+	overflow: hidden;
+	clip-path: inset(50%);
+	white-space: nowrap;
+	border: 0;
+}
+
 .music-radio-track--onair {
 	background-color: var(--color-background-hover);
 }
@@ -413,6 +523,24 @@ export default {
 	border: 1px solid var(--color-border);
 	border-radius: var(--border-radius-pill, 1rem);
 	padding: 0.1rem 0.5rem;
+}
+
+/*
+ * Quieter than the title, and a fixed width so the column does not jitter as counts
+ * change under it — the whole list would shuffle sideways otherwise.
+ */
+.music-radio-track__votes {
+	display: flex;
+	align-items: center;
+	gap: 0.1rem;
+	flex: none;
+}
+
+.music-radio-track__vote-count {
+	min-inline-size: 1.25rem;
+	font-size: 0.85em;
+	font-variant-numeric: tabular-nums;
+	color: var(--color-text-maxcontrast);
 }
 
 .music-radio-track__duration {

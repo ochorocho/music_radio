@@ -141,7 +141,33 @@ class ShareService {
 	 * @throws MusicRadioException
 	 * @throws Exception
 	 */
-	public function update(Share $share, ?int $permissions, ?int $expiration, ?string $label): Share {
+	/**
+	 * @param bool|null $requireApproval null leaves it alone, as with every field here
+	 * @param bool|null $allowVoting likewise
+	 */
+	public function update(
+		Share $share,
+		?int $permissions,
+		?int $expiration,
+		?string $label,
+		?bool $requireApproval = null,
+		?bool $allowVoting = null,
+		?bool $showListenerCount = null,
+		?bool $allowImport = null,
+	): Share {
+		if ($requireApproval !== null) {
+			$share->setRequireApproval($requireApproval);
+		}
+		if ($allowVoting !== null) {
+			$share->setAllowVoting($allowVoting);
+		}
+		if ($showListenerCount !== null) {
+			$share->setShowListenerCount($showListenerCount);
+		}
+		if ($allowImport !== null) {
+			$share->setAllowImport($allowImport);
+		}
+
 		if ($permissions !== null) {
 			$share->setPermissions($share->getShareType() === Share::TYPE_LINK
 				? $this->validateLinkPermissions($permissions)
@@ -293,9 +319,11 @@ class ShareService {
 	}
 
 	/**
-	 * A public link reaches people with no account. It may let them listen, and — if the
-	 * owner turns it on — upload a track; nothing beyond that, because there is no
-	 * identity behind the request to hold responsible for anything more consequential.
+	 * A public link reaches people with no account, but it can be given the same say over
+	 * the broadcast as a named person — see Permission::LINK_ALLOWED. What it can never
+	 * carry is SHARE or MANAGE: those decide who else reaches the channel and what the
+	 * channel is, and neither is something an owner could mean to hand to whoever holds a
+	 * URL.
 	 *
 	 * @throws MusicRadioException
 	 */
@@ -308,7 +336,7 @@ class ShareService {
 		// Refused rather than quietly clamped: silently handing back less than was asked
 		// for is how a caller ends up believing a link grants something it does not.
 		if (($normalized & ~Permission::LINK_ALLOWED) !== 0) {
-			throw new MusicRadioException('A public link can only allow listening and uploading');
+			throw new MusicRadioException('A public link cannot be given sharing or management of the channel');
 		}
 
 		return $normalized;

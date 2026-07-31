@@ -64,7 +64,7 @@ test.beforeEach(async ({ page, db }) => {
 	channelId = created.body.id
 
 	const fileRows = await db.query<Array<{ fileid: number, size: number }>>(
-		"select fileid, size from oc_filecache where name = 'tone-c.mp3' and path like 'files/Music/%' limit 1",
+		"select fileid, size from oc_filecache where name = 'tone-c.mp3' and path like 'files/Music/%' and path not like 'files/Music/%/%' limit 1",
 	)
 	fileSize = Number(fileRows[0].size)
 

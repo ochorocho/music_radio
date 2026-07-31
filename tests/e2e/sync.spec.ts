@@ -100,7 +100,7 @@ async function setUpChannel(page: Page, db: any, title: string) {
 	const id = created.body.id as number
 
 	const fileRows = await db.query(
-		"select fileid from oc_filecache where name in ('tone-a.mp3','tone-b.mp3','tone-c.mp3') and path like 'files/Music/%' order by name",
+		"select fileid from oc_filecache where name in ('tone-a.mp3','tone-b.mp3','tone-c.mp3') and path like 'files/Music/%' and path not like 'files/Music/%/%' order by name",
 	)
 	await api(page, 'POST', `${API}/channels/${id}/tracks`, {
 		fileIds: fileRows.map((r: { fileid: number }) => r.fileid),
@@ -237,7 +237,7 @@ test('adding a track mid-broadcast does not disturb the listener', async ({ page
 
 	try {
 		const fileRows = await db.query(
-			"select fileid, name from oc_filecache where name in ('tone-b.mp3','tone-c.mp3') and path like 'files/Music/%' order by name",
+			"select fileid, name from oc_filecache where name in ('tone-b.mp3','tone-c.mp3') and path like 'files/Music/%' and path not like 'files/Music/%/%' order by name",
 		)
 		// Start with the 8s tone only, so there is plenty of room before the boundary.
 		const longOne = fileRows.find((r: { name: string }) => r.name === 'tone-c.mp3')

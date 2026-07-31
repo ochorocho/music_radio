@@ -22,6 +22,8 @@ use OCP\DB\Types;
  * @method void setSortOrder(int $sortOrder)
  * @method int getShuffleOrder()
  * @method void setShuffleOrder(int $shuffleOrder)
+ * @method int getVoteOrder()
+ * @method void setVoteOrder(int $voteOrder)
  * @method string|null getTitle()
  * @method void setTitle(?string $title)
  * @method string|null getArtist()
@@ -40,6 +42,8 @@ use OCP\DB\Types;
  * @method void setUnavailable(bool $unavailable)
  * @method bool getDisabled()
  * @method void setDisabled(bool $disabled)
+ * @method bool getApproved()
+ * @method void setApproved(bool $approved)
  * @method int getCreatedAt()
  * @method void setCreatedAt(int $createdAt)
  */
@@ -66,6 +70,7 @@ class Track extends Entity implements \JsonSerializable {
 	protected $addedBy;
 	protected $sortOrder;
 	protected $shuffleOrder;
+	protected $voteOrder;
 	protected $title;
 	protected $artist;
 	protected $album;
@@ -75,6 +80,7 @@ class Track extends Entity implements \JsonSerializable {
 	protected $size;
 	protected $unavailable;
 	protected $disabled;
+	protected $approved;
 	protected $createdAt;
 
 	public function __construct() {
@@ -83,6 +89,7 @@ class Track extends Entity implements \JsonSerializable {
 		$this->addType('addedBy', Types::STRING);
 		$this->addType('sortOrder', Types::INTEGER);
 		$this->addType('shuffleOrder', Types::INTEGER);
+		$this->addType('voteOrder', Types::INTEGER);
 		$this->addType('title', Types::STRING);
 		$this->addType('artist', Types::STRING);
 		$this->addType('album', Types::STRING);
@@ -92,6 +99,7 @@ class Track extends Entity implements \JsonSerializable {
 		$this->addType('size', Types::BIGINT);
 		$this->addType('unavailable', Types::BOOLEAN);
 		$this->addType('disabled', Types::BOOLEAN);
+		$this->addType('approved', Types::BOOLEAN);
 		$this->addType('createdAt', Types::BIGINT);
 	}
 
@@ -104,8 +112,28 @@ class Track extends Entity implements \JsonSerializable {
 		return !$this->getUnavailable()
 			// Skipped on purpose by whoever runs the channel, as opposed to broken.
 			&& !$this->getDisabled()
+			// Added by somebody else on a channel that holds those until the owner has
+			// looked. Distinct from `disabled`: nobody has decided about this one yet.
+			//
+			// Compared against false rather than read as a boolean, because an entity that
+			// has not been through the database has null here, and the column's default is
+			// true. The neighbouring flags get this for free — `!null` is already "not
+			// disabled" — but this one reads the other way round, and without the
+			// comparison a track built in code would be silently unplayable.
+			&& $this->getApproved() !== false
 			&& $this->getDurationMs() !== null
 			&& $this->getDurationMs() > 0;
+	}
+
+	/**
+	 * Waiting for the owner, as opposed to unplayable for any of the other reasons.
+	 *
+	 * Worth its own question because it is the only one somebody can act on: an unreadable
+	 * file or a missing duration is the server's problem, but this is a decision waiting to
+	 * be made.
+	 */
+	public function isAwaitingApproval(): bool {
+		return $this->getApproved() === false;
 	}
 
 	public function jsonSerialize(): array {
@@ -125,6 +153,8 @@ class Track extends Entity implements \JsonSerializable {
 			'size' => $this->getSize(),
 			'unavailable' => $this->getUnavailable(),
 			'disabled' => $this->getDisabled(),
+			'approved' => $this->getApproved(),
+			'awaitingApproval' => $this->isAwaitingApproval(),
 			'playable' => $this->isPlayable(),
 			'createdAt' => $this->getCreatedAt(),
 		];

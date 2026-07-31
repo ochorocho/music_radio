@@ -40,6 +40,7 @@ class PermissionService {
 		private IGroupManager $groupManager,
 		private IUserManager $userManager,
 		private ITeamManager $teamManager,
+		private VisitorIdentity $visitorIdentity,
 		private Clock $clock,
 		private LoggerInterface $logger,
 	) {
@@ -51,6 +52,83 @@ class PermissionService {
 	 * request — those reach a channel only through a link token, which
 	 * ShareService handles separately, so they get nothing here.
 	 */
+	/**
+	 * What the shares granting this person access say about approval and voting.
+	 *
+	 * Both are decided per share now, so somebody reached by two of them — named directly
+	 * and through a group, say — has to be given one answer. The generous one wins in both
+	 * cases, matching how the permission mask above is combined: access granted twice is
+	 * not access halved.
+	 *
+	 * The owner is not a share and is governed by the channel: their own additions are
+	 * never held, and they may vote whenever the channel is voting at all.
+	 *
+	 * @return array{requireApproval: bool, allowVoting: bool, showListenerCount: bool, allowImport: bool}
+	 */
+	public function shareRulesFor(Channel $channel, ?string $userId): array {
+		if ($userId !== null && $userId !== '' && $channel->getUserId() === $userId) {
+			// The owner sees their own audience figure whatever any share says, and imports
+			// on their own channel subject only to the administrator's switch. Importing
+			// spends their storage and their server's time, so there is nobody left to ask.
+			return [
+				'requireApproval' => false,
+				'allowVoting' => $channel->getAllowVoting() === true,
+				'showListenerCount' => true,
+				'allowImport' => true,
+			];
+		}
+
+		if ($userId === null || $userId === '') {
+			return [
+				'requireApproval' => true,
+				'allowVoting' => false,
+				'showListenerCount' => false,
+				'allowImport' => false,
+			];
+		}
+
+		$shares = $this->shareMapper->findForRecipient(
+			$channel->getId(),
+			$userId,
+			$this->groupIdsOf($userId),
+			$this->teamIdsOf($userId),
+		);
+
+		$now = $this->clock->nowSeconds();
+		$requireApproval = true;
+		$allowVoting = false;
+		$showListenerCount = false;
+		$allowImport = false;
+		$found = false;
+
+		foreach ($shares as $share) {
+			if ($share->isExpired($now)) {
+				continue;
+			}
+			$found = true;
+			$requireApproval = $requireApproval && $share->getRequireApproval() !== false;
+			$allowVoting = $allowVoting || $share->getAllowVoting() === true;
+			$showListenerCount = $showListenerCount || $share->getShowListenerCount() !== false;
+			$allowImport = $allowImport || $share->getAllowImport() === true;
+		}
+
+		return [
+			// Somebody with no share at all cannot add anything anyway; answering "hold it"
+			// is the safe reading of a question that should not arise.
+			'requireApproval' => $found ? $requireApproval : true,
+			// The channel term is not a second switch any more — it is the derived flag
+			// ChannelService::syncVotingMode maintains, and it is true exactly when some
+			// share says so. Kept in the expression anyway, because it is also what decides
+			// whether the playlist is in vote order at all: letting somebody vote on a
+			// channel that is not counting votes would be a promise nothing keeps.
+			'allowVoting' => $found && $allowVoting && $channel->getAllowVoting(),
+			'showListenerCount' => $found && $showListenerCount,
+			// The share alone, plus the administrator's switch above it. The channel used to
+			// have a say too, which meant the same question was answered in two places.
+			'allowImport' => $found && $allowImport,
+		];
+	}
+
 	public function resolve(Channel $channel, ?string $userId): int {
 		if ($userId === null || $userId === '') {
 			return Permission::NONE;
@@ -154,6 +232,29 @@ class PermissionService {
 		return Permission::has($permissions, Permission::ADD_TRACKS)
 			&& $userId !== null
 			&& $trackAddedBy === $userId;
+	}
+
+	/**
+	 * The same rule for somebody with no account, whose browser key stands in for a user
+	 * id.
+	 *
+	 * Kept apart from the method above rather than folded into it: that one compares
+	 * against a Nextcloud user id, this one against a value the browser supplied, and the
+	 * two must not be able to be passed to each other by accident. A visitor key can never
+	 * equal a user id anyway — it is prefixed with a character user ids cannot contain —
+	 * but the signatures say so too.
+	 */
+	public function canVisitorRemoveTrack(int $linkPermissions, string $trackAddedBy, ?string $visitorKey): bool {
+		// The curator branch mirrors canRemoveTrack above. A link can now be given
+		// EDIT_PLAYLIST, and a curator who may reorder anyone's track but not remove one
+		// would be a strange half-measure — the two go together on the signed-in side and
+		// are described to the owner as one switch.
+		if (Permission::has($linkPermissions, Permission::EDIT_PLAYLIST)) {
+			return true;
+		}
+
+		return Permission::has($linkPermissions, Permission::ADD_TRACKS)
+			&& $this->visitorIdentity->owns($trackAddedBy, $visitorKey);
 	}
 
 	/**

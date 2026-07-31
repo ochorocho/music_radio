@@ -15,11 +15,12 @@
  * second poll interval perfectly adequate for a radio station.
  */
 import axios from '@nextcloud/axios'
-import { generateUrl } from '@nextcloud/router'
 import { showError } from '@nextcloud/dialogs'
 
 import { ServerClock } from '../utils/serverClock.js'
-import { stateUrl, streamUrl } from '../utils/api.js'
+import { clientId } from '../utils/clientId.js'
+import { playerStore } from '../utils/playerStore.js'
+import { controlUrl, playbackSettingsUrl, stateUrl, streamUrl } from '../utils/api.js'
 import {
 	CLOCK_BURST,
 	CLOCK_BURST_SPACING_MS,
@@ -29,12 +30,33 @@ import {
 	PRELOAD_LEAD_MS,
 	RATE_CHANGE_SETTLE_MS,
 	RATE_CLAMP,
+	STALL_RECOVERY_MS,
 	SYNC_SPEED_TIME,
 	TICK_MS,
 	WATCH_CLOCK_BURST,
 } from '../utils/syncConstants.js'
 
 const clamp = (value, min, max) => Math.min(max, Math.max(min, value))
+
+/**
+ * Whether this is an iOS device, including an iPad reporting itself as a Mac.
+ *
+ * Two things this app does are wrong on iOS specifically, and both are silent rather than
+ * an error, so they can only be avoided by asking:
+ *
+ *  - `preload` is ignored for `<audio>`, so the second element never actually buffers the
+ *    next track — the work is done and nothing comes of it;
+ *  - the audio session is exclusive, so telling that second element to load can interrupt
+ *    the one currently making sound.
+ *
+ * iPadOS reports a desktop Safari user agent, which is why the touch-point test is there:
+ * a real Mac reports `maxTouchPoints` of 0.
+ */
+const IS_IOS = typeof navigator !== 'undefined' && (
+	/iP(hone|ad|od)/.test(navigator.platform || '')
+	|| /iP(hone|ad|od)/.test(navigator.userAgent || '')
+	|| (/Mac/.test(navigator.userAgent || '') && (navigator.maxTouchPoints || 0) > 1)
+)
 
 /**
  * A valid, empty WAV.
@@ -54,6 +76,15 @@ export default {
 			tunedIn: false,
 			/** Measured drift between this element and the broadcast, for the UI. */
 			driftMs: 0,
+			/**
+			 * True while the element making sound has run out of data.
+			 *
+			 * Reactive, unlike the `stalledSince` timestamp that drives the logic, purely so
+			 * that a stall is visible from the outside — it goes into the sync-debug payload,
+			 * which is the only way to tell "the network stalled" from "the player is broken"
+			 * when the complaint arrives second-hand from a phone.
+			 */
+			stalled: false,
 			clockReady: false,
 			clockRttMs: 0,
 			syncError: null,
@@ -118,6 +149,9 @@ export default {
 		this.preloadedTrackId = null
 		this.lastRateChangeAt = 0
 		this.pendingSeek = false
+		// performance.now() at which the active element last ran out of data, or 0 when it
+		// has not. Everything about stall handling hangs off this one value.
+		this.stalledSince = 0
 		// Server time at which this client last crossed a track boundary on its own.
 		// Guards against a poll that was computed before the crossing dragging it back.
 		this.advancedAtServerMs = 0
@@ -184,6 +218,8 @@ export default {
 			this.localTrack = null
 			this.preloadedTrackId = null
 			this.advancedAtServerMs = 0
+			this.stalledSince = 0
+			this.stalled = false
 			this.driftMs = 0
 			this.muted = false
 		},
@@ -209,6 +245,7 @@ export default {
 			this.audioA = new Audio()
 			this.audioB = new Audio()
 			for (const audio of [this.audioA, this.audioB]) {
+				this.watchForStalls(audio)
 				audio.preload = 'auto'
 				audio.hidden = true
 				audio.dataset.musicRadioPlayer = 'true'
@@ -220,6 +257,61 @@ export default {
 			}
 			this.activeAudio = this.audioA
 			this.idleAudio = this.audioB
+		},
+
+		/**
+		 * Notice when an element runs out of data, and when it gets going again.
+		 *
+		 * Nothing watched for this before, and the omission is what made playback on a
+		 * phone unusable. The only acknowledgement a stall got was `readyState < 2` in
+		 * correctDrift, which returns without doing anything — so the broadcast walked away
+		 * from a stalled element, and by the time it recovered the gap was past
+		 * MAX_NUDGE_MS and the correction was a seek. A seek re-requests the audio, which
+		 * on a weak connection stalls again, which widens the gap again. That loop is
+		 * exactly what "the song gets stuck" describes.
+		 *
+		 * Knowing an element is stalled lets the correction wait for it instead.
+		 *
+		 * @param {HTMLAudioElement} audio
+		 */
+		watchForStalls(audio) {
+			const stalled = () => {
+				// Only the element making sound matters; the idle one is expected to be
+				// short of data and is nobody's problem until it is swapped in.
+				if (audio === this.activeAudio && this.stalledSince === 0) {
+					this.stalledSince = performance.now()
+					this.stalled = true
+				}
+			}
+			const recovered = () => {
+				if (audio === this.activeAudio) {
+					this.stalledSince = 0
+					this.stalled = false
+				}
+			}
+
+			audio.addEventListener('waiting', stalled)
+			audio.addEventListener('stalled', stalled)
+			audio.addEventListener('playing', recovered)
+			audio.addEventListener('canplay', recovered)
+		},
+
+		/**
+		 * Whether the given position is already downloaded.
+		 *
+		 * @param {HTMLAudioElement} audio
+		 * @param {number} targetMs
+		 * @return {boolean}
+		 */
+		isBuffered(audio, targetMs) {
+			const seconds = targetMs / 1000
+			for (let i = 0; i < audio.buffered.length; i++) {
+				if (seconds >= audio.buffered.start(i) && seconds <= audio.buffered.end(i)) {
+					return true
+				}
+			}
+
+			return false
 		},
 
 		removeAudioElements() {
@@ -346,7 +438,18 @@ export default {
 				return
 			}
 			try {
-				const { data } = await axios.get(stateUrl(this.channel.id, this.shareToken))
+				const { data } = await axios.get(stateUrl(this.channel.id, this.shareToken), {
+					params: {
+						clientId: clientId(),
+						// Read from the shared store, not from this instance's `tunedIn`.
+						// Two instances of this mixin poll the same channel from one tab —
+						// OnAir, which never plays audio, and GlobalPlayer, which does — so
+						// asking either one about itself would have them contradict each
+						// other on every poll, one adding this browser to the count and the
+						// other removing it.
+						listening: playerStore.isListeningTo(this.channel.id),
+					},
+				})
 				this.applyState(data, options)
 				this.syncError = null
 			} catch (error) {
@@ -360,6 +463,14 @@ export default {
 
 			if (previous && state.playlistVersion !== previous.playlistVersion) {
 				this.$emit('playlist-changed')
+			}
+
+			// Somebody voted, or a track's votes were spent because it played. The counts
+			// live on the playlist rows, so the list is refetched — but nothing about the
+			// broadcast has moved, which is why this is a counter of its own rather than
+			// part of playlistVersion.
+			if (previous && state.voteVersion !== previous.voteVersion) {
+				this.$emit('votes-changed')
 			}
 
 			if (!this.tunedIn) {
@@ -469,12 +580,39 @@ export default {
 			audio.dataset.trackId = String(track.trackId)
 			audio.src = url
 			audio.muted = this.muted
+			if (audio === this.activeAudio) {
+				// New source, so any outstanding stall belonged to the previous one.
+				this.stalledSince = 0
+				this.stalled = false
+			}
 			audio.load()
 		},
 
 		// ------------------------------------------------------------- the clock
 
 		/** How far into the current track the broadcast is, right now. */
+		/**
+		 * Where in the current track this client should be, in milliseconds.
+		 *
+		 * No playback delay is applied here, and the attempt to add one is worth recording
+		 * so it is not tried again the same way.
+		 *
+		 * Subtracting a fixed delay — `max(0, live - 3000)` — looks right and is not. A
+		 * programme has nothing before its own start, so for the first three seconds after
+		 * play, a jump or a seek the expression is pinned at zero while real time keeps
+		 * moving. The position readout freezes, and drift correction spends those seconds
+		 * pulling the element back towards a target that is not advancing. Doing it
+		 * properly needs a pre-roll: hold the element silent until the delayed programme
+		 * has actually begun, which is real machinery and buys little.
+		 *
+		 * Little, because the reason it was wanted does not hold up. A delay does not
+		 * increase how far ahead the browser has buffered — that is set by download speed
+		 * against playback speed, not by which absolute position is being played. What
+		 * actually stopped iOS from stalling repeatedly is refusing to seek at a stalled
+		 * element (see correctDrift and hardSeek), which costs nothing and needs no delay.
+		 *
+		 * @return {number}
+		 */
 		targetOffsetMs() {
 			if (!this.localTrack) {
 				return 0
@@ -542,6 +680,10 @@ export default {
 				this.activeAudio = this.idleAudio
 				this.idleAudio = previous
 				this.idleAudio.pause()
+				// The flag describes one element. Carrying the old one's stall across would
+				// suppress correction on a element that is perfectly healthy.
+				this.stalledSince = 0
+				this.stalled = false
 			}
 
 			this.localTrack = {
@@ -573,7 +715,22 @@ export default {
 		/**
 		 * @param {number} target current position within the track, in ms
 		 */
+		/**
+		 * Get the next track into the idle element before it is needed.
+		 *
+		 * Skipped entirely on iOS, where it is worse than useless: Safari ignores `preload`
+		 * for `<audio>`, so nothing is actually buffered — and because the audio session is
+		 * exclusive, telling a second element to load can interrupt the one currently
+		 * playing. The cost of not doing it is a short gap at each track change; the cost
+		 * of doing it was the music stopping.
+		 *
+		 * @param {number} target current position in the track, in ms
+		 */
 		preloadNextIfDue(target) {
+			if (IS_IOS) {
+				return
+			}
+
 			const next = this.syncState?.next
 			if (!next || !this.idleAudio) {
 				return
@@ -606,6 +763,17 @@ export default {
 			// A player that had stopped was therefore also being re-muted roughly once a
 			// second, which would have kept it silent even once it was started again.
 			if (!audio || audio.paused || audio.readyState < 2 || this.pendingSeek) {
+				return
+			}
+
+			// Waiting for data. Correcting now would measure a gap the element could not
+			// have closed — it is not drifting, it is stopped — and the correction for a
+			// gap that size is a seek, which throws away the buffering that was about to
+			// end the stall. Doing nothing is what lets it recover.
+			//
+			// Past STALL_RECOVERY_MS it is not coming back on its own, so fall through and
+			// let the ordinary correction re-seek it.
+			if (this.stalledSince !== 0 && performance.now() - this.stalledSince < STALL_RECOVERY_MS) {
 				return
 			}
 
@@ -647,6 +815,15 @@ export default {
 				return
 			}
 
+			// Never seek into audio that has not arrived yet while the element is already
+			// struggling. Assigning currentTime cancels whatever was downloading and asks
+			// for a fresh range starting somewhere else — which is the worst possible
+			// response to "the network is slow", and turns one stall into a series of them.
+			// The element is already loading the right region; let it finish.
+			if (this.stalledSince !== 0 && !this.isBuffered(audio, targetMs)) {
+				return
+			}
+
 			audio.muted = true
 			this.pendingSeek = true
 
@@ -673,16 +850,22 @@ export default {
 		// --------------------------------------------------------------- control
 
 		/**
+		 * Drive the broadcast, signed in or through a link.
+		 *
+		 * Both forms go through the same helper for the same reason the state and track
+		 * endpoints do: the player is one component, and a link that was granted control
+		 * has to behave exactly like the signed-in one — including the 409, which is how
+		 * two people sharing a link find out they pressed at the same moment. Whether this
+		 * link may control anything is the server's decision, not this method's; the UI
+		 * hides the buttons, and the endpoint refuses regardless.
+		 *
 		 * @param {string} action play|pause|next|previous|seek|jumpTo
 		 * @param {object} [payload]
 		 */
 		async sendControl(action, payload = {}) {
-			if (this.shareToken) {
-				return
-			}
 			try {
 				const { data } = await axios.post(
-					generateUrl(`/apps/music_radio/api/v1/channels/${this.channel.id}/control`),
+					controlUrl(this.channel.id, this.shareToken),
 					{ action, ...payload, expectedStateVersion: this.syncState?.stateVersion },
 				)
 				this.applyState(data, { force: true })
@@ -698,12 +881,9 @@ export default {
 		},
 
 		async sendSettings(payload) {
-			if (this.shareToken) {
-				return
-			}
 			try {
 				const { data } = await axios.put(
-					generateUrl(`/apps/music_radio/api/v1/channels/${this.channel.id}/playback-settings`),
+					playbackSettingsUrl(this.channel.id, this.shareToken),
 					payload,
 				)
 				this.applyState(data, { force: true })

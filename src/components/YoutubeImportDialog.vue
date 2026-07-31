@@ -82,6 +82,15 @@ export default {
 			type: Object,
 			default: () => ({}),
 		},
+
+		/**
+		 * Share token when this dialog is open on a public page, otherwise null. The only
+		 * difference between the two cases is which endpoint it addresses.
+		 */
+		publicToken: {
+			type: String,
+			default: null,
+		},
 	},
 
 	emits: ['close', 'started'],
@@ -152,7 +161,7 @@ export default {
 
 			this.submitting = true
 			try {
-				this.$emit('started', await startImport(this.channelId, url))
+				this.$emit('started', await startImport(this.channelId, url, this.publicToken))
 				this.$emit('close')
 			} catch (error) {
 				// Shown in the field, not as a toast: every refusal here is about the link

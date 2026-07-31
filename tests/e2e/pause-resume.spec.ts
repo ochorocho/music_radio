@@ -99,7 +99,7 @@ test.beforeEach(async ({ page, db }) => {
 
 	// One long track, on purpose — see the note at the top of this file.
 	const fileRows = await db.query<Array<{ fileid: number }>>(
-		"select fileid from oc_filecache where name = 'tone-long.mp3' and path like 'files/Music/%'",
+		"select fileid from oc_filecache where name = 'tone-long.mp3' and path like 'files/Music/%' and path not like 'files/Music/%/%'",
 	)
 	expect(
 		fileRows.length,

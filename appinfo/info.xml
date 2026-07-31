@@ -20,7 +20,7 @@ hears the same track at the same moment — the channel owner is the DJ, listene
 - **Share it your way.** Users, groups, teams, or a public link with an optional password and
   expiry date.
 	]]></description>
-	<version>0.6.0</version>
+	<version>0.12.1</version>
 	<licence>agpl</licence>
 	<author>Jochen Roth</author>
 	<namespace>MusicRadio</namespace>
@@ -45,8 +45,19 @@ hears the same track at the same moment — the channel owner is the DJ, listene
 	  request that asks for an import; listing it would have Nextcloud run it on a schedule
 	  with no argument.
 	-->
+	<!--
+	  Run on install and on every upgrade. The theming app caches a rendered favicon per
+	  app and never notices when the icon changes; see the class for why that is ours to
+	  clean up rather than the administrator's.
+	-->
+	<repair-steps>
+		<post-migration>
+			<step>OCA\MusicRadio\Migration\ClearThemingIconCache</step>
+		</post-migration>
+	</repair-steps>
 	<background-jobs>
 		<job>OCA\MusicRadio\BackgroundJob\ReapStaleImportsJob</job>
+		<job>OCA\MusicRadio\BackgroundJob\SweepVotesJob</job>
 	</background-jobs>
 	<!--
 	  The same section class in both lists: it is one "Music Radio" heading as far as
@@ -54,7 +65,9 @@ hears the same track at the same moment — the channel owner is the DJ, listene
 	  form's own section_type. The forms themselves are registered in Application::register.
 	-->
 	<settings>
+		<admin>OCA\MusicRadio\Settings\AdminSettings</admin>
 		<admin-section>OCA\MusicRadio\Settings\Section</admin-section>
+		<personal>OCA\MusicRadio\Settings\PersonalSettings</personal>
 		<personal-section>OCA\MusicRadio\Settings\Section</personal-section>
 	</settings>
 	<navigations>

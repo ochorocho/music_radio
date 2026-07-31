@@ -48,6 +48,7 @@ class UploadService {
 
 	public function __construct(
 		private MusicLibrary $library,
+		private VisitorIdentity $visitorIdentity,
 		private IL10N $l10n,
 		private LoggerInterface $logger,
 	) {
@@ -62,7 +63,18 @@ class UploadService {
 	 * @throws MusicRadioException when the upload is rejected; the message is meant for
 	 *                             the person who tried to upload
 	 */
-	public function storeForChannel(Channel $channel, array $upload): Track {
+	/**
+	 * @param bool|null $requireApproval what the link this arrived through says. Passed in
+	 *                                   rather than looked up: the share is known to the
+	 *                                   controller, and a visitor key is not an account, so
+	 *                                   it cannot be resolved from who added it.
+	 */
+	public function storeForChannel(
+		Channel $channel,
+		array $upload,
+		?string $visitorKey = null,
+		?bool $requireApproval = null,
+	): Track {
 		$tmpPath = $this->validateUpload($upload);
 
 		$track = $this->library->ingest(
@@ -70,7 +82,12 @@ class UploadService {
 			$channel->getUserId(),
 			$tmpPath,
 			(string)($upload['name'] ?? ''),
-			Track::ADDED_BY_PUBLIC_LINK,
+			// Credited to the browser that sent it, so that browser can take it back
+			// again. Without a key this falls back to the old anonymous sentinel and the
+			// upload is nobody's, exactly as it used to be.
+			$this->visitorIdentity->creditFor($visitorKey),
+			null,
+			$requireApproval === null ? null : !$requireApproval,
 		);
 
 		$this->logger->info('Track uploaded to a channel through a public link', [

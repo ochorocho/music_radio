@@ -10,9 +10,10 @@ app works regardless, so you can install now and set importing up later, or neve
 - [Requirements](#requirements)
 - [1. Install the app](#1-install-the-app)
 - [2. Install ffmpeg](#2-install-ffmpeg)
-- [3. Install yt-dlp](#3-install-yt-dlp)
-- [4. Make background jobs run promptly](#4-make-background-jobs-run-promptly)
-- [5. Check it](#5-check-it)
+- [3. Turn importing on](#3-turn-importing-on)
+- [4. Install yt-dlp](#4-install-yt-dlp)
+- [5. Make background jobs run promptly](#5-make-background-jobs-run-promptly)
+- [6. Check it](#6-check-it)
 - [Keeping yt-dlp working](#keeping-yt-dlp-working)
 - [Configuration reference](#configuration-reference)
 - [Troubleshooting](#troubleshooting)
@@ -20,15 +21,23 @@ app works regardless, so you can install now and set importing up later, or neve
 
 ## Requirements
 
-|                 | For the app | For YouTube import                     |
-|-----------------|-------------|----------------------------------------|
-| Nextcloud       | 33–34       | —                                      |
-| PHP             | 8.1+        | `proc_open` not in `disable_functions` |
-| Binaries        | none        | `ffmpeg`, `ffprobe`, `yt-dlp`          |
-| Background jobs | not needed  | required                               |
+|                   | For the app | For YouTube import                     |
+|-------------------|-------------|----------------------------------------|
+| Nextcloud         | 33–34       | —                                      |
+| PHP               | 8.1+        | `proc_open` not in `disable_functions` |
+| Binaries          | none        | `ffmpeg`, `ffprobe`, `yt-dlp`          |
+| Background jobs   | not needed  | required                               |
+| Distributed cache | optional    | —                                      |
 
 Importing is unavailable — visibly, with a reason — if any of those is missing. It does not
 half-work.
+
+The distributed cache (Redis or Memcached, configured as `memcache.distributed`) is only
+used for the listener count, which is the one thing that degrades rather than fails without
+it: presence is held in the cache because every listener would otherwise write to the
+database every few seconds. With no distributed cache the app reports that it cannot count
+and shows nothing, rather than showing every listener a confident "1" — a file-backed cache
+is per-request, so each listener would only ever see themselves.
 
 > **A note on what this feature is.** Downloading from YouTube conflicts with its Terms of
 > Service. Nothing here functions until an administrator has deliberately installed yt-dlp,
@@ -75,7 +84,21 @@ deriving from it.
 The app finds ffmpeg on the system path, or wherever `ffmpeg_path` points (see
 [Configuration reference](#configuration-reference)).
 
-## 3. Install yt-dlp
+## 3. Turn importing on
+
+Importing ships **off**. Downloading from YouTube conflicts with its terms of service, so
+whether this server does it is a decision for whoever runs it, not something installing an
+app should assume:
+
+```bash
+occ config:app:set music_radio import_enabled --value=1 --type=boolean
+```
+
+Or the switch under **Settings → Administration → Music Radio**. Until then
+`occ music_radio:ytdlp:status` reports it as switched off and the button never appears,
+however much of the rest of this you have done.
+
+## 4. Install yt-dlp
 
 The app does **not** bundle yt-dlp. Three reasons, all of which matter:
 
@@ -155,7 +178,7 @@ Takes precedence over everything else. The path must be absolute and executable 
 server user; the app refuses anything else rather than storing a setting that cannot work.
 Also settable under **Settings → Administration → Music Radio**.
 
-## 4. Make background jobs run promptly
+## 5. Make background jobs run promptly
 
 A download and transcode takes tens of seconds, far too long to hold a request open, so
 importing happens in a background job. **How quickly an import starts is entirely down to
@@ -205,7 +228,7 @@ Two things to know about a long-lived worker:
   a queue of links should not compete with serving pages. Several workers are harmless;
   they will not process the same import twice, and they will not run imports in parallel.
 
-## 5. Check it
+## 6. Check it
 
 ```bash
 occ music_radio:ytdlp:status
@@ -263,7 +286,7 @@ Everything below is also on the **Settings → Administration → Music Radio** 
 
 | Key                       | Default     | Meaning                                                     |
 |---------------------------|-------------|-------------------------------------------------------------|
-| `import_enabled`          | `true`      | Turns importing off without uninstalling anything           |
+| `import_enabled`          | `false`     | Must be turned on before importing works at all             |
 | `ytdlp_path`              | *(empty)*   | Absolute path; empty means detect                           |
 | `ffmpeg_path`             | *(empty)*   | Absolute path to `ffmpeg`; `ffprobe` must sit beside it     |
 | `import_max_duration`     | `5400`      | Longest video, **in seconds**. Refused before downloading   |
@@ -276,7 +299,7 @@ occ config:app:set music_radio import_max_duration --value=1800 --type=integer
 The settings page shows minutes and megabytes; `occ` uses seconds and bytes.
 
 Per-user, under **Settings → Personal → Music Radio**: the folder music lands in, `Music`
-by default, up to four levels deep. It applies to uploads as well as imports. Note that an
+by default. Any existing folder in their files, at any depth. It applies to uploads as well as imports. Note that an
 imported file goes to the **channel owner's** folder and counts against their quota,
 whoever pasted the link — so it is the owner's setting that decides.
 
@@ -304,7 +327,7 @@ work without it; the rest of the app is unaffected.
 **Imports sit at "Waiting to start…"**
 Nothing is running background jobs. Check with `occ background-job:list`. If the job is
 listed and never runs, cron is not working — importing is the messenger, not the problem.
-See [step 4](#4-make-background-jobs-run-promptly).
+See [step 5](#5-make-background-jobs-run-promptly).
 
 **"That import never started. Background jobs may not be running on this server."**
 The same thing, reported by the app after an hour of waiting. This message exists because

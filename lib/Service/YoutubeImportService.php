@@ -120,7 +120,15 @@ class YoutubeImportService {
 	 * @throws MusicRadioException carrying an ImportError code as its message, which the
 	 *                             controller turns into a sentence
 	 */
-	public function request(Channel $channel, string $userId, string $rawUrl): Import {
+	/**
+	 * @param bool|null $approved what the share this was asked through says. Recorded now
+	 *                            rather than resolved later: the job holds only the import
+	 *                            row, and a link's requester is `?link:<key>` — not an
+	 *                            account, and nothing a share can be found from. Null means
+	 *                            "decide the ordinary way", which is what a signed-in
+	 *                            request does.
+	 */
+	public function request(Channel $channel, string $userId, string $rawUrl, ?bool $approved = null): Import {
 		$status = $this->availability();
 		if (!$status->available) {
 			throw $this->refuse($status->reason ?? ImportError::UNKNOWN, Http::STATUS_SERVICE_UNAVAILABLE);
@@ -151,6 +159,7 @@ class YoutubeImportService {
 		$import->setSource(Import::SOURCE_YOUTUBE);
 		$import->setVideoId($videoId);
 		$import->setStatus(Import::STATUS_QUEUED);
+		$import->setApproved($approved ?? true);
 		$import->setPhase(Import::PHASE_PENDING);
 		$import->setProgress(0);
 		$import->setAttempts(0);
@@ -257,7 +266,7 @@ class YoutubeImportService {
 		$failure = YtDlpFailure::classifyProbe($probe);
 		if ($failure !== null) {
 			$this->logFailure($import, $failure, $probe->stderr);
-			$this->fail($import, $failure);
+			$this->fail($import, $failure, YtDlpFailure::detail($probe));
 
 			return;
 		}
@@ -308,7 +317,7 @@ class YoutubeImportService {
 		$failure = YtDlpFailure::classify($result, $produced !== null);
 		if ($failure !== null) {
 			$this->logFailure($import, $failure, $result->stderr);
-			$this->fail($import, $failure);
+			$this->fail($import, $failure, YtDlpFailure::detail($result));
 
 			return;
 		}
@@ -344,6 +353,8 @@ class YoutubeImportService {
 				// Credited to whoever pasted the link, which is not whose folder it is in.
 				$import->getUserId(),
 				$import->getDurationMs(),
+				// Carried from the request, for the reason given on request().
+				$import->getApproved(),
 			);
 		} catch (MusicRadioException $e) {
 			$this->fail($import, $this->classifyStorageFailure($e));
@@ -534,7 +545,13 @@ class YoutubeImportService {
 		};
 	}
 
-	private function fail(Import $import, string $code): void {
+	/**
+	 * @param string|null $detail what yt-dlp said, already cut down by
+	 *                            {@see YtDlpFailure::detail()}. Only worth carrying when
+	 *                            the code itself does not explain the failure — the
+	 *                            recognised causes have their own sentences.
+	 */
+	private function fail(Import $import, string $code, ?string $detail = null): void {
 		// A cancelled import that then fails is still cancelled: the person stopped it, and
 		// being told it "failed" would be misleading.
 		$current = $this->importMapper->statusOf($import->getId());
@@ -544,6 +561,7 @@ class YoutubeImportService {
 
 		$import->setStatus(Import::STATUS_FAILED);
 		$import->setErrorCode($code);
+		$import->setErrorDetail($code === ImportError::UNKNOWN ? $detail : null);
 		$import->setFinishedAt($this->clock->nowSeconds());
 
 		try {

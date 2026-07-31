@@ -54,21 +54,37 @@ export async function addTracks(channelId, fileIds, durationHints = {}) {
  * @param {number} channelId
  * @param {string} videoUrl a YouTube link. Only the video id survives the server's
  *   parsing, so anything else in the string is discarded rather than rejected.
+ * @param {string|null} token share token, or null when signed in
  * @return {Promise<object>} the queued import
  */
-export async function startImport(channelId, videoUrl) {
-	const { data } = await axios.post(url(`/channels/${channelId}/imports`), { url: videoUrl })
+export async function startImport(channelId, videoUrl, token = null) {
+	const { data } = await axios.post(importsUrl(channelId, token), { url: videoUrl })
 	return data.import
 }
 
 /**
+ * Where imports live, for whichever page is asking.
+ *
+ * The same shape as tracksUrl and streamUrl: a public page addresses the token endpoints
+ * and a signed-in one addresses the channel, and nothing above here has to care which.
+ *
  * @param {number} channelId
+ * @param {string|null} token share token, or null when signed in
+ * @return {string}
+ */
+function importsUrl(channelId, token = null) {
+	return token ? url(`/public/${token}/imports`) : url(`/channels/${channelId}/imports`)
+}
+
+/**
+ * @param {number} channelId
+ * @param {string|null} token share token, or null when signed in
  * @return {Promise<{imports: object[], capabilities: object}>} the imports plus whether
  *   this server can import at all, so the UI can explain itself rather than offering a
  *   button that will only ever fail
  */
-export async function fetchImports(channelId) {
-	const { data } = await axios.get(url(`/channels/${channelId}/imports`))
+export async function fetchImports(channelId, token = null) {
+	const { data } = await axios.get(importsUrl(channelId, token))
 	return { imports: data.imports, capabilities: data.capabilities ?? {} }
 }
 
@@ -78,9 +94,10 @@ export async function fetchImports(channelId) {
  *
  * @param {number} channelId
  * @param {number} importId
+ * @param {string|null} token share token, or null when signed in
  */
-export async function dismissImport(channelId, importId) {
-	await axios.delete(url(`/channels/${channelId}/imports/${importId}`))
+export async function dismissImport(channelId, importId, token = null) {
+	await axios.delete(`${importsUrl(channelId, token)}/${importId}`)
 }
 
 /**
@@ -88,9 +105,10 @@ export async function dismissImport(channelId, importId) {
  * @param {number[]} trackIds the complete playlist in its new order — the server rejects
  *   anything that is not a permutation of what it currently holds, which is how a
  *   concurrent append by someone else is caught instead of silently dropped.
+ * @param {string|null} [token] share token, when reordering through a public link
  */
-export async function reorderTracks(channelId, trackIds) {
-	const { data } = await axios.put(url(`/channels/${channelId}/tracks/order`), { trackIds })
+export async function reorderTracks(channelId, trackIds, token = null) {
+	const { data } = await axios.put(trackOrderUrl(channelId, token), { trackIds })
 	return data.tracks
 }
 
@@ -109,9 +127,9 @@ export async function deleteTrack(channelId, trackId) {
 }
 
 /**
- * The three endpoints a player needs, addressed either as a signed-in user or through a
- * share token. Keeping both forms behind one helper is what lets the whole synchronised
- * player be reused verbatim on the public page.
+ * The endpoints a player needs, addressed either as a signed-in user or through a share
+ * token. Keeping both forms behind one helper is what lets the whole synchronised player
+ * be reused verbatim on the public page.
  *
  * @param {number} channelId
  * @param {string|null} token share token, or null when signed in
@@ -128,6 +146,38 @@ export function stateUrl(channelId, token = null) {
  */
 export function tracksUrl(channelId, token = null) {
 	return token ? url(`/public/${token}/tracks`) : url(`/channels/${channelId}/tracks`)
+}
+
+/**
+ * Driving the broadcast. Reachable through a link only when its owner granted control,
+ * which the server checks — the token in the URL is not itself permission to do this.
+ *
+ * @param {number} channelId
+ * @param {string|null} token
+ * @return {string}
+ */
+export function controlUrl(channelId, token = null) {
+	return token ? url(`/public/${token}/control`) : url(`/channels/${channelId}/control`)
+}
+
+/**
+ * @param {number} channelId
+ * @param {string|null} token
+ * @return {string}
+ */
+export function playbackSettingsUrl(channelId, token = null) {
+	return token
+		? url(`/public/${token}/playback-settings`)
+		: url(`/channels/${channelId}/playback-settings`)
+}
+
+/**
+ * @param {number} channelId
+ * @param {string|null} token
+ * @return {string}
+ */
+export function trackOrderUrl(channelId, token = null) {
+	return token ? url(`/public/${token}/tracks/order`) : url(`/channels/${channelId}/tracks/order`)
 }
 
 /**
@@ -167,6 +217,46 @@ export async function uploadToPublicChannel(token, file, onProgress = undefined)
 	})
 
 	return data.track
+}
+
+/**
+ * Take back a track this browser uploaded through a link.
+ *
+ * The server decides whether that is allowed — see the `canRemove` flag it puts on each
+ * track — so this simply asks.
+ *
+ * @param {string} token share token
+ * @param {number} trackId
+ */
+export async function removeFromPublicChannel(token, trackId) {
+	await axios.delete(url(`/public/${token}/tracks/${trackId}`))
+}
+
+/**
+ * Vote for a track, or take the vote back.
+ *
+ * A toggle, and the server answers with the state after — the count includes everybody
+ * else's votes, which this browser has no way to know.
+ *
+ * @param {number} channelId
+ * @param {number} trackId
+ * @return {Promise<{voted: boolean, votes: number}>}
+ */
+export async function voteForTrack(channelId, trackId) {
+	const { data } = await axios.post(url(`/channels/${channelId}/tracks/${trackId}/vote`))
+	return data
+}
+
+/**
+ * The same, through a public link. Identified by the visitor cookie the share page set.
+ *
+ * @param {string} token share token
+ * @param {number} trackId
+ * @return {Promise<{voted: boolean, votes: number}>}
+ */
+export async function voteOnPublicChannel(token, trackId) {
+	const { data } = await axios.post(url(`/public/${token}/tracks/${trackId}/vote`))
+	return data
 }
 
 /**

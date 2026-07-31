@@ -12,6 +12,7 @@ use OCA\MusicRadio\AppInfo\Application;
 use OCA\MusicRadio\Db\ChannelMapper;
 use OCA\MusicRadio\Permission;
 use OCA\MusicRadio\Service\ShareService;
+use OCA\MusicRadio\Service\VisitorIdentity;
 use OCP\AppFramework\AuthPublicShareController;
 use OCP\AppFramework\Http\Attribute\NoCSRFRequired;
 use OCP\AppFramework\Http\Attribute\PublicPage;
@@ -47,6 +48,7 @@ class ChannelPublicController extends AuthPublicShareController {
 		private ShareService $shareService,
 		private ChannelMapper $channelMapper,
 		private IInitialState $initialState,
+		private VisitorIdentity $visitorIdentity,
 	) {
 		parent::__construct($appName, $request, $session, $urlGenerator);
 	}
@@ -106,6 +108,10 @@ class ChannelPublicController extends AuthPublicShareController {
 			return new TemplateResponse('core', '404', [], TemplateResponse::RENDER_AS_GUEST);
 		}
 
+		// Issued here rather than by the API, because this is the one request that renders
+		// a page and so the one that can set a cookie the browser will send back.
+		$visitorKey = $this->visitorIdentity->current() ?? $this->visitorIdentity->issue();
+
 		$this->initialState->provideInitialState('music_radio-initial-state', [
 			'mode' => 'public',
 			'token' => $this->getToken(),
@@ -130,6 +136,15 @@ class ChannelPublicController extends AuthPublicShareController {
 		$response = new PublicTemplateResponse(Application::APP_ID, 'public');
 		$response->setHeaderTitle($channel->getTitle());
 		$response->setFooterVisible(false);
+
+		// Lets this browser take back what it uploads. Re-set on every visit so the expiry
+		// keeps moving; the value only changes if the browser lost it. See VisitorIdentity
+		// for how little this is meant to prove.
+		$response->addCookie(
+			VisitorIdentity::COOKIE,
+			$visitorKey,
+			$this->visitorIdentity->lifetime(),
+		);
 
 		// No CSP override: the default policy already allows media-src and connect-src
 		// from 'self', which is all the player needs.

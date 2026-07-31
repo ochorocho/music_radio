@@ -77,7 +77,7 @@ test.beforeEach(async ({ page, db }) => {
 	titleB = uniqueTitle('AAB Nav Two')
 
 	const fileRows = await db.query<Array<{ fileid: number }>>(
-		"select fileid from oc_filecache where name in ('tone-a.mp3','tone-b.mp3','tone-c.mp3') and path like 'files/Music/%' order by name",
+		"select fileid from oc_filecache where name in ('tone-a.mp3','tone-b.mp3','tone-c.mp3') and path like 'files/Music/%' and path not like 'files/Music/%/%' order by name",
 	)
 	const fileIds = fileRows.map((r) => r.fileid)
 

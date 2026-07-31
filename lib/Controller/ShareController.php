@@ -86,6 +86,7 @@ class ShareController extends Controller {
 		// A new share changes who can reach the channel, so any cached resolution for
 		// this request is now wrong.
 		$this->permissionService->clearCache();
+		$this->channelService->syncVotingMode($channel);
 
 		return new DataResponse($this->shareService->present($share), Http::STATUS_CREATED);
 	}
@@ -97,18 +98,35 @@ class ShareController extends Controller {
 		?int $permissions = null,
 		?int $expiration = null,
 		?string $label = null,
+		?bool $requireApproval = null,
+		?bool $allowVoting = null,
+		?bool $showListenerCount = null,
+		?bool $allowImport = null,
 	): DataResponse {
 		try {
 			$channel = $this->channelService->findReadable($id, $this->userId);
 			$this->permissionService->requirePermission($channel, $this->userId, Permission::SHARE);
 
 			$share = $this->shareService->find($channel, $shareId);
-			$share = $this->shareService->update($share, $permissions, $expiration, $label);
+			$share = $this->shareService->update(
+				$share,
+				$permissions,
+				$expiration,
+				$label,
+				$requireApproval,
+				$allowVoting,
+				$showListenerCount,
+				$allowImport,
+			);
 		} catch (MusicRadioException $e) {
 			return new DataResponse(['error' => $e->getMessage()], $e->getStatus());
 		}
 
 		$this->permissionService->clearCache();
+		// Voting is decided per share now, but the running order is a property of the
+		// channel — turning the switch on for one audience is what puts the whole playlist
+		// in vote order. See ChannelService::syncVotingMode.
+		$this->channelService->syncVotingMode($channel);
 
 		return new DataResponse($this->shareService->present($share));
 	}
@@ -148,6 +166,8 @@ class ShareController extends Controller {
 		}
 
 		$this->permissionService->clearCache();
+		// Removing the last share that could vote puts the author's order back.
+		$this->channelService->syncVotingMode($channel);
 
 		return new DataResponse([], Http::STATUS_NO_CONTENT);
 	}

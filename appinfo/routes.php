@@ -9,6 +9,13 @@ return [
 	'routes' => [
 		['name' => 'page#index', 'url' => '/', 'verb' => 'GET'],
 
+		// One request per settings page, not one per field — see SettingsController.
+		['name' => 'settings#saveAdmin', 'url' => '/settings/admin', 'verb' => 'POST'],
+		// The web equivalent of `occ music_radio:ytdlp:install --force`, which the status
+		// text used to have to tell administrators to go and run in a terminal.
+		['name' => 'settings#installYtDlp', 'url' => '/settings/admin/ytdlp', 'verb' => 'POST'],
+		['name' => 'settings#savePersonal', 'url' => '/settings/personal', 'verb' => 'POST'],
+
 		// Channels
 		['name' => 'channel#index', 'url' => '/api/v1/channels', 'verb' => 'GET'],
 		['name' => 'channel#create', 'url' => '/api/v1/channels', 'verb' => 'POST'],
@@ -22,6 +29,11 @@ return [
 		['name' => 'track#reorder', 'url' => '/api/v1/channels/{id}/tracks/order', 'verb' => 'PUT'],
 		['name' => 'track#update', 'url' => '/api/v1/channels/{id}/tracks/{trackId}', 'verb' => 'PUT'],
 		['name' => 'track#destroy', 'url' => '/api/v1/channels/{id}/tracks/{trackId}', 'verb' => 'DELETE'],
+
+		// Voting. A toggle rather than separate cast/withdraw verbs: pressing the same
+		// control twice is what a listener does, and the server answers with the state
+		// after either way.
+		['name' => 'vote#toggle', 'url' => '/api/v1/channels/{id}/tracks/{trackId}/vote', 'verb' => 'POST'],
 
 		// Importing audio from a link. No public-link equivalent on purpose: an anonymous
 		// visitor starting server-side downloads against the owner's quota is a different
@@ -62,5 +74,23 @@ return [
 		['name' => 'publicApi#tracks', 'url' => '/api/v1/public/{token}/tracks', 'verb' => 'GET'],
 		['name' => 'publicApi#stream', 'url' => '/api/v1/public/{token}/tracks/{trackId}/stream', 'verb' => 'GET'],
 		['name' => 'publicApi#upload', 'url' => '/api/v1/public/{token}/tracks', 'verb' => 'POST'],
+		// The visitor's own upload, or anything at all on a link that curates — see
+		// PublicApiController::destroyTrack.
+		['name' => 'publicApi#destroyTrack', 'url' => '/api/v1/public/{token}/tracks/{trackId}', 'verb' => 'DELETE'],
+		['name' => 'publicApi#vote', 'url' => '/api/v1/public/{token}/tracks/{trackId}/vote', 'verb' => 'POST'],
+
+		// Being the DJ through a link. Both are off unless the owner granted CONTROL or
+		// EDIT_PLAYLIST on that link, which is never the default — see Permission::LINK_ALLOWED.
+		// Declared before the {trackId} routes above would ever be consulted for a PUT, but
+		// listed here so the whole controlling surface reads together.
+		['name' => 'publicApi#control', 'url' => '/api/v1/public/{token}/control', 'verb' => 'POST'],
+		['name' => 'publicApi#playbackSettings', 'url' => '/api/v1/public/{token}/playback-settings', 'verb' => 'PUT'],
+		['name' => 'publicApi#reorderTracks', 'url' => '/api/v1/public/{token}/tracks/order', 'verb' => 'PUT'],
+
+		// Importing through a link. Off unless the owner switched it on for that link —
+		// see PublicApiController::createImport for why this one is gated so heavily.
+		['name' => 'publicApi#imports', 'url' => '/api/v1/public/{token}/imports', 'verb' => 'GET'],
+		['name' => 'publicApi#createImport', 'url' => '/api/v1/public/{token}/imports', 'verb' => 'POST'],
+		['name' => 'publicApi#destroyImport', 'url' => '/api/v1/public/{token}/imports/{importId}', 'verb' => 'DELETE'],
 	],
 ];

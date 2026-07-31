@@ -32,6 +32,8 @@ export const playerStore = reactive({
 		clockReady: false,
 		clockRttMs: 0,
 		driftMs: 0,
+		/** The element making sound has run out of data and is waiting for more. */
+		stalled: false,
 		error: null,
 		/** The browser refused to start playback until something is pressed. */
 		needsGesture: false,
@@ -60,7 +62,7 @@ export const playerStore = reactive({
 		this.channel = null
 		this.token = null
 		this.muted = false
-		this.sync = { clockReady: false, clockRttMs: 0, driftMs: 0, error: null, needsGesture: false }
+		this.sync = { clockReady: false, clockRttMs: 0, driftMs: 0, stalled: false, error: null, needsGesture: false }
 	},
 
 	/** Ask the player — which lives in a different component — to start again. */

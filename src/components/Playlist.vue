@@ -25,18 +25,23 @@
 				:is-first="index === 0"
 				:is-last="index === tracks.length - 1"
 				:can-reorder="canReorder"
+				:can-curate="canReorder && curationAvailable"
 				:can-remove="canRemoveTrack(track)"
 				:can-control="canControl"
 				:is-on-air="onAirTrackId === track.id"
 				:is-dragging="draggingTrackId === track.id"
 				:can-preview="canPreview && track.playable"
 				:is-previewing="previewTrackId === track.id"
+				:show-votes="showVotes"
+				:can-vote="canVote"
+				@vote="$emit('vote', track)"
 				@move-up="move(index, -1)"
 				@move-down="move(index, 1)"
 				@remove="$emit('remove', track)"
 				@play="$emit('play', track)"
 				@preview="$emit('preview', track)"
 				@toggle-disabled="$emit('toggle-disabled', track)"
+				@approve="$emit('approve', track)"
 				@drag-start="draggingTrackId = track.id"
 				@drag-end="draggingTrackId = null"
 				@drop-on="onDropOn" />
@@ -86,14 +91,36 @@ export default {
 			type: Boolean,
 			default: false,
 		},
+		/** Whether the channel has voting switched on. */
+		showVotes: {
+			type: Boolean,
+			default: false,
+		},
+		/** Whether this person may cast a vote. */
+		canVote: {
+			type: Boolean,
+			default: false,
+		},
 		/** The track being played privately, if any. */
 		previewTrackId: {
 			type: Number,
 			default: null,
 		},
+		/**
+		 * Whether the curation actions — skip a track, let a held one play — are on offer
+		 * to someone who may otherwise reorder. On everywhere but the public page, which
+		 * passes false: those two go through the track-update endpoint, which has no
+		 * anonymous counterpart, and approving in particular is the owner's review of what
+		 * strangers uploaded. Reordering and removing are unaffected; they have public
+		 * endpoints and are what a link curator was granted.
+		 */
+		curationAvailable: {
+			type: Boolean,
+			default: true,
+		},
 	},
 
-	emits: ['reorder', 'remove', 'play', 'preview', 'toggle-disabled'],
+	emits: ['reorder', 'remove', 'play', 'preview', 'toggle-disabled', 'approve', 'vote'],
 
 	data() {
 		return {
@@ -126,10 +153,18 @@ export default {
 		 * Mirrors the server's rule: curating the playlist lets you remove anything,
 		 * while a contributor may only take back what they added themselves.
 		 *
+		 * A row that carries the server's own answer is believed instead. That is how the
+		 * public page works — a browser cannot read the visitor cookie that decides which
+		 * uploads are its own, so the server decides once and the page renders what it is
+		 * told, rather than guessing from a `currentUser` that is null there anyway.
+		 *
 		 * @param {object} track
 		 * @return {boolean}
 		 */
 		canRemoveTrack(track) {
+			if (track.canRemove !== undefined) {
+				return track.canRemove === true
+			}
 			if (can(this.channel.permissions, EDIT_PLAYLIST)) {
 				return true
 			}

@@ -66,7 +66,7 @@ test.describe('sharing a channel', () => {
 		channelId = created.body.id
 
 		const fileRows = await db.query<Array<{ fileid: number }>>(
-			"select fileid from oc_filecache where name in ('tone-a.mp3','tone-b.mp3') and path like 'files/Music/%' order by name",
+			"select fileid from oc_filecache where name in ('tone-a.mp3','tone-b.mp3') and path like 'files/Music/%' and path not like 'files/Music/%/%' order by name",
 		)
 		await api(page, 'POST', `${API}/channels/${channelId}/tracks`, {
 			fileIds: fileRows.map((r) => r.fileid),

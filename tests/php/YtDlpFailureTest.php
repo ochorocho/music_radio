@@ -184,4 +184,89 @@ class YtDlpFailureTest extends TestCase {
 
 		self::assertNull(YtDlpFailure::classifyProbe($result));
 	}
+
+	// ------------------------------------------------- what yt-dlp actually said
+
+	/**
+	 * The reason, without the extractor tag and the video id the row already holds.
+	 */
+	public function testTheDetailIsTheReasonWithoutItsPrefix(): void {
+		$result = self::failed(self::JS_WARNING . "\nERROR: [youtube] dQw4w9WgXcQ: Requested format is not available");
+
+		self::assertSame('Requested format is not available', YtDlpFailure::detail($result));
+	}
+
+	/** yt-dlp omits both when it fails before choosing an extractor. */
+	public function testTheDetailCopesWithNoPrefixAtAll(): void {
+		$result = self::failed('ERROR: Unable to rename file');
+
+		self::assertSame('Unable to rename file', YtDlpFailure::detail($result));
+	}
+
+	/**
+	 * A server's filesystem layout is not the requester's business, and postprocessing
+	 * failures quote temporary directories freely.
+	 */
+	public function testPathsAreStrippedOutOfTheDetail(): void {
+		$result = self::failed(
+			'ERROR: Postprocessing: ffmpeg not found at /var/www/html/nextcloud/data/tmp/xyz/audio.mp3',
+		);
+
+		$detail = YtDlpFailure::detail($result);
+
+		self::assertNotNull($detail);
+		self::assertStringNotContainsString('/var/www', $detail);
+		self::assertStringNotContainsString('/data/tmp', $detail);
+		self::assertStringContainsString('ffmpeg not found', $detail);
+	}
+
+	/** The warning on every run is not an error, and must never become the detail. */
+	public function testTheStandingWarningIsNeverTheDetail(): void {
+		self::assertNull(YtDlpFailure::detail(self::failed(self::JS_WARNING)));
+	}
+
+	public function testTheDetailIsCappedSoARowCannotBecomeALogFile(): void {
+		$result = self::failed('ERROR: ' . str_repeat('a very long complaint ', 60));
+
+		$detail = YtDlpFailure::detail($result);
+
+		self::assertNotNull($detail);
+		self::assertLessThanOrEqual(240, mb_strlen($detail));
+	}
+
+	/**
+	 * A link survives the path stripper.
+	 *
+	 * The two patterns overlap — `//www.youtube.com/watch` looks exactly like a path — so
+	 * without holding URLs aside first, a message naming the video came back as
+	 * "https:/…?v=abc". A URL is safe to show anyway: it is the one that was asked for.
+	 */
+	public function testAUrlIsNotMistakenForAPath(): void {
+		$result = self::failed('ERROR: Unsupported URL: https://www.youtube.com/watch?v=dQw4w9WgXcQ');
+
+		self::assertSame(
+			'Unsupported URL: https://www.youtube.com/watch?v=dQw4w9WgXcQ',
+			YtDlpFailure::detail($result),
+		);
+	}
+
+	/** And a path in the same line still goes, URL or no URL. */
+	public function testAPathGoesEvenWhenALinkIsPresent(): void {
+		$result = self::failed(
+			'ERROR: could not write /var/www/html/nextcloud/data/tmp/x.mp3 for https://youtu.be/dQw4w9WgXcQ',
+		);
+
+		$detail = YtDlpFailure::detail($result);
+
+		self::assertNotNull($detail);
+		self::assertStringNotContainsString('/var/www', $detail);
+		self::assertStringContainsString('https://youtu.be/dQw4w9WgXcQ', $detail);
+	}
+
+	/** Only the first: yt-dlp repeats itself, and the first line is the cause. */
+	public function testOnlyTheFirstErrorLineIsKept(): void {
+		$result = self::failed("ERROR: Video unavailable\nERROR: and then everything else broke");
+
+		self::assertSame('Video unavailable', YtDlpFailure::detail($result));
+	}
 }

@@ -107,7 +107,7 @@ test('tracks are added with durations read from the files themselves', async ({ 
 		// The seeded fixtures are sine tones of exactly 3s, 5s and 8s.
 		const fileRows = await db.query<Array<{ fileid: number, name: string }>>(
 			`select fc.fileid, fc.name from oc_filecache fc
-			 where fc.name in ('tone-a.mp3', 'tone-b.mp3', 'tone-c.mp3') and fc.path like 'files/Music/%'
+			 where fc.name in ('tone-a.mp3', 'tone-b.mp3', 'tone-c.mp3') and fc.path like 'files/Music/%' and fc.path not like 'files/Music/%/%'
 			 order by fc.name`,
 		)
 		expect(fileRows.length).toBe(3)
@@ -148,7 +148,7 @@ test('adding the same file twice is skipped rather than duplicated', async ({ pa
 
 	try {
 		const fileRows = await db.query<Array<{ fileid: number }>>(
-			"select fileid from oc_filecache where name = 'tone-a.mp3' and path like 'files/Music/%' limit 1",
+			"select fileid from oc_filecache where name = 'tone-a.mp3' and path like 'files/Music/%' and path not like 'files/Music/%/%' limit 1",
 		)
 		const fileId = fileRows[0].fileid
 
@@ -194,7 +194,7 @@ test('reordering rewrites sort order, and a stale order is rejected', async ({ p
 
 	try {
 		const fileRows = await db.query<Array<{ fileid: number }>>(
-			"select fileid from oc_filecache where name in ('tone-a.mp3', 'tone-b.mp3', 'tone-c.mp3') and path like 'files/Music/%' order by name",
+			"select fileid from oc_filecache where name in ('tone-a.mp3', 'tone-b.mp3', 'tone-c.mp3') and path like 'files/Music/%' and path not like 'files/Music/%/%' order by name",
 		)
 		const added = await api(page, 'POST', `${API}/channels/${id}/tracks`, {
 			fileIds: fileRows.map((r) => r.fileid),
@@ -222,7 +222,7 @@ test('deleting a channel removes its tracks too', async ({ page, db }) => {
 	const id = created.body.id as number
 
 	const fileRows = await db.query<Array<{ fileid: number }>>(
-		"select fileid from oc_filecache where name = 'tone-a.mp3' and path like 'files/Music/%' limit 1",
+		"select fileid from oc_filecache where name = 'tone-a.mp3' and path like 'files/Music/%' and path not like 'files/Music/%/%' limit 1",
 	)
 	await api(page, 'POST', `${API}/channels/${id}/tracks`, { fileIds: [fileRows[0].fileid] })
 

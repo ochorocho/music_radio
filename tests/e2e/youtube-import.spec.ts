@@ -162,6 +162,45 @@ test('the server refuses anything that is not a YouTube video link', async ({ pa
 	}
 })
 
+/**
+ * The stub must refuse videos it was not written for.
+ *
+ * This is a guard on the test harness rather than on the app, and it exists because the
+ * harness silently lied once. The stub used to answer *any* unrecognised id with
+ * tone-a.mp3, so an instance left pointed at it — which the e2e wrapper could do
+ * permanently, by "restoring" the stub as though it were the previous configuration —
+ * imported "Test tone 440Hz" for every real video anybody asked for, and nothing said why.
+ *
+ * A well-formed link the stub does not know must therefore fail, and leave nothing behind.
+ */
+test('a video the stub does not know is refused rather than served a test tone', async ({ page, db }) => {
+	await page.goto(APP_PATH)
+
+	// Real-shaped and accepted by the app's URL parsing, so it reaches the stub — which is
+	// the whole point. `dQw4w9WgXcQ` is Rickrolling's, and is not one the stub was given.
+	const result = await api(page, 'POST', `${API}/channels/${channelId}/imports`, {
+		url: 'https://www.youtube.com/watch?v=dQw4w9WgXcQ',
+	})
+	expect(result.status).toBe(202)
+
+	await waitForStatus(page, 'failed')
+
+	// Nothing was added. That is the whole assertion: the fault being guarded against was
+	// a *successful* import of the wrong audio, not a failure of any particular shape.
+	const tracks = await db.query<Array<{ id: number }>>(
+		'select id from oc_music_radio_tracks where channel_id = ?', [channelId],
+	)
+	expect(tracks).toHaveLength(0)
+
+	// The reason is deliberately not checked here. yt-dlp's stderr never reaches whoever
+	// pressed the button — ImportError::describe answers anything it does not recognise
+	// with a generic sentence — and the stub's explanation of itself goes to the Nextcloud
+	// log instead, via YoutubeImportService::logFailure, which is where an administrator
+	// investigating "why did this import fail" would look.
+	const failed = await currentImport(page)
+	expect(failed.status).toBe('failed')
+})
+
 // ------------------------------------------------------------- the happy path
 
 test('a link becomes a track on the playlist', async ({ page, db }) => {
@@ -321,4 +360,194 @@ test('a channel that is not yours cannot be imported into', async ({ page }) => 
 	// Not 403: saying "forbidden" would confirm the channel exists.
 	const result = await api(page, 'POST', `${API}/channels/999999/imports`, { url: link(VIDEO.ok) })
 	expect(result.status).toBe(404)
+})
+
+// ------------------------------------------------- importing through a link
+
+/*
+ * A visitor with no account, importing.
+ *
+ * This app refused to do this for a long time, and the reasoning has not become wrong: an
+ * anonymous visitor starting server-side downloads against the owner's quota and CPU is a
+ * different proposition from uploading a file they already have. It is allowed now, but
+ * only where somebody has deliberately said so on that particular link — which is what
+ * these check, from both directions.
+ */
+
+/** A link on the current channel, with whatever rules the test needs. */
+async function linkAllowing(page: Page, rules: Record<string, unknown>) {
+	const created = await api(page, 'POST', `${API}/channels/${channelId}/shares`, { shareType: 3 })
+	expect(created.status).toBe(201)
+
+	const updated = await api(page, 'PUT', `${API}/channels/${channelId}/shares/${created.body.id}`, {
+		// LISTEN | ADD_TRACKS. The switch cannot grant importing on its own — it says who,
+		// among those who may add at all, may add this way.
+		permissions: 3,
+		...rules,
+	})
+	expect(updated.status).toBe(200)
+
+	return created.body.token as string
+}
+
+/**
+ * A visitor page with no session at all — not the owner's, and not another visitor's.
+ * The share page is also what issues the per-browser key an import is attributed to.
+ */
+async function visitorOn(browser: import('@playwright/test').Browser, token: string) {
+	const context = await browser.newContext({ ignoreHTTPSErrors: true, storageState: undefined })
+	const visitor = await context.newPage()
+	await visitor.goto(`${APP_PATH}s/${token}`)
+	await expect(visitor.getByTestId('public-channel-title')).toBeVisible({ timeout: 20_000 })
+
+	return { context, visitor }
+}
+
+async function importAs(visitor: Page, token: string, videoId: string) {
+	return await visitor.evaluate(async ({ t, id }) => {
+		const response = await fetch(`/index.php/apps/music_radio/api/v1/public/${t}/imports`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ url: `https://www.youtube.com/watch?v=${id}` }),
+		})
+		const text = await response.text()
+		return { status: response.status, body: text ? JSON.parse(text) : null }
+	}, { t: token, id: videoId })
+}
+
+test('a link that allows it can import, and the track lands on the playlist', async ({ page, browser }) => {
+	await page.goto(APP_PATH)
+	const token = await linkAllowing(page, { allowImport: true, requireApproval: false })
+
+	const { context, visitor } = await visitorOn(browser, token)
+	try {
+		await expect(visitor.getByTestId('public-add-youtube'), 'the button is offered').toBeVisible()
+
+		const started = await importAs(visitor, token, 'stubOKLINK1')
+		expect(started.status).toBe(202)
+
+		await waitForStatus(page, 'done')
+
+		const tracks = await api(page, 'GET', `${API}/channels/${channelId}/tracks`)
+		expect(tracks.body.tracks).toHaveLength(1)
+		// Recorded against the link rather than against nobody, so the owner can see where
+		// it came from and the visitor can stop their own.
+		expect(tracks.body.tracks[0].addedBy).toMatch(/^\?link:/)
+	} finally {
+		await visitor.close()
+		await context.close()
+	}
+})
+
+/**
+ * The link's approval setting has to be read while the link is still in hand.
+ *
+ * The job that files the track runs minutes later and knows the requester only as
+ * `?link:<key>` — not an account, and not resolvable back to a share. Get this wrong and
+ * an anonymous import quietly ignores the setting that was supposed to hold it.
+ */
+test('an import through a link that holds things is held', async ({ page, browser, db }) => {
+	await page.goto(APP_PATH)
+	const token = await linkAllowing(page, { allowImport: true, requireApproval: true })
+
+	const { context, visitor } = await visitorOn(browser, token)
+	try {
+		expect((await importAs(visitor, token, 'stubOKLINK2')).status).toBe(202)
+		await waitForStatus(page, 'done')
+
+		const rows = await db.query<Array<{ approved: number }>>(
+			'select approved from oc_music_radio_tracks where channel_id = ?', [channelId],
+		)
+		expect(rows).toHaveLength(1)
+		expect(Number(rows[0].approved), 'held for the owner to approve').toBe(0)
+	} finally {
+		await visitor.close()
+		await context.close()
+	}
+})
+
+test('a link without the switch cannot import, button or no button', async ({ page, browser }) => {
+	await page.goto(APP_PATH)
+	const token = await linkAllowing(page, { allowImport: false })
+
+	const { context, visitor } = await visitorOn(browser, token)
+	try {
+		await expect(visitor.getByTestId('public-add-youtube')).toHaveCount(0)
+
+		const refused = await importAs(visitor, token, 'stubOKLINK3')
+		expect(refused.status).toBe(403)
+		expect(await currentImport(page)).toBeNull()
+	} finally {
+		await visitor.close()
+		await context.close()
+	}
+})
+
+/*
+ * There used to be a test here for the channel-wide import switch overruling a link that
+ * allowed it. That switch is gone: it AND-gated the per-share one, which meant an owner
+ * had to say yes twice and a share could be silently inert. Two switches decide it now —
+ * the administrator's and the share's own — and the share's is covered by the test above.
+ */
+
+/**
+ * The key comes from the share page. Without it there is nobody to attribute the import
+ * to, nobody to hold to the per-visitor cap, and nobody who could stop it afterwards — so
+ * it is refused rather than run for an unknown.
+ */
+test('a browser that cannot be identified cannot import', async ({ page, browser }) => {
+	await page.goto(APP_PATH)
+	const token = await linkAllowing(page, { allowImport: true })
+
+	const context = await browser.newContext({ ignoreHTTPSErrors: true, storageState: undefined })
+	const stranger = await context.newPage()
+	try {
+		// Straight at the endpoint, never having loaded the share page.
+		await stranger.goto(`${APP_PATH}s/${token}`)
+		await context.clearCookies()
+
+		expect((await importAs(stranger, token, 'stubOKLINK5')).status).toBe(403)
+	} finally {
+		await stranger.close()
+		await context.close()
+	}
+})
+
+/**
+ * A link is not a window onto who else uses the channel.
+ *
+ * The queue exists so a visitor can watch and stop what they started. The owner's imports
+ * carry the owner's user id, and other visitors' carry theirs — neither is anything a link
+ * was meant to disclose, and neither is anything the visitor could act on anyway.
+ */
+test('a visitor sees only their own imports, and no user ids', async ({ page, browser }) => {
+	await page.goto(APP_PATH)
+	const token = await linkAllowing(page, { allowImport: true })
+
+	// The owner starts one, signed in, before the visitor looks.
+	expect((await api(page, 'POST', `${API}/channels/${channelId}/imports`, { url: link(VIDEO.slow) })).status)
+		.toBe(202)
+
+	const { context, visitor } = await visitorOn(browser, token)
+	try {
+		const mine = await visitor.evaluate(async (t) => {
+			const r = await fetch(`/index.php/apps/music_radio/api/v1/public/${t}/imports`)
+			return await r.json()
+		}, token)
+
+		expect(mine.imports, "the owner's import is not the visitor's business").toHaveLength(0)
+
+		expect((await importAs(visitor, token, 'stubOKLINK6')).status).toBe(202)
+
+		const now = await visitor.evaluate(async (t) => {
+			const r = await fetch(`/index.php/apps/music_radio/api/v1/public/${t}/imports`)
+			return await r.json()
+		}, token)
+
+		expect(now.imports, 'their own, and only their own').toHaveLength(1)
+		expect(now.imports[0]).not.toHaveProperty('userId')
+	} finally {
+		await visitor.close()
+		await context.close()
+	}
 })

@@ -40,7 +40,7 @@ test('the browser decodes the stream, reports the right duration, and plays it',
 	try {
 		// tone-c.mp3 is a generated sine tone of exactly 8 seconds.
 		const fileRows = await db.query<Array<{ fileid: number }>>(
-			"select fileid from oc_filecache where name = 'tone-c.mp3' and path like 'files/Music/%' limit 1",
+			"select fileid from oc_filecache where name = 'tone-c.mp3' and path like 'files/Music/%' and path not like 'files/Music/%/%' limit 1",
 		)
 		const added = await api(page, 'POST', `${API}/channels/${channelId}/tracks`, {
 			fileIds: [fileRows[0].fileid],

@@ -82,7 +82,7 @@ test.describe('public links', () => {
 		channelId = created.body.id
 
 		const fileRows = await db.query<Array<{ fileid: number }>>(
-			"select fileid from oc_filecache where name in ('tone-a.mp3','tone-b.mp3') and path like 'files/Music/%' order by name",
+			"select fileid from oc_filecache where name in ('tone-a.mp3','tone-b.mp3') and path like 'files/Music/%' and path not like 'files/Music/%/%' order by name",
 		)
 		await api(page, 'POST', `${API}/channels/${channelId}/tracks`, {
 			fileIds: fileRows.map((r) => r.fileid),
@@ -118,24 +118,53 @@ test.describe('public links', () => {
 		expect(Number(rows[0].permissions)).toBe(1)
 	})
 
-	test('a link cannot be upgraded into control of the channel', async ({ page, db }) => {
+	test('a link cannot be upgraded into sharing the channel on', async ({ page, db }) => {
 		const rows = await db.query<Array<{ id: number }>>(
 			'select id from oc_music_radio_shares where channel_id = ? and share_type = 3', [channelId],
 		)
 
-		// Uploading is the one thing a link can be given beyond listening — see
-		// public-upload.spec.ts. Everything else is refused.
-		const result = await api(page, 'PUT', `${API}/channels/${channelId}/shares/${rows[0].id}`, {
+		// A link can be given the broadcast itself — uploading, control, curation — because
+		// those are decisions about the music and the owner makes them per link. SHARE (16)
+		// and MANAGE (32) are not: they decide who else reaches the channel and what it is,
+		// and handing those to whoever holds a URL is not something an owner could mean.
+		const refused = await api(page, 'PUT', `${API}/channels/${channelId}/shares/${rows[0].id}`, {
 			permissions: 63,
 		})
-		expect(result.status).toBe(400)
+		expect(refused.status).toBe(400)
+
+		// Still listen-only afterwards: a rejected change must not half-apply.
+		const after = await db.query<Array<{ permissions: number }>>(
+			'select permissions from oc_music_radio_shares where id = ?', [rows[0].id],
+		)
+		expect(Number(after[0].permissions)).toBe(1)
+	})
+
+	test('a link can be given control and curation of the broadcast', async ({ page, db }) => {
+		const rows = await db.query<Array<{ id: number }>>(
+			'select id from oc_music_radio_shares where channel_id = ? and share_type = 3', [channelId],
+		)
+
+		// 4 = CONTROL, 8 = EDIT_PLAYLIST. Accepted, and normalised on the way in: curating
+		// implies being able to add, exactly as it does for a named person's share.
+		const result = await api(page, 'PUT', `${API}/channels/${channelId}/shares/${rows[0].id}`, {
+			permissions: 1 | 4 | 8,
+		})
+		expect(result.status).toBe(200)
+
+		const after = await db.query<Array<{ permissions: number }>>(
+			'select permissions from oc_music_radio_shares where id = ?', [rows[0].id],
+		)
+		expect(Number(after[0].permissions)).toBe(1 | 2 | 4 | 8)
+
+		// Put back, so the tests below still describe a listen-only link.
+		await api(page, 'PUT', `${API}/channels/${channelId}/shares/${rows[0].id}`, { permissions: 1 })
 	})
 
 	test('anyone with the link can open the page and see the channel', async () => {
 		await anonPage.goto(`${APP_PATH}s/${token}`)
 
 		await expect(anonPage.getByTestId('public-channel-title')).toHaveText(channelTitle, { timeout: 20_000 })
-		await expect(anonPage.getByTestId('public-playlist')).toBeVisible()
+		await expect(anonPage.getByTestId('playlist')).toBeVisible()
 		await expect(anonPage.getByTestId('on-air')).toBeVisible()
 
 		// Listening only: no DJ controls, nothing to add music with.
@@ -332,6 +361,65 @@ test.describe('public links', () => {
 		// Having authenticated, the same session may now use the token API.
 		expect(await statusOf(anonPage, `${API}/public/${token}/state`)).toBe(200)
 	})
+
+	/**
+	 * A visitor should be able to see which row they are hearing.
+	 *
+	 * The signed-in playlist has always marked it; the public list did not, so somebody
+	 * following a link had the title in the player and no way to place it in the list. The
+	 * player already publishes the current track — the list just had to be told.
+	 *
+	 * The fixtures here are three and five seconds long, which is what makes the second
+	 * half of this cheap: the mark has to move on its own.
+	 */
+	test('the public playlist marks the track that is on air, and it moves', async () => {
+		await anonPage.goto(`${APP_PATH}s/${token}`)
+		await expect(anonPage.getByTestId('playlist').locator('li').first())
+			.toBeVisible({ timeout: 20_000 })
+
+		await expect
+			.poll(async () => await anonPage.locator('[data-onair="true"]').count(),
+				{ timeout: 30_000, intervals: [500] })
+			.toBe(1)
+
+		const marked = async () => (
+			(await anonPage.locator('[data-onair="true"] [data-testid="track-title"]').textContent()) ?? ''
+		).trim()
+
+		// The marked row is the one the player says is playing, not merely some row.
+		const playing = ((await anonPage.getByTestId('now-playing-title').first().textContent()) ?? '').trim()
+		expect(await marked()).toBe(playing)
+
+		// And it follows the broadcast rather than being decided once at load.
+		const first = await marked()
+		await expect
+			.poll(marked, { timeout: 40_000, intervals: [1000] })
+			.not.toBe(first)
+	})
+
+	/**
+	 * Not by colour alone.
+	 *
+	 * A tinted row says nothing to a screen reader and is not a signal every sighted
+	 * reader receives either. The icon and the words carry it instead, and exactly one row
+	 * has them.
+	 */
+	test('the playing row says so, not just shows so', async () => {
+		await anonPage.goto(`${APP_PATH}s/${token}`)
+		await expect(anonPage.getByTestId('playlist').locator('li').first())
+			.toBeVisible({ timeout: 20_000 })
+
+		await expect
+			.poll(async () => await anonPage.getByTestId('track-onair').count(),
+				{ timeout: 30_000, intervals: [500] })
+			.toBe(1)
+
+		// On the row that is actually playing, and readable rather than merely coloured.
+		await expect(anonPage.locator('[data-onair="true"] [data-testid="track-onair"]'))
+			.toHaveCount(1)
+		await expect(anonPage.getByTestId('track-onair')).toContainText(/playing now/i)
+	})
+
 })
 /**
  * A title unique to this run.
@@ -345,4 +433,3 @@ function uniqueTitle(base: string): string {
 }
 
 let channelTitle = ''
-

@@ -11,6 +11,7 @@ namespace OCA\MusicRadio\Service;
 use OCA\MusicRadio\Db\Channel;
 use OCA\MusicRadio\Db\Track;
 use OCA\MusicRadio\Db\TrackMapper;
+use OCA\MusicRadio\Db\VoteMapper;
 use OCA\MusicRadio\Exception\MusicRadioException;
 use OCA\MusicRadio\Exception\NotFoundException;
 use OCP\AppFramework\Db\DoesNotExistException;
@@ -42,6 +43,8 @@ class TrackService {
 
 	public function __construct(
 		private TrackMapper $trackMapper,
+		private VoteMapper $voteMapper,
+		private PermissionService $permissionService,
 		private TimelineService $timelineService,
 		private AudioProbe $audioProbe,
 		private IRootFolder $rootFolder,
@@ -95,6 +98,7 @@ class TrackService {
 		array $fileIds,
 		array $durationHints = [],
 		?string $addedBy = null,
+		?bool $approvedOverride = null,
 	): array {
 		$addedBy ??= $userId;
 
@@ -147,7 +151,15 @@ class TrackService {
 
 		$now = $this->clock->nowSeconds();
 
-		$this->timelineService->withPreservedPosition($channel, function () use ($prepared, $channel, $addedBy, $now, &$nextSort, &$added): void {
+		// Whether what somebody adds plays straight away is decided by the share that let
+		// them in, not by the channel — an owner may trust the people they named while
+		// holding whatever arrives through a link handed round a room.
+		//
+		// A link upload passes its own answer in, because the share it came through is
+		// known there and cannot be found from `$addedBy` (a visitor key is not an account).
+		$approved = $approvedOverride ?? !$this->permissionService->shareRulesFor($channel, $addedBy)['requireApproval'];
+
+		$this->timelineService->withPreservedPosition($channel, function () use ($prepared, $channel, $addedBy, $approved, $now, &$nextSort, &$added): void {
 			foreach ($prepared as $item) {
 				/** @var File $file */
 				$file = $item['file'];
@@ -167,6 +179,7 @@ class TrackService {
 				$track->setMimetype($file->getMimeType());
 				$track->setSize($file->getSize());
 				$track->setUnavailable(false);
+				$track->setApproved($approved);
 				$track->setCreatedAt($now);
 
 				$added[] = $this->trackMapper->insert($track);
@@ -182,6 +195,9 @@ class TrackService {
 	 */
 	public function remove(Channel $channel, Track $track): void {
 		$this->timelineService->withPreservedPosition($channel, function () use ($track): void {
+			// Before the row itself: votes point at a track id, and leaving them behind
+			// would let a future track inherit them.
+			$this->voteMapper->clearForTrack($track->getId());
 			$this->trackMapper->delete($track);
 		});
 	}
@@ -262,6 +278,30 @@ class TrackService {
 	 *
 	 * @throws Exception
 	 */
+	/**
+	 * Let a held track play, or put it back on hold.
+	 *
+	 * Separate from setDisabled() on purpose — see Track::isPlayable(). Approving something
+	 * the owner had also skipped leaves it skipped, because those are two different
+	 * decisions and this one does not overrule the other.
+	 *
+	 * @throws Exception
+	 */
+	public function setApproved(Channel $channel, Track $track, bool $approved): Track {
+		if ($track->getApproved() === $approved) {
+			return $track;
+		}
+
+		// Changes what is on the timeline, so it goes through the same guard as every
+		// other playlist edit.
+		$this->timelineService->withPreservedPosition($channel, function () use ($track, $approved): void {
+			$track->setApproved($approved);
+			$this->trackMapper->update($track);
+		});
+
+		return $track;
+	}
+
 	public function setDisabled(Channel $channel, Track $track, bool $disabled): Track {
 		if ($track->getDisabled() === $disabled) {
 			return $track;

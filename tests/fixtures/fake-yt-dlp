@@ -38,6 +38,8 @@ for arg in "$@"; do
 	URL="$arg"
 done
 
+# Only ids this stub was written for are served. Anything else is refused — see the
+# `unknown` arm below for why that matters more than it looks.
 case "$URL" in
 	*stubPRIVATE*) MODE=private ;;
 	*stubUNAVAIL*) MODE=unavailable ;;
@@ -47,7 +49,8 @@ case "$URL" in
 	*stubTOOLONG*) MODE=toolong ;;
 	*stubNOFILE0*) MODE=nofile ;;
 	*stubSLOW000*) MODE=slow ;;
-	*)             MODE=ok ;;
+	*stub*)        MODE=ok ;;
+	*)             MODE=unknown ;;
 esac
 
 fail() {
@@ -55,10 +58,23 @@ fail() {
 	exit 1
 }
 
+# The message a leaked stub gets to say for itself.
+#
+# This used to be `*) MODE=ok`, so a real YouTube link did not fail — it succeeded, handing
+# back tone-a.mp3. An instance left pointed at this stub therefore imported "Test tone
+# 440Hz" for every video anybody asked for, and nothing anywhere said why.
+unknown_video() {
+	fail "this is music_radio's e2e fake yt-dlp, asked for a video it does not know ($URL).
+If you are seeing this from a real import, ytdlp_path is still pointed at the test stub.
+Clear it with:  occ config:app:delete music_radio ytdlp_path
+and restart the worker:  sudo supervisorctl restart music-radio-import-worker"
+}
+
 # --- the probe pass -----------------------------------------------------------
 for arg in "$@"; do
 	if [ "$arg" = "--dump-single-json" ]; then
 		case "$MODE" in
+			unknown)     unknown_video ;;
 			private)     fail "Private video. Sign in if you've been granted access to this video" ;;
 			unavailable) fail "Video unavailable" ;;
 			broken)      fail "nsig extraction failed: Some formats may be missing" ;;
@@ -80,6 +96,11 @@ for arg in "$@"; do
 done
 
 # --- the download pass --------------------------------------------------------
+# Belt and braces: the probe above already refuses an unknown video, so reaching here with
+# one would mean the service stopped probing. Better to say so than to copy a test tone
+# over whatever was actually asked for.
+[ "$MODE" != "unknown" ] || unknown_video
+
 # Where the real thing would write, taken from the argv the service built — so if the
 # output arrangement ever changes this stops working rather than quietly passing.
 TARGET=""

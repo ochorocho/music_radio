@@ -180,7 +180,7 @@ class TimelineService {
 	public function withPreservedPosition(Channel $channel, callable $mutate): Channel {
 		$nowMs = $this->clock->nowMillis();
 
-		$before = $this->trackMapper->findAllForChannelInPlayOrder($channel->getId(), $channel->getShuffle());
+		$before = $this->trackMapper->findAllForChannelInPlayOrder($channel);
 		$playableBefore = self::playable($before);
 		$durationsBefore = self::durations($playableBefore);
 		$positionBefore = $this->position($channel, $durationsBefore, $nowMs);
@@ -192,7 +192,7 @@ class TimelineService {
 
 		$mutate();
 
-		$after = $this->trackMapper->findAllForChannelInPlayOrder($channel->getId(), $channel->getShuffle());
+		$after = $this->trackMapper->findAllForChannelInPlayOrder($channel);
 		$playableAfter = self::playable($after);
 		$durationsAfter = self::durations($playableAfter);
 		$totalAfter = self::total($durationsAfter);

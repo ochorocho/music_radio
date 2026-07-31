@@ -3,20 +3,13 @@
 -->
 <template>
 	<div class="music-radio-sharing" data-testid="sharing-panel">
+		<!--
+			The picker stands alone. There used to be a "Let them add music too" switch under
+			it, deciding at the moment somebody was picked whether their share was created as
+			a Contributor or a Listener — which was a second place to answer a question the
+			row itself now answers, a click away behind its chevron. See onPick.
+		-->
 		<ShareeSelect :exclude="internalShares" @pick="onPick" />
-
-		<span data-testid="share-as-contributor">
-			<NcCheckboxRadioSwitch
-				class="music-radio-sharing__preset"
-				type="switch"
-				:model-value="shareAsContributor"
-				@update:model-value="shareAsContributor = $event">
-				{{ t('music_radio', 'Let them add music too') }}
-			</NcCheckboxRadioSwitch>
-		</span>
-		<p class="music-radio-sharing__hint">
-			{{ t('music_radio', 'Contributors can put tracks on the channel, but not decide what is playing.') }}
-		</p>
 
 		<NcLoadingIcon v-if="loading" :size="24" class="music-radio-sharing__loading" />
 
@@ -25,7 +18,9 @@
 				v-for="share in internalShares"
 				:key="share.id"
 				:share="share"
+				:server-can-import="importAvailable"
 				@update="onUpdate"
+				@settings="onShareSettings"
 				@remove="onRemove" />
 		</ul>
 
@@ -46,7 +41,9 @@
 					:key="share.id"
 					:share="share"
 					:password-required="linkPasswordEnforced"
+					:server-can-import="importAvailable"
 					@remove="onRemove"
+					@settings="onShareSettings"
 					@update="onUpdate"
 					@set-password="onSetPassword" />
 			</ul>
@@ -95,6 +92,20 @@
 			</p>
 		</div>
 
+		<!--
+			There is deliberately no "This channel" section any more.
+
+			It used to hold two switches — whether listeners may vote, and whether the
+			channel takes tracks from YouTube — which AND-gated the per-share ones above
+			them. That meant the same question was asked in two places: an owner had to say
+			yes twice, and a share whose switch was on could be silently inert because the
+			channel's was off. Both are questions about what one audience may do, so both
+			are now answered where the audience is, on the row.
+
+			Voting still has a channel-wide fact behind it — whether the playlist is in vote
+			order at all — but that is derived from the shares rather than set here. See
+			ChannelService::syncVotingMode.
+		-->
 	</div>
 </template>
 
@@ -112,7 +123,7 @@ import LinkShareRow from './LinkShareRow.vue'
 import ShareItem from './ShareItem.vue'
 import ShareeSelect from './ShareeSelect.vue'
 import { createShare, deleteShare, errorMessage, fetchShares, setSharePassword, updateShare } from '../utils/api.js'
-import { PRESET_CONTRIBUTOR, PRESET_LISTENER } from '../utils/permissions.js'
+import { PRESET_LISTENER } from '../utils/permissions.js'
 
 const SHARE_TYPE_LINK = 3
 
@@ -137,13 +148,23 @@ export default {
 			type: Object,
 			required: true,
 		},
+
+		/**
+		 * What this server can import, as the channel view already knows it. Only used to
+		 * decide whether the YouTube switch is worth offering at all.
+		 */
+		importCapabilities: {
+			type: Object,
+			default: () => ({}),
+		},
 	},
+
+	emits: ['rules-changed', 'channel-gone'],
 
 	data() {
 		return {
 			shares: [],
 			loading: true,
-			shareAsContributor: false,
 			creatingLink: false,
 			protectLink: false,
 			linkPassword: '',
@@ -153,6 +174,14 @@ export default {
 	},
 
 	computed: {
+		/**
+		 * Whether this server can import at all — the administrator's switch plus a working
+		 * yt-dlp. Distinct from the channel's own preference, which is what the switch sets.
+		 */
+		importAvailable() {
+			return this.importCapabilities.available !== false
+		},
+
 		/** Everything except public links, which the picker must not offer again. */
 		internalShares() {
 			return this.shares.filter((share) => share.shareType !== SHARE_TYPE_LINK)
@@ -177,6 +206,31 @@ export default {
 	},
 
 	methods: {
+		/**
+		 * Report a failure, and notice when the channel itself has gone.
+		 *
+		 * The server answers "Channel not found" for any share operation on a channel that
+		 * is no longer there — or no longer readable, which it reports identically so that
+		 * a stranger cannot probe which ids exist. Surfaced raw, that is a puzzling thing to
+		 * read after pressing delete on a *link*: it names the wrong object and suggests
+		 * nothing to do about it.
+		 *
+		 * A page left open while the channel was removed elsewhere is the ordinary way to
+		 * get here, so it is worth saying plainly and getting out of.
+		 *
+		 * @param {Error} error the rejected request
+		 * @param {string} fallback what to say for anything else
+		 */
+		reportShareFailure(error, fallback) {
+			if (error?.response?.status === 404) {
+				showError(t('music_radio', 'This channel no longer exists, or is no longer shared with you.'))
+				this.$emit('channel-gone')
+				return
+			}
+
+			showError(errorMessage(error, fallback))
+		},
+
 		async load() {
 			this.loading = true
 			try {
@@ -188,23 +242,34 @@ export default {
 					this.protectLink = true
 				}
 			} catch (error) {
-				showError(errorMessage(error, t('music_radio', 'Could not load who this is shared with')))
+				this.reportShareFailure(error, t('music_radio', 'Could not load who this is shared with'))
 			} finally {
 				this.loading = false
 			}
 		},
 
+		/**
+		 * Share with whoever was picked.
+		 *
+		 * Listen-only, deliberately, and the same default the server applies when a caller
+		 * says nothing — see ShareController::create. Everything beyond listening is granted
+		 * on the row afterwards, where it can be seen and taken back. Sharing more than was
+		 * asked for is the mistake worth designing against; sharing too little is one press
+		 * away from being fixed.
+		 *
+		 * @param {object} option the person, group or team the picker returned
+		 */
 		async onPick(option) {
 			try {
 				const share = await createShare(this.channel.id, {
 					shareType: option.shareType,
 					receiver: option.receiver,
-					permissions: this.shareAsContributor ? PRESET_CONTRIBUTOR : PRESET_LISTENER,
+					permissions: PRESET_LISTENER,
 				})
 				this.shares.push(share)
 				showSuccess(t('music_radio', 'Shared with {name}', { name: option.label }))
 			} catch (error) {
-				showError(errorMessage(error, t('music_radio', 'Could not share the channel')))
+				this.reportShareFailure(error, t('music_radio', 'Could not share the channel'))
 			}
 		},
 
@@ -216,9 +281,10 @@ export default {
 
 			this.creatingLink = true
 			try {
-				// A public link is always listen-only; the server enforces that too. The
-				// password goes in with the create so the link never exists unprotected,
-				// not even for the moment between creating it and securing it.
+				// A new link starts listen-only, whatever it can later be given — nobody
+				// should have to remember to take something away. The password goes in with
+				// the create so the link never exists unprotected, not even for the moment
+				// between creating it and securing it.
 				const share = await createShare(this.channel.id, {
 					shareType: SHARE_TYPE_LINK,
 					password: this.protectLink ? this.linkPassword : null,
@@ -229,7 +295,7 @@ export default {
 					? t('music_radio', 'Password-protected link created')
 					: t('music_radio', 'Link created'))
 			} catch (error) {
-				showError(errorMessage(error, t('music_radio', 'Could not create a link')))
+				this.reportShareFailure(error, t('music_radio', 'Could not create a link'))
 			} finally {
 				this.creatingLink = false
 			}
@@ -246,7 +312,7 @@ export default {
 					? t('music_radio', 'Password set')
 					: t('music_radio', 'Password removed'))
 			} catch (error) {
-				showError(errorMessage(error, t('music_radio', 'Could not change the password')))
+				this.reportShareFailure(error, t('music_radio', 'Could not change the password'))
 			}
 		},
 
@@ -258,7 +324,34 @@ export default {
 					this.shares.splice(index, 1, updated)
 				}
 			} catch (error) {
-				showError(errorMessage(error, t('music_radio', 'Could not change what they can do')))
+				this.reportShareFailure(error, t('music_radio', 'Could not change what they can do'))
+			}
+		},
+
+		/**
+		 * Save approval, voting, the listener count or importing for one share.
+		 *
+		 * Separate from onUpdate, which writes the permission mask: these are not
+		 * permissions, they are rules applied to one audience. Keeping them apart is what
+		 * stopped voting from being expressible two ways at once.
+		 *
+		 * @param {object} share the row that changed
+		 * @param {object} values the fields to write
+		 */
+		async onShareSettings(share, values) {
+			try {
+				const updated = await updateShare(this.channel.id, share.id, values)
+				const index = this.shares.findIndex((s) => s.id === share.id)
+				if (index !== -1) {
+					this.shares.splice(index, 1, updated)
+				}
+				// Granting voting to anybody is what puts the whole channel in vote order, so
+				// the view behind this dialog has just changed shape: every playlist row grows
+				// a vote control, and the running order is not the author's any more. It reads
+				// from its own copy and would otherwise not find out until its next poll.
+				this.$emit('rules-changed')
+			} catch (error) {
+				this.reportShareFailure(error, t('music_radio', 'That could not be saved'))
 			}
 		},
 
@@ -266,8 +359,10 @@ export default {
 			try {
 				await deleteShare(this.channel.id, share.id)
 				this.shares = this.shares.filter((s) => s.id !== share.id)
+				// Removing the last share that could vote puts the author's order back.
+				this.$emit('rules-changed')
 			} catch (error) {
-				showError(errorMessage(error, t('music_radio', 'Could not stop sharing')))
+				this.reportShareFailure(error, t('music_radio', 'Could not stop sharing'))
 			}
 		},
 	},
@@ -280,10 +375,6 @@ export default {
 	flex-direction: column;
 	gap: 0.5rem;
 	padding: 0.5rem 0;
-}
-
-.music-radio-sharing__preset {
-	margin-block-start: 0.5rem;
 }
 
 .music-radio-sharing__hint {

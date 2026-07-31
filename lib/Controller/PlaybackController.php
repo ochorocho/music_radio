@@ -12,8 +12,10 @@ use OCA\MusicRadio\Exception\MusicRadioException;
 use OCA\MusicRadio\Permission;
 use OCA\MusicRadio\Service\ChannelService;
 use OCA\MusicRadio\Service\Clock;
+use OCA\MusicRadio\Service\ListenerPresence;
 use OCA\MusicRadio\Service\PermissionService;
 use OCA\MusicRadio\Service\PlaybackService;
+use OCA\MusicRadio\Service\VoteService;
 use OCP\AppFramework\Controller;
 use OCP\AppFramework\Http;
 use OCP\AppFramework\Http\Attribute\AnonRateLimit;
@@ -31,6 +33,8 @@ class PlaybackController extends Controller {
 		private ChannelService $channelService,
 		private PlaybackService $playbackService,
 		private PermissionService $permissionService,
+		private ListenerPresence $listenerPresence,
+		private VoteService $voteService,
 		private Clock $clock,
 		private ?string $userId,
 	) {
@@ -53,8 +57,15 @@ class PlaybackController extends Controller {
 		return new DataResponse(['serverTimeMs' => $this->clock->nowMillis()]);
 	}
 
+	/**
+	 * @param string|null $clientId a per-tab id the browser made up, so one browser
+	 *                              polling twice for the same channel — `OnAir` and
+	 *                              `GlobalPlayer` both do — counts once
+	 * @param bool $listening whether audio is actually playing here, which is not
+	 *                        something the request itself can tell us
+	 */
 	#[NoAdminRequired]
-	public function state(int $id): DataResponse {
+	public function state(int $id, ?string $clientId = null, bool $listening = false): DataResponse {
 		// Sampled before any work, so the client's round-trip estimate reflects the
 		// whole request rather than just the tail of it.
 		$receivedAt = $this->clock->nowMillis();
@@ -66,7 +77,32 @@ class PlaybackController extends Controller {
 			return new DataResponse(['error' => $e->getMessage()], $e->getStatus());
 		}
 
-		return new DataResponse($this->playbackService->buildState($channel, $permissions, $receivedAt));
+		// Deliberately here and not in buildState: that method is documented as a pure
+		// read for good reasons, and this is the only place that knows who is asking.
+		$listeners = $this->listenerPresence->record($id, $clientId, $listening);
+
+		// Spend the votes of whatever has since played, and honour any that arrived.
+		//
+		// This has to be driven by something, and there is no track-boundary event to hang
+		// it on — a channel is one continuous programme. It used to run only when somebody
+		// voted, which meant a track that played with nobody voting afterwards kept its
+		// votes for ever, and the next recompute treated them as current. The poll is the
+		// one thing that happens reliably while a channel is playing.
+		//
+		// Cheap: it is debounced to once every VoteService::RECOMPUTE_EVERY_SECONDS per
+		// channel, and the check is a comparison against a column already loaded, so the
+		// common case costs nothing regardless of how many people are listening.
+		if ($channel->getAllowVoting()) {
+			$this->voteService->recomputeIfDue($channel);
+		}
+
+		return new DataResponse($this->playbackService->buildState(
+			$channel,
+			$permissions,
+			$receivedAt,
+			$listeners,
+			$this->permissionService->shareRulesFor($channel, $this->userId)['showListenerCount'],
+		));
 	}
 
 	/**
@@ -94,7 +130,9 @@ class PlaybackController extends Controller {
 			if ($expectedStateVersion !== null && $expectedStateVersion !== $channel->getStateVersion()) {
 				return new DataResponse([
 					'error' => 'The channel changed since you last loaded it',
-					'state' => $this->playbackService->buildState($channel, $permissions, $receivedAt),
+					'state' => $this->playbackService->buildState(
+						$channel, $permissions, $receivedAt, $this->listenerPresence->count($id),
+					),
 				], Http::STATUS_CONFLICT);
 			}
 
@@ -112,8 +150,12 @@ class PlaybackController extends Controller {
 		}
 
 		// Hand the new state straight back so the controller's own UI updates without
-		// waiting for its next poll.
-		return new DataResponse($this->playbackService->buildState($channel, $permissions, $receivedAt));
+		// waiting for its next poll. Counted read-only rather than skipped: every one of
+		// these replaces the client's state wholesale, and a missing count would blink
+		// the listener figure out of the page on every press of play.
+		return new DataResponse($this->playbackService->buildState(
+			$channel, $permissions, $receivedAt, $this->listenerPresence->count($id),
+		));
 	}
 
 	#[NoAdminRequired]
@@ -128,6 +170,8 @@ class PlaybackController extends Controller {
 			return new DataResponse(['error' => $e->getMessage()], $e->getStatus());
 		}
 
-		return new DataResponse($this->playbackService->buildState($channel, $permissions, $receivedAt));
+		return new DataResponse($this->playbackService->buildState(
+			$channel, $permissions, $receivedAt, $this->listenerPresence->count($id),
+		));
 	}
 }

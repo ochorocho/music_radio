@@ -52,6 +52,15 @@ export const CLOCK_REFRESH_MS = 45_000
 export const PRELOAD_LEAD_MS = 15_000
 
 /**
+ * How long to wait for a stalled element to recover before forcing the issue.
+ *
+ * A stall usually clears on its own once the network catches up, and doing nothing is the
+ * correct response to almost all of them. This is the backstop for the ones that never
+ * come back — long enough that it is not competing with ordinary buffering.
+ */
+export const STALL_RECOVERY_MS = 10_000
+
+/**
  * Safari freezes `currentTime` for a moment after `playbackRate` changes, so drift
  * measured just after a change is meaningless.
  */

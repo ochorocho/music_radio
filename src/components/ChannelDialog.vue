@@ -23,6 +23,10 @@
 				:label="t('music_radio', 'Description')"
 				:placeholder="t('music_radio', 'What is this channel for?')"
 				resize="vertical" />
+
+			<!-- The switches that govern what people this channel is shared with may do
+			     used to live here. They are in the share dialog now, next to the shares
+			     they describe — see SharingPanel. -->
 		</form>
 	</NcDialog>
 </template>
@@ -96,7 +100,10 @@ export default {
 			try {
 				const description = this.description.trim() || null
 				const saved = this.isEdit
-					? await updateChannel(this.channel.id, { title, description })
+					? await updateChannel(this.channel.id, {
+						title,
+						description,
+							})
 					: await createChannel(title, description)
 
 				this.$emit('saved', saved)
@@ -116,5 +123,28 @@ export default {
 	flex-direction: column;
 	gap: 1rem;
 	padding-block: 0.5rem;
+}
+
+.music-radio-dialog__group {
+	display: flex;
+	flex-direction: column;
+	gap: 0.25rem;
+	margin: 0;
+	padding: 0.75rem 0 0;
+	border: 0;
+	border-top: 1px solid var(--color-border);
+}
+
+.music-radio-dialog__legend {
+	padding: 0;
+	margin-block-end: 0.5rem;
+	font-size: 0.9em;
+	color: var(--color-text-maxcontrast);
+}
+
+.music-radio-dialog__hint {
+	margin: 0 0 0.5rem;
+	font-size: 0.85em;
+	color: var(--color-text-maxcontrast);
 }
 </style>

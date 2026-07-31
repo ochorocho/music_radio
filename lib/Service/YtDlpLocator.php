@@ -45,6 +45,19 @@ class YtDlpLocator {
 	public const CONFIG_ENABLED = 'import_enabled';
 
 	/**
+	 * Off until an administrator says otherwise.
+	 *
+	 * Downloading from YouTube conflicts with its terms of service, and whether to do it is
+	 * the decision of whoever runs the server — not something an app should assume by
+	 * installing. Nothing about the feature works until this is turned on, which makes that
+	 * decision explicit rather than implied.
+	 *
+	 * Stated once and read from everywhere, so the setting page and the server cannot
+	 * disagree about what "not configured" means.
+	 */
+	public const DEFAULT_ENABLED = false;
+
+	/**
 	 * How long a successful detection is trusted.
 	 *
 	 * This matters more than it looks. status() is read on every page load to decide
@@ -72,7 +85,7 @@ class YtDlpLocator {
 	}
 
 	public function status(bool $recheck = false): ToolStatus {
-		if (!$this->appConfig->getValueBool(Application::APP_ID, self::CONFIG_ENABLED, true)) {
+		if (!$this->appConfig->getValueBool(Application::APP_ID, self::CONFIG_ENABLED, self::DEFAULT_ENABLED)) {
 			return ToolStatus::unavailable(ImportError::DISABLED);
 		}
 

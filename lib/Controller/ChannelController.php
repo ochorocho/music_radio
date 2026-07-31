@@ -74,12 +74,30 @@ class ChannelController extends Controller {
 		);
 	}
 
+	/**
+	 * Voting and YouTube importing are deliberately not accepted here any more. They are
+	 * decided per share, in the share dialog — see ChannelService::update.
+	 */
 	#[NoAdminRequired]
-	public function update(int $id, ?string $title = null, ?string $description = null, ?int $coverFileId = null): DataResponse {
+	public function update(
+		int $id,
+		?string $title = null,
+		?string $description = null,
+		?int $coverFileId = null,
+		?bool $requireApproval = null,
+		?bool $showListenerCount = null,
+	): DataResponse {
 		try {
 			$channel = $this->channelService->findReadable($id, $this->userId);
 			$this->permissionService->requirePermission($channel, $this->userId, Permission::MANAGE);
-			$channel = $this->channelService->update($channel, $title, $description, $coverFileId);
+			$channel = $this->channelService->update(
+				$channel,
+				$title,
+				$description,
+				$coverFileId,
+				$requireApproval,
+				$showListenerCount,
+			);
 		} catch (MusicRadioException $e) {
 			return new DataResponse(['error' => $e->getMessage()], $e->getStatus());
 		}

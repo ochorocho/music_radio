@@ -1,5 +1,10 @@
 <!--
   - SPDX-License-Identifier: AGPL-3.0-or-later
+  -
+  - One person, group or team this channel is shared with.
+  -
+  - The options themselves live in ShareOptions, which the public-link row renders too —
+  - see that component for why there is only one list now.
 -->
 <template>
 	<li class="music-radio-share" data-testid="share-row">
@@ -15,13 +20,21 @@
 				<span class="music-radio-share__role" data-testid="share-role">{{ roleLabel }}</span>
 			</div>
 
+			<NcButton
+				variant="tertiary"
+				:aria-label="expanded
+					? t('music_radio', 'Hide what {name} can do', { name: displayName })
+					: t('music_radio', 'Change what {name} can do', { name: displayName })"
+				:aria-expanded="expanded"
+				data-testid="share-expand"
+				@click="expanded = !expanded">
+				<template #icon>
+					<ChevronUpIcon v-if="expanded" :size="20" />
+					<ChevronDownIcon v-else :size="20" />
+				</template>
+			</NcButton>
+
 			<NcActions>
-				<NcActionButton @click="expanded = !expanded">
-					<template #icon>
-						<TuneIcon :size="20" />
-					</template>
-					{{ t('music_radio', 'Change what they can do') }}
-				</NcActionButton>
 				<NcActionButton data-testid="share-remove" @click="$emit('remove', share)">
 					<template #icon>
 						<DeleteIcon :size="20" />
@@ -32,37 +45,11 @@
 		</div>
 
 		<div v-if="expanded" class="music-radio-share__detail">
-			<NcCheckboxRadioSwitch
-				type="switch"
-				:model-value="has(ADD_TRACKS)"
-				data-testid="perm-add-tracks"
-				@update:model-value="toggle(ADD_TRACKS, $event)">
-				{{ t('music_radio', 'Can add music') }}
-			</NcCheckboxRadioSwitch>
-
-			<NcCheckboxRadioSwitch
-				type="switch"
-				:model-value="has(CONTROL)"
-				data-testid="perm-control"
-				@update:model-value="toggle(CONTROL, $event)">
-				{{ t('music_radio', 'Can control what is playing') }}
-			</NcCheckboxRadioSwitch>
-
-			<NcCheckboxRadioSwitch
-				type="switch"
-				:model-value="has(EDIT_PLAYLIST)"
-				data-testid="perm-edit-playlist"
-				@update:model-value="toggle(EDIT_PLAYLIST, $event)">
-				{{ t('music_radio', 'Can reorder and remove any track') }}
-			</NcCheckboxRadioSwitch>
-
-			<NcCheckboxRadioSwitch
-				type="switch"
-				:model-value="has(SHARE)"
-				data-testid="perm-share"
-				@update:model-value="toggle(SHARE, $event)">
-				{{ t('music_radio', 'Can share this channel on') }}
-			</NcCheckboxRadioSwitch>
+			<ShareOptions
+				:share="share"
+				:server-can-import="serverCanImport"
+				@update="(...args) => $emit('update', ...args)"
+				@settings="(...args) => $emit('settings', ...args)" />
 		</div>
 	</li>
 </template>
@@ -71,40 +58,46 @@
 import NcActionButton from '@nextcloud/vue/components/NcActionButton'
 import NcActions from '@nextcloud/vue/components/NcActions'
 import NcAvatar from '@nextcloud/vue/components/NcAvatar'
-import NcCheckboxRadioSwitch from '@nextcloud/vue/components/NcCheckboxRadioSwitch'
+import NcButton from '@nextcloud/vue/components/NcButton'
+import ChevronDownIcon from 'vue-material-design-icons/ChevronDown.vue'
+import ChevronUpIcon from 'vue-material-design-icons/ChevronUp.vue'
 import DeleteIcon from 'vue-material-design-icons/Delete.vue'
-import TuneIcon from 'vue-material-design-icons/Tune.vue'
 
-import { ADD_TRACKS, CONTROL, EDIT_PLAYLIST, LISTEN, SHARE, can } from '../utils/permissions.js'
+import ShareOptions from './ShareOptions.vue'
+import { roleLabel } from '../utils/shareRoles.js'
 
 export default {
 	name: 'ShareItem',
 
 	components: {
+		ChevronDownIcon,
+		ChevronUpIcon,
 		DeleteIcon,
 		NcActionButton,
 		NcActions,
 		NcAvatar,
-		NcCheckboxRadioSwitch,
-		TuneIcon,
+		NcButton,
+		ShareOptions,
 	},
 
 	props: {
+		/** Whether this server can fetch from YouTube at all; the switch is moot otherwise. */
+		serverCanImport: {
+			type: Boolean,
+			default: false,
+		},
+
 		share: {
 			type: Object,
 			required: true,
 		},
 	},
 
-	emits: ['update', 'remove'],
+	emits: ['update', 'remove', 'settings'],
 
 	data() {
 		return {
 			expanded: false,
-			ADD_TRACKS,
-			CONTROL,
-			EDIT_PLAYLIST,
-			SHARE,
 		}
 	},
 
@@ -113,34 +106,8 @@ export default {
 			return this.share.displayName || this.share.receiver || t('music_radio', 'Public link')
 		},
 
-		/**
-		 * The shorthand for what this share amounts to. "Contributor" is the interesting
-		 * one — it is the combination the app exists for: can put music on, cannot decide
-		 * what plays.
-		 *
-		 * @return {string}
-		 */
 		roleLabel() {
-			if (this.has(CONTROL)) {
-				return t('music_radio', 'Co-host')
-			}
-			if (this.has(ADD_TRACKS)) {
-				return t('music_radio', 'Contributor')
-			}
-			return t('music_radio', 'Listener')
-		},
-	},
-
-	methods: {
-		has(bit) {
-			return can(this.share.permissions, bit)
-		},
-
-		toggle(bit, enabled) {
-			let permissions = this.share.permissions
-			permissions = enabled ? (permissions | bit) : (permissions & ~bit)
-			// Never leave a share granting nothing at all.
-			this.$emit('update', this.share, permissions | LISTEN)
+			return roleLabel(this.share.permissions)
 		},
 	},
 }
@@ -177,9 +144,6 @@ export default {
 }
 
 .music-radio-share__detail {
-	display: flex;
-	flex-direction: column;
-	gap: 0.25rem;
 	padding: 0.5rem 0 0.25rem 2.75rem;
 }
 </style>

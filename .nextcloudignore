@@ -17,6 +17,8 @@ src
 src/**
 tests
 tests/**
+playwright-report/**
+test-results/**
 screenshots
 screenshots/**
 package.json

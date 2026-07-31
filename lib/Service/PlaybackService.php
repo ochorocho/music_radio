@@ -68,12 +68,27 @@ class PlaybackService {
 	 *
 	 * @param int $requestReceivedAtMs when this request began, for the client's clock
 	 *                                 offset estimate
+	 * @param int|null $listenerCount how many people are tuned in, counted by
+	 *                                {@see ListenerPresence} in the controller — this
+	 *                                method stays a pure read and only decides who is
+	 *                                allowed to see the number. Null means nobody counted.
+	 * @param bool|null $maySeeListeners whether this viewer's share publishes the figure,
+	 *                                   resolved by {@see PermissionService::shareRulesFor}.
+	 *                                   Passed in for the same reason as the count itself:
+	 *                                   working it out needs the share, and looking that up
+	 *                                   here would make this a read that queries.
 	 * @return array<string, mixed>
 	 */
-	public function buildState(Channel $channel, int $permissions, int $requestReceivedAtMs): array {
+	public function buildState(
+		Channel $channel,
+		int $permissions,
+		int $requestReceivedAtMs,
+		?int $listenerCount = null,
+		?bool $maySeeListeners = null,
+	): array {
 		$nowMs = $this->clock->nowMillis();
 
-		$tracks = $this->trackMapper->findAllForChannelInPlayOrder($channel->getId(), $channel->getShuffle());
+		$tracks = $this->trackMapper->findAllForChannelInPlayOrder($channel);
 		$playable = TimelineService::playable($tracks);
 		$durations = TimelineService::durations($playable);
 		$total = TimelineService::total($durations);
@@ -117,6 +132,9 @@ class PlaybackService {
 			'channelId' => $channel->getId(),
 			'stateVersion' => $channel->getStateVersion(),
 			'playlistVersion' => $channel->getPlaylistVersion(),
+			// Moves when somebody votes. Separate from playlistVersion on purpose: a vote
+			// must not re-anchor the timeline or drop everyone to a fast poll.
+			'voteVersion' => (int)$channel->getVoteVersion(),
 			'status' => $status,
 			'loop' => $channel->getLoopEnabled(),
 			'shuffle' => $channel->getShuffle(),
@@ -127,6 +145,7 @@ class PlaybackService {
 			'current' => $current,
 			'next' => $next,
 			'permissions' => $permissions,
+			'listenerCount' => self::visibleListenerCount($permissions, $listenerCount, $maySeeListeners),
 			'pollAfterMs' => $this->pollAfterMs($channel, $permissions),
 			// Jellyfin-style clock handshake: with these three the client can estimate
 			// its offset from server time and the round-trip delay, and keep the sample
@@ -135,6 +154,29 @@ class PlaybackService {
 			'serverTimeMs' => $nowMs,
 			'responseSentAtMs' => $this->clock->nowMillis(),
 		];
+	}
+
+	/**
+	 * Who gets told how many people are listening.
+	 *
+	 * Whoever manages the channel always does — that is what the number was asked for. For
+	 * everyone else it is the share they came through that decides, so an owner can publish
+	 * the figure to the people they named while keeping it from a link handed to strangers.
+	 *
+	 * Withheld as null rather than as zero: the two are told apart by the page, and a
+	 * channel that genuinely has nobody listening should not look like one that is
+	 * keeping it to itself.
+	 */
+	private static function visibleListenerCount(int $permissions, ?int $count, ?bool $maySee): ?int {
+		if ($count === null) {
+			return null;
+		}
+
+		if (($permissions & Permission::MANAGE) !== 0) {
+			return $count;
+		}
+
+		return $maySee === true ? $count : null;
 	}
 
 	private function status(Channel $channel, int $total, int $raw, bool $located): string {
@@ -383,7 +425,7 @@ class PlaybackService {
 	 */
 	private function playableOf(Channel $channel): array {
 		return TimelineService::playable(
-			$this->trackMapper->findAllForChannelInPlayOrder($channel->getId(), $channel->getShuffle()),
+			$this->trackMapper->findAllForChannelInPlayOrder($channel),
 		);
 	}
 

@@ -34,6 +34,12 @@ final class Permission {
 	public const SHARE = 16;
 	/** Rename, re-describe, set the cover. */
 	public const MANAGE = 32;
+	/**
+	 * Retired. Voting is a switch on each share (`music_radio_shares.allow_voting`), not a
+	 * bit on its permission mask — see Version001100. The value is kept reserved so a mask
+	 * stored while it was in use cannot come to mean something else.
+	 */
+	public const RETIRED_VOTE = 64;
 
 	public const NONE = 0;
 	public const ALL = self::LISTEN | self::ADD_TRACKS | self::CONTROL
@@ -47,12 +53,28 @@ final class Permission {
 	/**
 	 * Everything a public link may carry.
 	 *
-	 * Anyone at all can follow a link, so the bits that decide what the channel *is* —
-	 * what plays, in what order, who else may reach it — are never on offer. ADD_TRACKS
-	 * on a link means specifically "may upload a file", since someone with no account
-	 * has no stored files to pick from.
+	 * A link can be handed the same say over the broadcast as a named person: listening,
+	 * uploading, being the DJ, curating the running order. Which of those it actually gets
+	 * is the owner's choice per link — a link passed round one room is a different thing
+	 * from a link posted in public, and the dialog is where that judgement is made.
+	 *
+	 * SHARE and MANAGE are the two that stay off the table, and for a different reason
+	 * than the rest: they are not about the broadcast but about the channel's existence.
+	 * Anyone at all can follow a link, so granting SHARE would let a stranger widen the
+	 * audience past whatever the owner decided, and MANAGE would let them rename or
+	 * re-cover somebody else's channel. Neither is a thing an owner could sensibly mean
+	 * to delegate to "whoever holds this URL".
+	 *
+	 * ADD_TRACKS on a link means specifically "may upload a file", since someone with no
+	 * account has no stored files to pick from.
+	 *
+	 * Voting is not here, and is not a permission at all any more: it is a switch on the
+	 * share itself, which is where approval lives too. Both are questions about what an
+	 * audience may do rather than about what a mask grants, and keeping them together is
+	 * what stops the two from disagreeing.
 	 */
-	public const LINK_ALLOWED = self::LISTEN | self::ADD_TRACKS;
+	public const LINK_ALLOWED = self::LISTEN | self::ADD_TRACKS
+		| self::CONTROL | self::EDIT_PLAYLIST;
 
 	private function __construct() {
 	}

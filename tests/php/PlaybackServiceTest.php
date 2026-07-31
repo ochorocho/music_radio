@@ -240,6 +240,78 @@ class PlaybackServiceTest extends TestCase {
 		self::assertSame(PlaybackService::POLL_CONTROLLER_MS, $state['pollAfterMs']);
 	}
 
+	// ------------------------------------------------------------ listener count
+
+	public function testTheCountIsToldToWhoeverTheirShareSaysMaySeeIt(): void {
+		$this->withPlaylist([self::track(1, 10_000)]);
+		$channel = self::channel(paused: false, epochOffsetMs: 0);
+
+		$state = $this->service->buildState(
+			$channel,
+			Permission::LISTEN,
+			self::NOW_MS,
+			listenerCount: 4,
+			maySeeListeners: true,
+		);
+
+		self::assertSame(4, $state['listenerCount']);
+	}
+
+	/**
+	 * Withheld as null, not as zero: the page tells the two apart, and a channel nobody is
+	 * listening to should not look like one keeping the figure to itself.
+	 */
+	public function testTheCountIsWithheldWhenTheirShareSaysNo(): void {
+		$this->withPlaylist([self::track(1, 10_000)]);
+		$channel = self::channel(paused: false, epochOffsetMs: 0);
+
+		$state = $this->service->buildState(
+			$channel,
+			Permission::LISTEN,
+			self::NOW_MS,
+			listenerCount: 4,
+			maySeeListeners: false,
+		);
+
+		self::assertNull($state['listenerCount']);
+	}
+
+	/**
+	 * The number was asked for by whoever runs the channel, so no share setting takes it
+	 * away from them.
+	 */
+	public function testWhoeverManagesTheChannelIsToldRegardless(): void {
+		$this->withPlaylist([self::track(1, 10_000)]);
+		$channel = self::channel(paused: false, epochOffsetMs: 0);
+
+		$state = $this->service->buildState(
+			$channel,
+			Permission::ALL,
+			self::NOW_MS,
+			listenerCount: 4,
+			maySeeListeners: false,
+		);
+
+		self::assertSame(4, $state['listenerCount']);
+	}
+
+	/**
+	 * No distributed cache means presence cannot be counted at all — a different thing
+	 * from being counted and not shown, and reported the same way to everybody.
+	 */
+	public function testAnUncountableChannelTellsNobody(): void {
+		$this->withPlaylist([self::track(1, 10_000)]);
+		$channel = self::channel(paused: false, epochOffsetMs: 0);
+
+		self::assertNull($this->service->buildState(
+			$channel,
+			Permission::ALL,
+			self::NOW_MS,
+			listenerCount: null,
+			maySeeListeners: true,
+		)['listenerCount']);
+	}
+
 	// ------------------------------------------------------------------- control
 
 	public function testResumingContinuesFromWhereItWasPaused(): void {

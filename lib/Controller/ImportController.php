@@ -100,6 +100,20 @@ class ImportController extends Controller {
 			$channel = $this->channelService->findReadable($id, $this->userId);
 			$this->permissionService->requirePermission($channel, $this->userId, Permission::ADD_TRACKS);
 
+			// Two switches, answering different questions: the administrator's decides
+			// whether this server will fetch from YouTube at all, and this one whether this
+			// particular person was granted it. Checked here rather than only hidden in the
+			// interface, because the endpoint is reachable without it — and it was reachable
+			// without it, until this read the share instead of the channel: the tracks
+			// endpoint has always advertised `canImport` from the same rule, so a sharee who
+			// was told no could nevertheless post one and have it accepted.
+			if (!$this->permissionService->shareRulesFor($channel, $this->userId)['allowImport']) {
+				return new DataResponse(
+					['error' => $this->l10n->t('This channel does not take tracks from YouTube')],
+					Http::STATUS_FORBIDDEN,
+				);
+			}
+
 			$import = $this->importService->request($channel, $this->userId, $url);
 		} catch (MusicRadioException $e) {
 			return new DataResponse(['error' => $this->explain($e)], $e->getStatus());
@@ -151,15 +165,26 @@ class ImportController extends Controller {
 	/**
 	 * The row plus its error as a sentence.
 	 *
+	 * When the cause was one yt-dlp's output did not explain — ImportError::UNKNOWN — what
+	 * it actually said is appended, so "The import failed." is never the whole answer. The
+	 * text has already been cut down by YtDlpFailure::detail(); see there for what is
+	 * stripped and why the public endpoint deliberately does not do this.
+	 *
 	 * @return array<string, mixed>
 	 */
 	private function present(Import $import): array {
 		$code = $import->getErrorCode();
+		if ($code === null) {
+			return array_merge($import->jsonSerialize(), ['error' => null]);
+		}
+
+		$message = ImportError::describe($code, $this->l10n, $this->importService->maxDurationSeconds());
+		$detail = $import->getErrorDetail();
 
 		return array_merge($import->jsonSerialize(), [
-			'error' => $code === null
-				? null
-				: ImportError::describe($code, $this->l10n, $this->importService->maxDurationSeconds()),
+			'error' => $detail === null || $detail === ''
+				? $message
+				: $this->l10n->t('%1$s yt-dlp said: %2$s', [$message, $detail]),
 		]);
 	}
 

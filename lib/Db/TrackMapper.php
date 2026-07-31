@@ -62,19 +62,40 @@ class TrackMapper extends QBMapper {
 	}
 
 	/**
-	 * The channel's tracks in broadcast order — shuffled order when the channel is
-	 * shuffling, author order otherwise. `id` breaks ties so the order is total and
-	 * stable (two rows can share a sort_order after a concurrent append).
+	 * The channel's tracks in broadcast order.
+	 *
+	 * Three orderings, each in its own column so that switching between them is lossless:
+	 * `sort_order` is the order the playlist was arranged in and is never overwritten by
+	 * the other two, `shuffle_order` holds a materialised shuffle, and `vote_order` holds
+	 * the running order votes have asked for. Turning shuffle or voting off therefore
+	 * restores the author's order exactly.
+	 *
+	 * Shuffle wins over voting when both are on: shuffling is a deliberate instruction to
+	 * randomise, and a vote asking for a particular track next is not a coherent thing to
+	 * honour at the same time.
+	 *
+	 * `id` breaks ties so the order is total and stable — two rows can share a sort_order
+	 * after a concurrent append, and every vote_order is 0 until the first recompute.
+	 *
+	 * Taking the Channel rather than its flags on purpose: this choice is made in exactly
+	 * one place, so no caller can pick a different ordering from the one the timeline is
+	 * anchored against.
 	 *
 	 * @return Track[]
 	 * @throws Exception
 	 */
-	public function findAllForChannelInPlayOrder(int $channelId, bool $shuffle): array {
+	public function findAllForChannelInPlayOrder(Channel $channel): array {
+		$column = match (true) {
+			$channel->getShuffle() => 'shuffle_order',
+			$channel->getAllowVoting() => 'vote_order',
+			default => 'sort_order',
+		};
+
 		$qb = $this->db->getQueryBuilder();
 		$qb->select('*')
 			->from($this->getTableName())
-			->where($qb->expr()->eq('channel_id', $qb->createNamedParameter($channelId, IQueryBuilder::PARAM_INT)))
-			->orderBy($shuffle ? 'shuffle_order' : 'sort_order', 'ASC')
+			->where($qb->expr()->eq('channel_id', $qb->createNamedParameter($channel->getId(), IQueryBuilder::PARAM_INT)))
+			->orderBy($column, 'ASC')
 			->addOrderBy('id', 'ASC');
 
 		return $this->findEntities($qb);

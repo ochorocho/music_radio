@@ -41,6 +41,14 @@ class PermissionTest extends TestCase {
 				Permission::MANAGE | Permission::EDIT_PLAYLIST | Permission::CONTROL
 					| Permission::ADD_TRACKS | Permission::LISTEN,
 			],
+			// Voting used to be a bit here. It is a switch on the share now, so the value
+			// it occupied is reserved and must be discarded like any other unknown bit —
+			// otherwise a mask stored while it was in use would grant something it no
+			// longer means.
+			'the retired voting bit is discarded' => [
+				Permission::LISTEN | Permission::RETIRED_VOTE,
+				Permission::LISTEN,
+			],
 			'editing the playlist implies adding to it' => [
 				Permission::EDIT_PLAYLIST,
 				Permission::EDIT_PLAYLIST | Permission::ADD_TRACKS | Permission::LISTEN,
@@ -107,5 +115,31 @@ class PermissionTest extends TestCase {
 
 	public function testDescribeReportsNothingForAnEmptyMask(): void {
 		self::assertSame([], array_filter(Permission::describe(Permission::NONE)));
+	}
+
+	/**
+	 * A public link can be trusted with the broadcast — listening, adding, being the DJ,
+	 * curating the running order — because those are decisions about the music and the
+	 * owner makes them per link.
+	 *
+	 * SHARE and MANAGE are the two that never appear, and for a different reason than the
+	 * rest: they decide who else reaches the channel and what the channel is, not what it
+	 * is playing. Handing either to whoever holds a URL is not something an owner could
+	 * mean to do, so it is not on offer to be got wrong.
+	 */
+	public function testALinkMayCarryTheBroadcastButNotTheChannel(): void {
+		self::assertTrue(Permission::has(Permission::LINK_ALLOWED, Permission::LISTEN));
+		self::assertTrue(Permission::has(Permission::LINK_ALLOWED, Permission::ADD_TRACKS));
+		self::assertTrue(Permission::has(Permission::LINK_ALLOWED, Permission::CONTROL));
+		self::assertTrue(Permission::has(Permission::LINK_ALLOWED, Permission::EDIT_PLAYLIST));
+
+		self::assertFalse(Permission::has(Permission::LINK_ALLOWED, Permission::SHARE));
+		self::assertFalse(Permission::has(Permission::LINK_ALLOWED, Permission::MANAGE));
+	}
+
+	/** Whatever it grows to include, it can never exceed what any share may carry. */
+	public function testTheLinkMaskIsASubsetOfEverything(): void {
+		self::assertSame(Permission::LINK_ALLOWED, Permission::LINK_ALLOWED & Permission::ALL);
+		self::assertSame(Permission::LINK_ALLOWED, Permission::normalize(Permission::LINK_ALLOWED));
 	}
 }

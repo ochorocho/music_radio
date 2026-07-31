@@ -60,6 +60,16 @@ class MusicLibrary {
 	/** Per-user config key holding the folder name, relative to their files root. */
 	public const CONFIG_FOLDER = 'download_folder';
 
+	/**
+	 * How long the whole relative path may be.
+	 *
+	 * There is deliberately no limit on *depth* — the folder is picked from the user's own
+	 * files, so any nesting they already have is legitimate. This bounds the total instead,
+	 * which is the thing storages actually care about: most filesystems stop somewhere
+	 * around 4096 bytes for a full path, and this is a fragment of one.
+	 */
+	private const MAX_FOLDER_PATH_LENGTH = 1024;
+
 	private const AUDIO_MIME_PREFIX = 'audio/';
 
 	public function __construct(
@@ -94,6 +104,7 @@ class MusicLibrary {
 		string $suggestedName,
 		string $addedBy,
 		?int $durationHintMs = null,
+		?bool $approvedOverride = null,
 	): Track {
 		$file = $this->store($storageOwnerId, $localPath, $suggestedName);
 
@@ -104,6 +115,7 @@ class MusicLibrary {
 				[$file->getId()],
 				$durationHintMs === null ? [] : [$file->getId() => $durationHintMs],
 				$addedBy,
+				$approvedOverride,
 			);
 		} catch (\Throwable $e) {
 			// The file only exists to be a track. If it could not become one, leaving it
@@ -222,13 +234,15 @@ class MusicLibrary {
 			return self::DEFAULT_FOLDER;
 		}
 
-		$segments = explode('/', $configured);
-
-		// Deep enough for `Media/Music/Imports`, shallow enough that a pasted absolute
-		// path or a runaway value cannot build a tree.
-		if (count($segments) > 4) {
+		// A whole path still has to be a plausible one. No depth limit — a folder is chosen
+		// from the user's own files now, and somebody who keeps music six levels down has
+		// done nothing wrong — but a single value is not allowed to be arbitrarily long,
+		// because this ends up in a filesystem call and most storages have their own limit.
+		if (mb_strlen($configured) > self::MAX_FOLDER_PATH_LENGTH) {
 			return self::DEFAULT_FOLDER;
 		}
+
+		$segments = explode('/', $configured);
 
 		foreach ($segments as $segment) {
 			// '' catches a doubled slash; whitespace-only is not a name anybody meant; a

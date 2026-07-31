@@ -1,11 +1,17 @@
 <!--
   - SPDX-License-Identifier: AGPL-3.0-or-later
   -
-  - A public link, with its settings on show.
+  - A public link.
   -
-  - Everything is visible without opening anything: a link is one of the more consequential
-  - things you can do to a channel, and whether it is password protected should be readable
-  - at a glance rather than hidden a click away.
+  - Collapsed, it shows the three things you look at a link to find out: who it lets in,
+  - whether it is password protected, and the URL itself. A link is one of the more
+  - consequential things you can do to a channel, and that much should be readable at a
+  - glance rather than a click away.
+  -
+  - Expanded, it shows exactly what a named person's row shows — see ShareOptions. It used
+  - to show a shorter, differently-worded list, which was the whole problem: an owner
+  - comparing what they had given a colleague with what they had given a link was reading
+  - two different vocabularies for the same set of decisions.
 -->
 <template>
 	<li class="music-radio-link" data-testid="link-share-row">
@@ -31,6 +37,20 @@
 
 			<NcButton
 				variant="tertiary"
+				:aria-label="expanded
+					? t('music_radio', 'Hide what this link allows')
+					: t('music_radio', 'Change what this link allows')"
+				:aria-expanded="expanded"
+				data-testid="link-expand"
+				@click="expanded = !expanded">
+				<template #icon>
+					<ChevronUpIcon v-if="expanded" :size="20" />
+					<ChevronDownIcon v-else :size="20" />
+				</template>
+			</NcButton>
+
+			<NcButton
+				variant="tertiary"
 				:aria-label="t('music_radio', 'Remove link')"
 				data-testid="link-remove"
 				@click="$emit('remove', share)">
@@ -40,7 +60,7 @@
 			</NcButton>
 		</div>
 
-		<div class="music-radio-link__settings">
+		<div class="music-radio-link__url-row">
 			<label class="music-radio-link__url-label" :for="urlFieldId">
 				{{ t('music_radio', 'Link') }}
 			</label>
@@ -52,18 +72,15 @@
 				:value="shareUrl"
 				data-testid="link-url"
 				@focus="$event.target.select()">
+		</div>
 
-			<span data-testid="link-allow-uploads">
-				<NcCheckboxRadioSwitch
-					type="switch"
-					:model-value="allowsUploads"
-					@update:model-value="setUploads">
-					{{ t('music_radio', 'Allow uploading music') }}
-				</NcCheckboxRadioSwitch>
-			</span>
-			<p class="music-radio-link__note">
-				{{ t('music_radio', 'Anyone with the link can add a track to the channel. Uploads are saved in your Music folder and count against your storage.') }}
-			</p>
+		<div v-if="expanded" class="music-radio-link__settings">
+			<ShareOptions
+				:share="share"
+				is-link
+				:server-can-import="serverCanImport"
+				@update="(...args) => $emit('update', ...args)"
+				@settings="(...args) => $emit('settings', ...args)" />
 
 			<NcPasswordField
 				v-model="password"
@@ -102,25 +119,30 @@
 
 <script>
 import NcButton from '@nextcloud/vue/components/NcButton'
-import NcCheckboxRadioSwitch from '@nextcloud/vue/components/NcCheckboxRadioSwitch'
 import NcPasswordField from '@nextcloud/vue/components/NcPasswordField'
+import ChevronDownIcon from 'vue-material-design-icons/ChevronDown.vue'
+import ChevronUpIcon from 'vue-material-design-icons/ChevronUp.vue'
 import ContentCopyIcon from 'vue-material-design-icons/ContentCopy.vue'
 import DeleteIcon from 'vue-material-design-icons/Delete.vue'
 import LinkVariantIcon from 'vue-material-design-icons/LinkVariant.vue'
 import { generateUrl, getBaseUrl } from '@nextcloud/router'
 import { showError, showSuccess } from '@nextcloud/dialogs'
-import { ADD_TRACKS, LISTEN, can } from '../utils/permissions.js'
+
+import ShareOptions from './ShareOptions.vue'
+import { roleLabel } from '../utils/shareRoles.js'
 
 export default {
 	name: 'LinkShareRow',
 
 	components: {
+		ChevronDownIcon,
+		ChevronUpIcon,
 		ContentCopyIcon,
 		DeleteIcon,
 		LinkVariantIcon,
 		NcButton,
-		NcCheckboxRadioSwitch,
 		NcPasswordField,
+		ShareOptions,
 	},
 
 	props: {
@@ -133,35 +155,35 @@ export default {
 			type: Boolean,
 			default: false,
 		},
+		/** Whether this server can fetch from YouTube at all; the switch is moot otherwise. */
+		serverCanImport: {
+			type: Boolean,
+			default: false,
+		},
 	},
 
-	emits: ['remove', 'set-password', 'update'],
+	emits: ['remove', 'set-password', 'update', 'settings'],
 
 	data() {
 		return {
+			expanded: false,
 			password: '',
 			saving: false,
 		}
 	},
 
 	computed: {
-		allowsUploads() {
-			return can(this.share.permissions, ADD_TRACKS)
-		},
-
 		/**
-		 * Both halves of what a link grants, in the order they matter: what it lets
-		 * people do, then how hard it is to reach.
+		 * Both halves of what a link grants, in the order they matter: what it lets people
+		 * do, then how hard it is to reach. The first half is the same word a named
+		 * person's row uses, because it is now the same set of things being described.
 		 */
 		roleSummary() {
-			const what = this.allowsUploads
-				? t('music_radio', 'Can listen and upload')
-				: t('music_radio', 'Can listen')
 			const how = this.share.hasPassword
 				? t('music_radio', 'password protected')
 				: t('music_radio', 'no password')
 
-			return `${what} · ${how}`
+			return `${roleLabel(this.share.permissions)} · ${how}`
 		},
 
 		shareUrl() {
@@ -175,10 +197,6 @@ export default {
 	},
 
 	methods: {
-		setUploads(allow) {
-			this.$emit('update', this.share, allow ? LISTEN | ADD_TRACKS : LISTEN)
-		},
-
 		async copy() {
 			try {
 				await navigator.clipboard.writeText(this.shareUrl)
@@ -230,6 +248,7 @@ export default {
 	color: var(--color-text-maxcontrast);
 }
 
+.music-radio-link__url-row,
 .music-radio-link__settings {
 	display: flex;
 	flex-direction: column;

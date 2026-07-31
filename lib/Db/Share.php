@@ -29,6 +29,14 @@ use OCP\DB\Types;
  * @method void setToken(?string $token)
  * @method string|null getPassword()
  * @method void setPassword(?string $password)
+ * @method bool getRequireApproval()
+ * @method void setRequireApproval(bool $requireApproval)
+ * @method bool getAllowVoting()
+ * @method void setAllowVoting(bool $allowVoting)
+ * @method bool getShowListenerCount()
+ * @method void setShowListenerCount(bool $showListenerCount)
+ * @method bool getAllowImport()
+ * @method void setAllowImport(bool $allowImport)
  * @method int getPermissions()
  * @method void setPermissions(int $permissions)
  * @method int|null getExpiration()
@@ -54,6 +62,10 @@ class Share extends Entity implements \JsonSerializable {
 	protected $token;
 	protected $password;
 	protected $permissions;
+	protected $requireApproval;
+	protected $allowVoting;
+	protected $showListenerCount;
+	protected $allowImport;
 	protected $expiration;
 	protected $label;
 	protected $createdBy;
@@ -66,6 +78,10 @@ class Share extends Entity implements \JsonSerializable {
 		$this->addType('token', Types::STRING);
 		$this->addType('password', Types::STRING);
 		$this->addType('permissions', Types::INTEGER);
+		$this->addType('requireApproval', Types::BOOLEAN);
+		$this->addType('allowVoting', Types::BOOLEAN);
+		$this->addType('showListenerCount', Types::BOOLEAN);
+		$this->addType('allowImport', Types::BOOLEAN);
 		$this->addType('expiration', Types::BIGINT);
 		$this->addType('label', Types::STRING);
 		$this->addType('createdBy', Types::STRING);
@@ -90,6 +106,15 @@ class Share extends Entity implements \JsonSerializable {
 			'token' => $this->getToken(),
 			'hasPassword' => ($this->getPassword() ?? '') !== '',
 			'permissions' => $this->getPermissions(),
+			// Decided per share: an owner may trust the people they named while holding
+			// whatever arrives through a link, and may want accounts voting but not
+			// anonymous visitors.
+			'requireApproval' => $this->getRequireApproval() !== false,
+			'allowVoting' => $this->getAllowVoting() === true,
+			'showListenerCount' => $this->getShowListenerCount() !== false,
+			// Off unless the owner said otherwise — on a link this is what lets a stranger
+			// spend the owner's quota, so it is never inherited by accident.
+			'allowImport' => $this->getAllowImport() === true,
 			'expiration' => $this->getExpiration(),
 			'label' => $this->getLabel(),
 			'createdBy' => $this->getCreatedBy(),
