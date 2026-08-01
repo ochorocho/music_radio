@@ -80,6 +80,15 @@ class YoutubeImportSetupCheck implements ISetupCheck {
 			};
 		}
 
+		// Before staleness, because the failures a missing runtime produces look exactly like
+		// a stale downloader — and being told to press "Update yt-dlp" would spend the one
+		// action an administrator is likely to take on the thing that is not wrong.
+		if ($status->jsRuntime === null) {
+			return SetupResult::warning(
+				$this->l10n->t('No JavaScript runtime is installed, so imports from YouTube will fail unpredictably. YouTube signs its audio links with JavaScript that yt-dlp has to run; without an engine it falls back to a route that yt-dlp has deprecated and YouTube refuses at random. Install Deno or Node on this server.'),
+			);
+		}
+
 		if ($status->outdated) {
 			return SetupResult::warning(
 				$this->l10n->t('The installed yt-dlp (%1$s) is more than 90 days old. YouTube changes frequently and imports will start failing; update it with "Update yt-dlp" in the Music Radio settings.', [
@@ -90,7 +99,10 @@ class YoutubeImportSetupCheck implements ISetupCheck {
 		}
 
 		return SetupResult::success(
-			$this->l10n->t('yt-dlp %1$s and ffmpeg are available.', [$status->ytDlpVersion ?? '?']),
+			$this->l10n->t('yt-dlp %1$s, ffmpeg and %2$s are available.', [
+				$status->ytDlpVersion ?? '?',
+				$status->jsRuntime->name,
+			]),
 		);
 	}
 }

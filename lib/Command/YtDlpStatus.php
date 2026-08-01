@@ -9,6 +9,7 @@ declare(strict_types=1);
 namespace OCA\MusicRadio\Command;
 
 use OCA\MusicRadio\Service\ImportError;
+use OCA\MusicRadio\Service\JsRuntime;
 use OCA\MusicRadio\Service\YtDlpLocator;
 use OCP\IAppConfig;
 use Symfony\Component\Console\Command\Command;
@@ -45,10 +46,12 @@ class YtDlpStatus extends Command {
 		// for a binary that is sitting right there.
 		$ytDlp = $this->locator->ytDlpPath();
 		$ffmpeg = $this->locator->ffmpegDirectory();
+		$jsRuntime = $this->locator->jsRuntime();
 
 		$output->writeln('yt-dlp:  ' . ($ytDlp ?? '<comment>not found</comment>'));
 		$output->writeln('version: ' . ($this->locator->version($ytDlp, recheck: true) ?? '<comment>unknown</comment>'));
 		$output->writeln('ffmpeg:  ' . ($ffmpeg ?? '<comment>not found</comment>'));
+		$output->writeln('js:      ' . ($jsRuntime?->spec() ?? '<comment>not found</comment>'));
 		$output->writeln('');
 
 		if (!$status->available) {
@@ -60,6 +63,20 @@ class YtDlpStatus extends Command {
 		}
 
 		$output->writeln('<info>YouTube import is usable.</info>');
+
+		// Reported after "usable" rather than instead of it: everything this app needs is
+		// present, and yt-dlp will still be turned away at the download. Said here because
+		// the failure it produces looks like a stale binary or a broken network, and an
+		// administrator can lose an afternoon to either.
+		if ($status->jsRuntime === null) {
+			$output->writeln('');
+			$output->writeln('<comment>No JavaScript runtime was found, and imports will fail unpredictably.</comment>');
+			$output->writeln('YouTube signs its audio links with JavaScript that yt-dlp has to run; without');
+			$output->writeln('an engine it falls back to a deprecated route that YouTube refuses at random.');
+			$output->writeln('Install one of: <info>' . implode(', ', JsRuntime::SUPPORTED) . '</info>');
+			$output->writeln('Or point at an existing copy: <info>occ config:app:set music_radio '
+				. YtDlpLocator::CONFIG_JS_RUNTIME_PATH . ' --value=/path/to/node</info>');
+		}
 
 		if ($status->outdated) {
 			$output->writeln('');

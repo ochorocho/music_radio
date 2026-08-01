@@ -37,6 +37,7 @@ final class ImportError {
 	// The server cannot do this at all.
 	public const YTDLP_MISSING = 'ytdlp_missing';
 	public const FFMPEG_MISSING = 'ffmpeg_missing';
+	public const JS_RUNTIME_MISSING = 'js_runtime_missing';
 	public const PROCESS_DISABLED = 'process_disabled';
 
 	// The video itself.
@@ -80,6 +81,7 @@ final class ImportError {
 
 			self::YTDLP_MISSING => $l->t('YouTube import is not set up on this server. An administrator needs to install yt-dlp.'),
 			self::FFMPEG_MISSING => $l->t('YouTube import needs ffmpeg, which is not installed on this server.'),
+			self::JS_RUNTIME_MISSING => $l->t('YouTube import needs a JavaScript runtime, which is not installed on this server. An administrator needs to install Deno or Node.'),
 			self::PROCESS_DISABLED => $l->t('This server does not allow running external programs, so YouTube import cannot work here.'),
 
 			self::VIDEO_UNAVAILABLE => $l->t('That video is not available.'),
@@ -97,8 +99,10 @@ final class ImportError {
 				: $l->t('That video is too long to import.'),
 			self::TOO_LARGE => $l->t('That video is too large to import.'),
 
-			// Named as the server's problem, not the listener's, because it is.
-			self::BOT_CHECK => $l->t('YouTube asked this server to prove it is not a bot, so the video could not be fetched.'),
+			// Named as the server's problem, not the listener's, because it is. "Later" is
+			// not a platitude here: this depends on what YouTube currently thinks of the
+			// address the server asks from, and it does pass.
+			self::BOT_CHECK => $l->t('YouTube asked this server to prove it is not a bot, so the video could not be fetched. Trying again later often works.'),
 			self::DOWNLOADER_OUTDATED => $l->t('YouTube changed something the downloader on this server cannot handle yet. Ask an administrator to update yt-dlp.'),
 			self::NETWORK => $l->t('This server could not reach YouTube.'),
 			self::TIMED_OUT => $l->t('That download took too long and was stopped.'),

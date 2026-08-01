@@ -16,7 +16,7 @@ use OCP\IConfig;
 use Psr\Log\LoggerInterface;
 
 /**
- * Finding yt-dlp and ffmpeg, and saying so when they are not there.
+ * Finding yt-dlp, ffmpeg and a JavaScript runtime, and saying so when they are not there.
  *
  * The app does not ship yt-dlp, and cannot: `occ integrity:sign-app` hashes every file in
  * a release, so a downloader that updates itself would break the instance's integrity
@@ -40,6 +40,7 @@ class YtDlpLocator {
 
 	public const CONFIG_YTDLP_PATH = 'ytdlp_path';
 	public const CONFIG_FFMPEG_PATH = 'ffmpeg_path';
+	public const CONFIG_JS_RUNTIME_PATH = 'js_runtime_path';
 	public const CONFIG_VERSION = 'ytdlp_version';
 	public const CONFIG_CHECKED_AT = 'ytdlp_checked_at';
 	public const CONFIG_ENABLED = 'import_enabled';
@@ -119,7 +120,41 @@ class YtDlpLocator {
 			ytDlpVersion: $version,
 			ffmpegDir: $ffmpegDir,
 			outdated: self::isOutdated($version, $this->clock->nowSeconds()),
+			// Deliberately not a reason to report the feature unavailable, unlike a missing
+			// ffmpeg. What a runtime is needed for is decided by YouTube and changes without
+			// notice, so a server without one is reported as *likely* to fail — by the setup
+			// check, and by the import that actually does — rather than being stopped from
+			// trying. Erring the other way would switch the feature off on every host where
+			// it currently still works.
+			jsRuntime: $this->jsRuntime(),
 		);
+	}
+
+	/**
+	 * The JavaScript engine to lend yt-dlp, or null if this server has none.
+	 *
+	 * An explicitly configured path wins, as everywhere else here, and is not fallen back
+	 * on: an administrator who named a binary wants that binary or a clear failure, not a
+	 * quiet substitution.
+	 *
+	 * @see JsRuntime for why an import needs one at all
+	 */
+	public function jsRuntime(): ?JsRuntime {
+		$configured = $this->appConfig->getValueString(Application::APP_ID, self::CONFIG_JS_RUNTIME_PATH);
+		if ($configured !== '') {
+			$runtime = JsRuntime::fromPath($configured);
+
+			return $runtime !== null && $this->isRunnable($runtime->path) ? $runtime : null;
+		}
+
+		foreach (JsRuntime::SUPPORTED as $name) {
+			$path = (string)($this->binaryFinder->findBinaryPath($name) ?: '');
+			if ($this->isRunnable($path)) {
+				return new JsRuntime($name, $path);
+			}
+		}
+
+		return null;
 	}
 
 	/**

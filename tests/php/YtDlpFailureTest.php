@@ -171,6 +171,88 @@ class YtDlpFailureTest extends TestCase {
 		);
 	}
 
+	// ------------------------------------------------- no JavaScript runtime
+
+	/**
+	 * Verbatim from a run on a server with no runtime: the metadata pass succeeded, the
+	 * download picked the client that needs no signature, and YouTube refused it. The line
+	 * begins "unable to download", which is also how a DNS failure begins.
+	 */
+	private const REFUSED = 'ERROR: unable to download video data: HTTP Error 403: Forbidden';
+
+	public function testARefusedDownloadIsNotANetworkFault(): void {
+		self::assertSame(ImportError::BOT_CHECK, YtDlpFailure::classify(self::failed(self::REFUSED), false));
+	}
+
+	/**
+	 * @return array<string, array{string}>
+	 */
+	public static function withoutARuntimeProvider(): array {
+		return [
+			'the download is refused' => [self::REFUSED],
+			'the signature step gives up' => [
+				'ERROR: [youtube] abc: nsig extraction failed: Some formats may be missing',
+			],
+		];
+	}
+
+	#[DataProvider('withoutARuntimeProvider')]
+	public function testARefusedUnsignedUrlNamesTheMissingRuntime(string $stderr): void {
+		$noisy = self::JS_WARNING . "\n" . $stderr;
+
+		self::assertSame(
+			ImportError::JS_RUNTIME_MISSING,
+			YtDlpFailure::classify(self::failed($noisy), false, jsRuntimeAvailable: false),
+		);
+	}
+
+	/**
+	 * With a runtime present the same lines keep their ordinary readings: a failed
+	 * signature really does mean the binary is behind.
+	 */
+	#[DataProvider('withoutARuntimeProvider')]
+	public function testARuntimeBeingPresentLeavesTheOrdinaryVerdictsAlone(string $stderr): void {
+		self::assertNotSame(
+			ImportError::JS_RUNTIME_MISSING,
+			YtDlpFailure::classify(self::failed($stderr), false),
+		);
+	}
+
+	/**
+	 * The one that looks like it belongs in the list above and does not. A sign-in prompt
+	 * is about who YouTube thinks is asking — an address it distrusts — and it arrives on
+	 * servers with a perfectly good runtime. Answering it with "install Deno" would send an
+	 * administrator after the one thing that cannot help.
+	 */
+	public function testASignInPromptIsNotBlamedOnTheRuntime(): void {
+		$stderr = 'ERROR: [youtube] abc: Sign in to confirm you\'re not a bot. Use --cookies-from-browser or --cookies.';
+
+		self::assertSame(
+			ImportError::BOT_CHECK,
+			YtDlpFailure::classify(self::failed($stderr), false, jsRuntimeAvailable: false),
+		);
+	}
+
+	/**
+	 * The override is narrow on purpose. A private video is private whatever the server
+	 * is missing, and blaming its own configuration for it would be a lie with a plausible
+	 * shape.
+	 */
+	public function testAMissingRuntimeDoesNotExcuseUnrelatedFailures(): void {
+		self::assertSame(
+			ImportError::VIDEO_PRIVATE,
+			YtDlpFailure::classify(self::failed('ERROR: [youtube] abc: Private video'), false, jsRuntimeAvailable: false),
+		);
+		self::assertSame(
+			ImportError::NETWORK,
+			YtDlpFailure::classify(
+				self::failed('ERROR: Unable to download webpage: <urlopen error [Errno 111] Connection refused>'),
+				false,
+				jsRuntimeAvailable: false,
+			),
+		);
+	}
+
 	// ------------------------------------------------------------- the probe
 
 	public function testProbeFailuresUseTheSameTaxonomy(): void {

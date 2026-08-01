@@ -171,6 +171,41 @@ class YtDlpArgvTest extends TestCase {
 		self::assertNotContains('--proxy', YtDlpArgv::probe(self::YTDLP, self::URL, ''));
 	}
 
+	// ------------------------------------------------------- JavaScript runtime
+
+	/**
+	 * Both passes, because the metadata pass needs a runtime for some videos too — and
+	 * because a probe that quietly used a different set of clients than the download would
+	 * make the pre-flight checks describe a video the download never sees.
+	 */
+	public function testTheJavascriptRuntimeIsNamedOnBothPasses(): void {
+		$probe = YtDlpArgv::probe(self::YTDLP, self::URL, null, 'node:/usr/local/bin/node');
+		$download = YtDlpArgv::download(
+			self::YTDLP,
+			self::URL,
+			self::TMP,
+			self::FFMPEG_DIR,
+			maxDurationSeconds: 5400,
+			maxFilesizeBytes: 314572800,
+			proxy: null,
+			jsRuntime: 'node:/usr/local/bin/node',
+		);
+
+		self::assertSame('node:/usr/local/bin/node', $probe[array_search('--js-runtimes', $probe, true) + 1]);
+		self::assertSame('node:/usr/local/bin/node', $download[array_search('--js-runtimes', $download, true) + 1]);
+	}
+
+	/**
+	 * Naming a runtime that is not there is an option error, and yt-dlp exits on it before
+	 * doing anything — which would turn "the download will probably fail" into "the probe
+	 * fails too, and says something about command-line syntax".
+	 */
+	public function testNoRuntimeFlagWhenTheServerHasNone(): void {
+		self::assertNotContains('--js-runtimes', YtDlpArgv::probe(self::YTDLP, self::URL, null, null));
+		self::assertNotContains('--js-runtimes', YtDlpArgv::probe(self::YTDLP, self::URL, null, ''));
+		self::assertNotContains('--js-runtimes', self::download());
+	}
+
 	// --------------------------------------------------------------- progress
 
 	/**

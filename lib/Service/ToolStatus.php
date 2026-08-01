@@ -29,6 +29,7 @@ final class ToolStatus implements \JsonSerializable {
 		public readonly ?string $ytDlpVersion = null,
 		public readonly ?string $ffmpegDir = null,
 		public readonly bool $outdated = false,
+		public readonly ?JsRuntime $jsRuntime = null,
 	) {
 	}
 

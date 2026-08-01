@@ -21,9 +21,11 @@ use OCA\MusicRadio\Process\ProcessResult;
  * Three things about a real yt-dlp run that this had to be built around, all confirmed by
  * running it rather than by reading the manual:
  *
- * 1. **Only `ERROR:` lines matter.** Every single run also emits a `WARNING:` about
- *    JavaScript runtimes being deprecated. That warning contains a URL and the word
- *    "deprecated", and matching against it would misclassify every failure.
+ * 1. **Only `ERROR:` lines matter.** A run with no JavaScript runtime also emits a
+ *    `WARNING:` saying so. That warning contains a URL and the word "deprecated", and
+ *    matching against it would misclassify every failure — including the successful runs,
+ *    since it is printed there too. The condition it describes is real and is answered by
+ *    {@see JsRuntime}, not by reading this line.
  * 2. **A rejected `--match-filter` exits 0.** A video that is too long is not an error at
  *    all: yt-dlp prints "does not pass filter" on *stdout*, exits 0, and writes no file. So
  *    the exit code cannot be the first thing consulted.
@@ -33,11 +35,38 @@ use OCA\MusicRadio\Process\ProcessResult;
 final class YtDlpFailure {
 
 	/**
+	 * What an unsigned download looks like when it is turned away.
+	 *
+	 * Only consulted when the server has no JavaScript runtime, and deliberately narrow.
+	 * These two say the URL itself was not acceptable — refused outright, or never properly
+	 * signed in the first place — which is exactly what an engine would have fixed.
+	 *
+	 * The sign-in prompt is **not** in here, tempting as it looks. That one is about who
+	 * YouTube thinks is asking, not about how the URL was built; it turns up on servers with
+	 * a perfectly good runtime, and answering it with "install Deno" would send an
+	 * administrator after the one thing that cannot help.
+	 */
+	private const UNSIGNED_AND_REFUSED = [
+		'http error 403',
+		'403: forbidden',
+		'nsig extraction failed',
+		'signature extraction failed',
+	];
+
+	/**
 	 * @param bool $producedFile whether an audio file actually appeared. Exit code 0 with
 	 *                           no file is a normal outcome, not a contradiction.
+	 * @param bool $jsRuntimeAvailable whether the run had a JavaScript engine to lend
+	 *                                 yt-dlp. Defaults to the equipped case, so that every
+	 *                                 other caller and test reads as being about stderr and
+	 *                                 nothing else.
 	 * @return string|null null when the run succeeded and there is nothing to explain
 	 */
-	public static function classify(ProcessResult $result, bool $producedFile): ?string {
+	public static function classify(
+		ProcessResult $result,
+		bool $producedFile,
+		bool $jsRuntimeAvailable = true,
+	): ?string {
 		if ($producedFile && $result->succeeded()) {
 			return null;
 		}
@@ -59,6 +88,13 @@ final class YtDlpFailure {
 		// Order matters: the specific readings come before the general ones, because
 		// several of these strings co-occur. "Private video" also says "Sign in", and an
 		// outdated extractor also fails to "download" things.
+		// Before the general reading, because both of these otherwise land on something true
+		// and unhelpful — a stale downloader, or a network that is plainly working. On a
+		// server with no engine to run YouTube's own JavaScript in, they mean the engine.
+		if (!$jsRuntimeAvailable && self::matches($errors, self::UNSIGNED_AND_REFUSED)) {
+			return ImportError::JS_RUNTIME_MISSING;
+		}
+
 		$code = self::fromErrorText($errors);
 		if ($code !== null) {
 			return $code;
@@ -77,12 +113,12 @@ final class YtDlpFailure {
 	 * Also used on the probe pass, where there is no file to look for and the metadata
 	 * checks happen separately.
 	 */
-	public static function classifyProbe(ProcessResult $result): ?string {
+	public static function classifyProbe(ProcessResult $result, bool $jsRuntimeAvailable = true): ?string {
 		if ($result->succeeded()) {
 			return null;
 		}
 
-		return self::classify($result, false);
+		return self::classify($result, false, $jsRuntimeAvailable);
 	}
 
 	private static function fromErrorText(string $text): ?string {
@@ -117,6 +153,18 @@ final class YtDlpFailure {
 				'update to the latest version',
 				'confirm the issue persists',
 			]) => ImportError::DOWNLOADER_OUTDATED,
+
+			// A refusal of the media URLs themselves, rather than of the page. The request
+			// arrived and was understood, so this is not a network fault however much the
+			// line around it looks like one — it is the same gate as the sign-in prompt,
+			// reached by a different road: the URL was signed with something YouTube did not
+			// accept, or not signed at all.
+			//
+			// Ordering is the whole point of this arm. yt-dlp words it "unable to download
+			// video data: HTTP Error 403: Forbidden", which the network patterns just below
+			// match on their first three words — so a server that cannot sign a URL spent a
+			// long time being told it could not reach YouTube.
+			self::matches($text, ['http error 403', '403: forbidden']) => ImportError::BOT_CHECK,
 
 			self::matches($text, [
 				'unable to download',

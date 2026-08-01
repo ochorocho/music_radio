@@ -252,10 +252,11 @@ class YoutubeImportService {
 		$url = YoutubeUrl::canonical($import->getVideoId());
 		$environment = $this->environmentFor($temporaryDirectory);
 		$proxy = $this->config->getSystemValueString('proxy', '') ?: null;
+		$jsRuntime = $status->jsRuntime?->spec();
 
 		// --- what is this? ----------------------------------------------------
 		$probe = $this->runner->run(
-			YtDlpArgv::probe($status->ytDlpPath, $url, $proxy),
+			YtDlpArgv::probe($status->ytDlpPath, $url, $proxy, $jsRuntime),
 			$temporaryDirectory,
 			$environment,
 			self::PROBE_TIMEOUT_SECONDS,
@@ -263,7 +264,7 @@ class YoutubeImportService {
 			fn (): bool => $this->wasCancelled($import),
 		);
 
-		$failure = YtDlpFailure::classifyProbe($probe);
+		$failure = YtDlpFailure::classifyProbe($probe, $jsRuntime !== null);
 		if ($failure !== null) {
 			$this->logFailure($import, $failure, $probe->stderr);
 			$this->fail($import, $failure, YtDlpFailure::detail($probe));
@@ -302,6 +303,7 @@ class YoutubeImportService {
 				$this->maxDurationSeconds(),
 				$this->maxSourceBytes(),
 				$proxy,
+				$jsRuntime,
 			),
 			$temporaryDirectory,
 			$environment,
@@ -314,7 +316,7 @@ class YoutubeImportService {
 
 		$produced = $this->producedFile($temporaryDirectory);
 
-		$failure = YtDlpFailure::classify($result, $produced !== null);
+		$failure = YtDlpFailure::classify($result, $produced !== null, $jsRuntime !== null);
 		if ($failure !== null) {
 			$this->logFailure($import, $failure, $result->stderr);
 			$this->fail($import, $failure, YtDlpFailure::detail($result));

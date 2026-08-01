@@ -94,10 +94,16 @@ final class YtDlpArgv {
 	/**
 	 * @return list<string>
 	 */
-	public static function probe(string $ytDlp, string $canonicalUrl, ?string $proxy = null): array {
+	public static function probe(
+		string $ytDlp,
+		string $canonicalUrl,
+		?string $proxy = null,
+		?string $jsRuntime = null,
+	): array {
 		return [
 			...self::safetyFlags($ytDlp),
 			...self::networkFlags($proxy),
+			...self::javascriptFlags($jsRuntime),
 
 			// Ask, do not fetch.
 			'--simulate',
@@ -117,6 +123,8 @@ final class YtDlpArgv {
 	 * @param int $maxFilesizeBytes ceiling on the *source* stream; the produced file is
 	 *                              measured again afterwards, because a transcode can
 	 *                              land either side of this
+	 * @param string|null $jsRuntime a {@see JsRuntime::spec()}; without one it is this pass
+	 *                               that gets refused, the probe above having succeeded
 	 * @return list<string>
 	 */
 	public static function download(
@@ -127,10 +135,12 @@ final class YtDlpArgv {
 		int $maxDurationSeconds,
 		int $maxFilesizeBytes,
 		?string $proxy = null,
+		?string $jsRuntime = null,
 	): array {
 		return [
 			...self::safetyFlags($ytDlp),
 			...self::networkFlags($proxy),
+			...self::javascriptFlags($jsRuntime),
 
 			// --- limits, applied before and during the download -----------------
 			// Checked against the metadata, so an over-long video costs nothing.
@@ -217,6 +227,32 @@ final class YtDlpArgv {
 			// help neither.
 			'--no-color',
 		];
+	}
+
+	/**
+	 * Lend yt-dlp an engine for YouTube's own JavaScript.
+	 *
+	 * On both passes, because the metadata pass needs it too on some videos and asking for
+	 * it costs nothing when it is not — the flag enables a runtime, it does not invoke one.
+	 *
+	 * yt-dlp enables `deno` by default and looks for it on PATH. That default is why this
+	 * looks superfluous and is not: the child's PATH is the minimal one this app hands it,
+	 * and `node` — the runtime a Nextcloud host is actually likely to have — is not enabled
+	 * unless it is named here.
+	 *
+	 * Nothing is passed when the server has no runtime at all. `--js-runtimes` with an
+	 * absent binary is an error yt-dlp refuses to start on, which would turn "the download
+	 * will probably fail" into "nothing works, including the parts that did".
+	 *
+	 * @param string|null $jsRuntime a {@see JsRuntime::spec()}
+	 * @return list<string>
+	 */
+	private static function javascriptFlags(?string $jsRuntime): array {
+		if ($jsRuntime === null || $jsRuntime === '') {
+			return [];
+		}
+
+		return ['--js-runtimes', $jsRuntime];
 	}
 
 	/**

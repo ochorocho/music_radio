@@ -17,6 +17,7 @@ use OCA\MusicRadio\Db\Track;
 use OCA\MusicRadio\Exception\MusicRadioException;
 use OCA\MusicRadio\Service\Clock;
 use OCA\MusicRadio\Service\ImportError;
+use OCA\MusicRadio\Service\JsRuntime;
 use OCA\MusicRadio\Service\MusicLibrary;
 use OCA\MusicRadio\Service\ToolStatus;
 use OCA\MusicRadio\Service\YoutubeImportService;
@@ -92,12 +93,15 @@ class YoutubeImportServiceTest extends TestCase {
 		$config = $this->createMock(IConfig::class);
 		$config->method('getSystemValueString')->willReturn('');
 
+		// A fully equipped server, which is what every test below except the one about a
+		// missing runtime is talking about.
 		$this->locator->method('status')->willReturn(new ToolStatus(
 			available: true,
 			reason: null,
 			ytDlpPath: '/usr/local/bin/yt-dlp',
 			ytDlpVersion: '2026.07.04',
 			ffmpegDir: '/usr/bin',
+			jsRuntime: new JsRuntime('node', '/usr/local/bin/node'),
 		));
 
 		$this->service = new YoutubeImportService(
@@ -461,6 +465,55 @@ class YoutubeImportServiceTest extends TestCase {
 		$this->service->perform(self::import());
 
 		self::assertSame(ImportError::DOWNLOADER_OUTDATED, $this->lastSaved()->getErrorCode());
+	}
+
+	// ------------------------------------------------- the JavaScript runtime
+
+	public function testTheRuntimeIsLentToBothPasses(): void {
+		$this->allowClaim();
+		$this->runner->queueSuccess(self::metadata());
+		$this->runner->queueSuccess();
+		$this->runner->producesFile = 'audio.mp3';
+
+		$this->captureUpdates();
+
+		$this->service->perform(self::import());
+
+		self::assertCount(2, $this->runner->calls);
+		foreach ($this->runner->calls as $argv) {
+			self::assertContains('--js-runtimes', $argv);
+			self::assertContains('node:/usr/local/bin/node', $argv);
+		}
+	}
+
+	/**
+	 * The failure this actually produces on a server without one: the probe succeeds, so
+	 * everything looks healthy, and then YouTube refuses the download. Said plainly, because
+	 * the honest-looking readings of that line — a network fault, a stale yt-dlp — both send
+	 * an administrator after something that is not wrong.
+	 */
+	public function testARefusedDownloadWithNoRuntimeNamesTheRuntime(): void {
+		$locator = $this->createMock(YtDlpLocator::class);
+		$locator->method('status')->willReturn(new ToolStatus(
+			available: true,
+			reason: null,
+			ytDlpPath: '/usr/local/bin/yt-dlp',
+			ytDlpVersion: '2026.07.04',
+			ffmpegDir: '/usr/bin',
+			jsRuntime: null,
+		));
+
+		$this->allowClaim();
+		$this->runner->queueSuccess(self::metadata());
+		$this->runner->queueFailure('ERROR: unable to download video data: HTTP Error 403: Forbidden');
+
+		$this->captureUpdates();
+
+		$this->serviceWith($locator)->perform(self::import());
+
+		self::assertSame(ImportError::JS_RUNTIME_MISSING, $this->lastSaved()->getErrorCode());
+		// And nothing was told to yt-dlp that it would refuse to start on.
+		self::assertNotContains('--js-runtimes', $this->runner->calls[0]);
 	}
 
 	// ------------------------------------------------------------------ storage
