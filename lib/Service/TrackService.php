@@ -8,6 +8,7 @@ declare(strict_types=1);
 
 namespace OCA\MusicRadio\Service;
 
+use OCA\MusicRadio\BackgroundJob\PrepareBroadcastJob;
 use OCA\MusicRadio\Db\Channel;
 use OCA\MusicRadio\Db\Track;
 use OCA\MusicRadio\Db\TrackMapper;
@@ -16,6 +17,7 @@ use OCA\MusicRadio\Exception\MusicRadioException;
 use OCA\MusicRadio\Exception\NotFoundException;
 use OCP\AppFramework\Db\DoesNotExistException;
 use OCP\AppFramework\Db\MultipleObjectsReturnedException;
+use OCP\BackgroundJob\IJobList;
 use OCP\DB\Exception;
 use OCP\Files\File;
 use OCP\Files\IRootFolder;
@@ -43,6 +45,8 @@ class TrackService {
 
 	public function __construct(
 		private TrackMapper $trackMapper,
+		private IJobList $jobList,
+		private BroadcastLibrary $library,
 		private VoteMapper $voteMapper,
 		private PermissionService $permissionService,
 		private TimelineService $timelineService,
@@ -159,7 +163,10 @@ class TrackService {
 		// known there and cannot be found from `$addedBy` (a visitor key is not an account).
 		$approved = $approvedOverride ?? !$this->permissionService->shareRulesFor($channel, $addedBy)['requireApproval'];
 
-		$this->timelineService->withPreservedPosition($channel, function () use ($prepared, $channel, $addedBy, $approved, $now, &$nextSort, &$added): void {
+		/** @var list<int> $queueForBroadcast ids to prepare once the rows are committed */
+		$queueForBroadcast = [];
+
+		$this->timelineService->withPreservedPosition($channel, function () use ($prepared, $channel, $addedBy, $approved, $now, &$nextSort, &$added, &$queueForBroadcast): void {
 			foreach ($prepared as $item) {
 				/** @var File $file */
 				$file = $item['file'];
@@ -182,10 +189,26 @@ class TrackService {
 				$track->setApproved($approved);
 				$track->setCreatedAt($now);
 
-				$added[] = $this->trackMapper->insert($track);
+				$stored = $this->trackMapper->insert($track);
+				$added[] = $stored;
+				$queueForBroadcast[] = (int)$stored->getId();
 				$nextSort += self::SORT_STEP;
 			}
 		});
+
+		// Queued after the transaction, never inside it.
+		//
+		// A job added inside would be visible to a worker the moment it is written, which
+		// can be before the track row it names has been committed — the worker then looks
+		// up an id that does not exist yet, finds nothing, and returns having done the one
+		// thing it was for. Queuing here means the rows are in place before anything can
+		// come looking.
+		foreach ($queueForBroadcast as $trackId) {
+			$this->jobList->add(PrepareBroadcastJob::class, [
+				'trackId' => $trackId,
+				'channelId' => $channel->getId(),
+			]);
+		}
 
 		return ['added' => $added, 'skipped' => $skipped];
 	}
@@ -194,12 +217,24 @@ class TrackService {
 	 * @throws Exception
 	 */
 	public function remove(Channel $channel, Track $track): void {
+		$trackId = (int)$track->getId();
+
 		$this->timelineService->withPreservedPosition($channel, function () use ($track): void {
 			// Before the row itself: votes point at a track id, and leaving them behind
 			// would let a future track inherit them.
 			$this->voteMapper->clearForTrack($track->getId());
 			$this->trackMapper->delete($track);
 		});
+
+		// The prepared copy is derived data and nothing else refers to it, so removing the
+		// row is the moment it stops meaning anything. Left behind it is invisible: about a
+		// megabyte per minute of audio, in a directory nobody looks at, reclaimed by
+		// nothing. This instance reached 865 files that way before anyone noticed.
+		//
+		// After the delete rather than inside it, and never allowed to fail the removal:
+		// the row is the truth and the file is a cache. A copy that survives is waste; a
+		// track that could not be deleted because a file was locked is a bug.
+		$this->library->forget($trackId);
 	}
 
 	/**

@@ -251,8 +251,11 @@ class SettingsStore {
 		$status = $this->locator->status();
 
 		if ($status->available) {
+			// The button is on this page, immediately below. Sending an administrator to a
+			// terminal for something they can press is the friction it was added to remove
+			// — and on a managed server there may be no terminal to send them to.
 			return $status->outdated
-				? $this->l10n->t('Working, but the downloader is out of date and some videos will fail. Update it with "occ music_radio:ytdlp:install --force".')
+				? $this->l10n->t('Working, but the downloader is out of date and some videos will fail. Use "Update yt-dlp" below.')
 				: $this->l10n->t('Working.');
 		}
 
@@ -260,7 +263,9 @@ class SettingsStore {
 			ImportError::DISABLED => $this->l10n->t('Switched off below.'),
 			ImportError::FFMPEG_MISSING => $this->l10n->t('Not usable: ffmpeg and ffprobe are not installed. Both are needed, because YouTube does not serve MP3 and the audio has to be converted.'),
 			ImportError::PROCESS_DISABLED => $this->l10n->t('Not usable: this PHP installation does not allow running external programs (proc_open is disabled).'),
-			default => $this->l10n->t('Not usable: yt-dlp was not found. Install it with "occ music_radio:ytdlp:install", or give its path below.'),
+			// Same reasoning as the outdated message above: the button that does this is
+			// on this page.
+			default => $this->l10n->t('Not usable: yt-dlp was not found. Install it with "Update yt-dlp" below, or give its path.'),
 		};
 	}
 

@@ -541,7 +541,13 @@ test('the channel settings dialog has no accessibility violations', async ({ pag
 
 	// Behind the header's overflow menu; there is no direct control for it. Matched on the
 	// German label too — this instance runs translated.
-	await page.getByTestId('channel-view').locator('header').getByRole('button').last().click()
+	//
+	// Selected as "the menu", not as "the last button in the header". It was the latter,
+	// which held only while the menu happened to be last: enabling YouTube import adds a
+	// button to that header, and from then on the click landed on Share and waited twenty
+	// seconds for a popover that a dialog was never going to produce. The row menus
+	// elsewhere in the suite already address this toggle by its class.
+	await page.getByTestId('channel-title').locator('.action-item__menutoggle').click()
 	await expect(page.locator('.v-popper__popper--shown')).toBeVisible({ timeout: 20_000 })
 	await page.getByRole('menuitem', { name: /channel settings|Kanaleinstellungen/i })
 		.or(page.getByRole('button', { name: /channel settings|Kanaleinstellungen/i }))

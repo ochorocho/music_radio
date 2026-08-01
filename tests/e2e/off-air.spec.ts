@@ -103,7 +103,13 @@ test('what is on air is shown even when not tuned in', async ({ page, db }) => {
 	// …but the channel's state is on screen anyway.
 	await expect(page.getByTestId('off-air-status')).toBeVisible({ timeout: 20_000 })
 	await expect(page.getByTestId('now-playing-title')).toHaveText(rows[1].title)
-	await expect(page.getByTestId('off-air-note')).toBeVisible()
+	// The position too, which is the part that proves this is the live broadcast rather
+	// than a static "something is playing" placeholder.
+	await expect(page.getByTestId('now-playing-time')).toContainText(/\d+:\d\d/)
+	// The standing "you are not listening" note is gone — the Tune in button beside it says
+	// the same thing in less room — and what remains of that element is about whether the
+	// channel *can* go on air, which is a different test's business. Nothing is asserted
+	// about it here.
 
 	// And the marked row matches.
 	await expect(page.getByTestId('track').nth(1)).toHaveAttribute('data-onair', 'true')

@@ -189,10 +189,15 @@ test.describe('public links', () => {
 			.toBe(1)
 
 		// Playing the channel's own audio, through the token endpoint.
+		//
+		// The programme rather than a single track: a listener is given a stretch of the
+		// broadcast that carries its own track changes, which is what lets a phone with the
+		// screen locked play past the end of a song. The per-track URL this used to name is
+		// still served, but nothing plays it any more.
 		const src = await anonPage.evaluate(() =>
 			Array.from(document.querySelectorAll('audio')).find((a) => !a.paused)?.src ?? '',
 		)
-		expect(src).toContain(`/public/${token}/tracks/`)
+		expect(src).toContain(`/public/${token}/programme`)
 
 		// And it is moving, rather than sitting at zero.
 		await expect

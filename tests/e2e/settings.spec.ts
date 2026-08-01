@@ -125,6 +125,18 @@ test.describe('admin settings', () => {
 		// something the page remembered from its own request.
 		await page.reload()
 		await expect(page.getByTestId('admin-ytdlp-version')).toContainText(/yt-dlp \d/i, { timeout: 20_000 })
+
+		// The thing a version string does not tell you: whether what was just installed can
+		// be *used*.
+		//
+		// A reported version only proves the file ran once, with `--version`, which is the
+		// cheapest thing yt-dlp does. The failure this whole asset choice exists to avoid
+		// looks exactly like success here — a build for the wrong architecture, or one whose
+		// interpreter is missing, downloads cleanly, sits there executable, and then fails
+		// at every real import. So the server's own verdict is read back after the update,
+		// which is derived from the binary that was just put in place.
+		await expect(page.getByTestId('admin-status')).toContainText(/working/i, { timeout: 20_000 })
+		await expect(page.getByTestId('admin-status')).not.toContainText(/not usable|switched off/i)
 	})
 
 	test.afterEach(async ({ page }) => {

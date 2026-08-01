@@ -57,8 +57,11 @@
 					:seekable="canSeek"
 					@seek="seekTo" />
 
-				<p v-if="localTrack" class="music-radio-onair__hint" data-testid="off-air-note">
-					{{ t('music_radio', 'You are not listening. The channel is playing without you.') }}<br>
+				<!-- Only when there is something to say. The standing "you are not listening"
+				     line was dropped — the Tune in button beside it says the same thing in
+				     less room — so this is now empty on a healthy channel, and an empty
+				     paragraph is still a paragraph. -->
+				<p v-if="tuneInHint" class="music-radio-onair__hint" data-testid="off-air-note">
 					{{ tuneInHint }}
 				</p>
 			</div>
@@ -70,7 +73,7 @@
 			<NcButton
 				class="music-radio-onair__tunein-button"
 				variant="primary"
-				size="large"
+				size="small"
 				data-testid="tune-in"
 				:disabled="!canTuneIn"
 				@click="startListening">
@@ -701,7 +704,7 @@ export default {
 	align-items: center;
 	flex-wrap: wrap;
 	gap: 0.75rem 1rem;
-	padding-block: 0.5rem;
+	padding-block: 0;
 }
 
 .music-radio-onair__status {
@@ -712,11 +715,14 @@ export default {
 	flex: 1 1 20rem;
 	min-inline-size: 0;
 	gap: 0.35rem;
+  padding-block: 0.5rem;
 }
 
 /* Never the flexible item — that is what truncates a label to fit. */
 .music-radio-onair__tunein-button {
 	flex: none;
+  display: inline-block;
+  margin: auto auto .3rem;
 }
 
 .music-radio-onair__now {
@@ -818,15 +824,40 @@ export default {
 
 /* A link in prose rather than a button that looks like one: it sits at the end of the
    status line, and anything button-shaped there would read as an action on the broadcast. */
+/*
+ * A link that happens to be a button.
+ *
+ * It has to be a <button>, because it toggles something on the page rather than going
+ * anywhere — but Nextcloud gives every bare <button> a 44px min-height and a control's
+ * worth of padding, sized for a tap target. Dropping the background and border was not
+ * enough: the height stayed, so a word inside a sentence reserved the space of a full
+ * button and pushed the status line apart.
+ *
+ * So the box is reset as well as the paint, and it is laid out inline like the text it
+ * sits in. Only the focus ring is left alone — it is still a control, and still has to be
+ * findable from the keyboard.
+ */
 .music-radio-onair__diagnostics-toggle {
+	display: inline;
+	min-height: 0;
+	height: auto;
+	width: auto;
 	background: none;
 	border: 0;
-	padding: 0;
+	margin: 0;
 	margin-inline-start: 0.5rem;
+	padding: 0;
 	font: inherit;
-	color: var(--color-text-maxcontrast);
+	line-height: inherit;
+	color: var(--color-primary-element);
 	text-decoration: underline;
 	cursor: pointer;
+}
+
+.music-radio-onair__diagnostics-toggle:hover,
+.music-radio-onair__diagnostics-toggle:focus-visible {
+	background: none;
+	text-decoration: none;
 }
 
 .music-radio-onair__diagnostics {
@@ -843,7 +874,7 @@ export default {
 .music-radio-onair__diagnostics-list {
 	display: grid;
 	grid-template-columns: auto auto;
-	gap: 0.15rem 0.75rem;
+	gap: 0.15rem 0.15rem;
 	margin: 0 0 0.5rem;
 }
 
@@ -853,20 +884,22 @@ export default {
 
 .music-radio-onair__diagnostics-list dt {
 	color: var(--color-text-maxcontrast);
+  padding: 2px;
 }
 
 .music-radio-onair__diagnostics-list dd {
 	margin: 0;
+  padding: 2px;
 	font-variant-numeric: tabular-nums;
 }
 
 .music-radio-onair__controls {
 	display: flex;
 	align-items: center;
-	gap: 0.5rem;
+	gap: 0.2rem;
 	flex-wrap: wrap;
-	margin-block-start: 1rem;
-	padding-block-start: 1rem;
+	margin-block-start: 0;
+	padding-block-start: 0.5rem;
 	border-top: 1px solid var(--color-border);
 }
 
@@ -880,16 +913,62 @@ export default {
  * exists to say, so it goes first and takes the whole line; the rest wraps underneath and
  * stays perfectly readable.
  */
+/*
+ * On a phone this card is competing with the playlist for a screen that is mostly not
+ * either of them.
+ *
+ * It is sticky, so every millimetre it occupies is taken from the list underneath for the
+ * whole session — not just at the top of the page. Desktop spacing is generous on purpose
+ * and reads as wasteful here, so the whole box tightens rather than any one part of it:
+ * less padding around the card, less gap between its rows, and the explanatory hint shrunk
+ * to the aside it actually is.
+ *
+ * Nothing is hidden. Every control and every readout that exists at desktop width still
+ * exists here — a phone is where somebody is most likely to be *using* the channel rather
+ * than administering it, and quietly removing the controls they came for would buy height
+ * at the wrong price.
+ */
 @media (max-width: 600px) {
+	.music-radio-onair {
+		padding: 0.6rem 0.75rem;
+		margin-block-end: 0.75rem;
+	}
+
+	.music-radio-onair__tunein {
+		gap: 0.5rem 0.75rem;
+	}
+
+	.music-radio-onair__status {
+		gap: 0.25rem;
+		padding-block: 0;
+	}
+
 	.music-radio-onair__now {
 		flex-wrap: wrap;
 		/* Tighter than the row gap: these are now two lines, not two columns. */
-		row-gap: 0.35rem;
+		row-gap: 0.25rem;
+		column-gap: 0.5rem;
 	}
 
 	.music-radio-onair__text {
 		order: -1;
 		flex: 1 0 100%;
+	}
+
+	/* Two lines of explanation, at the size of an aside rather than of the title above it. */
+	.music-radio-onair__hint {
+		margin-block: 0.15rem 0;
+		font-size: 0.8em;
+		line-height: 1.3;
+	}
+
+	.music-radio-onair__sync {
+		margin-block-start: 0.25rem;
+	}
+
+	.music-radio-onair__diagnostics {
+		margin-block-start: 0.25rem;
+		padding: 0.4rem 0.5rem;
 	}
 }
 </style>

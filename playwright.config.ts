@@ -36,6 +36,8 @@ export default defineConfig<object, { dbConfig: DbConnectorConfig }>({
 	timeout: 60_000,
 	expect: { timeout: 15_000 },
 	globalSetup: './tests/e2e/global-setup.ts',
+	// Puts the admin account's language back; see global-setup.ts.
+	globalTeardown: './tests/e2e/global-teardown.ts',
 	reporter: [['list'], ['html', { open: 'never' }]],
 	use: {
 		baseURL: BASE_URL,

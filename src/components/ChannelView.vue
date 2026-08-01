@@ -6,7 +6,21 @@
 		<header class="music-radio-header">
 			<div class="music-radio-header__text">
 				<h2 class="music-radio-header__title" data-testid="channel-title">
-					{{ channel.title }}
+          <NcActions v-if="canManage || channel.isOwner">
+            <NcActionButton v-if="canManage" @click="showSettings = true">
+              <template #icon>
+                <PencilIcon :size="20" />
+              </template>
+              {{ t('music_radio', 'Channel settings') }}
+            </NcActionButton>
+            <NcActionButton v-if="channel.isOwner" @click="confirmDelete">
+              <template #icon>
+                <DeleteIcon :size="20" />
+              </template>
+              {{ t('music_radio', 'Delete channel') }}
+            </NcActionButton>
+          </NcActions>
+          {{ channel.title }}
 				</h2>
 				<p v-if="channel.description" class="music-radio-header__description">
 					{{ channel.description }}
@@ -38,7 +52,7 @@
 					<template #icon>
 						<YoutubeIcon :size="20" />
 					</template>
-					{{ t('music_radio', 'From YouTube') }}
+					{{ t('music_radio', 'YouTube') }}
 				</NcButton>
 
 				<NcButton
@@ -51,21 +65,6 @@
 					</template>
 					{{ t('music_radio', 'Share') }}
 				</NcButton>
-
-				<NcActions v-if="canManage || channel.isOwner">
-					<NcActionButton v-if="canManage" @click="showSettings = true">
-						<template #icon>
-							<PencilIcon :size="20" />
-						</template>
-						{{ t('music_radio', 'Channel settings') }}
-					</NcActionButton>
-					<NcActionButton v-if="channel.isOwner" @click="confirmDelete">
-						<template #icon>
-							<DeleteIcon :size="20" />
-						</template>
-						{{ t('music_radio', 'Delete channel') }}
-					</NcActionButton>
-				</NcActions>
 			</div>
 		</header>
 
@@ -773,7 +772,7 @@ export default {
 
 <style scoped>
 .music-radio-channel {
-	padding: 1rem 3rem 3rem;
+	padding: 3.2rem .5rem 3rem 2.2rem;
 	max-width: 60rem;
 	margin-inline: auto;
 }
@@ -813,6 +812,7 @@ export default {
 .music-radio-header__actions {
 	display: flex;
 	align-items: center;
-	gap: 0.5rem;
+	gap: 0.3rem;
+  overflow: auto;
 }
 </style>

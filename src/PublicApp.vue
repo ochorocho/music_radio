@@ -47,7 +47,7 @@
 						<template #icon>
 							<YoutubeIcon :size="20" />
 						</template>
-						{{ t('music_radio', 'From YouTube') }}
+						{{ t('music_radio', 'YouTube') }}
 					</NcButton>
 				</div>
 			</header>

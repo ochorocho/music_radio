@@ -12,6 +12,7 @@ use OCA\MusicRadio\Db\Channel;
 use OCA\MusicRadio\Db\ChannelMapper;
 use OCA\MusicRadio\Db\ImportMapper;
 use OCA\MusicRadio\Db\ShareMapper;
+use OCA\MusicRadio\Db\Track;
 use OCA\MusicRadio\Db\TrackMapper;
 use OCA\MusicRadio\Db\VoteMapper;
 use OCA\MusicRadio\Exception\MusicRadioException;
@@ -34,6 +35,7 @@ class ChannelService {
 		private VoteMapper $voteMapper,
 		private ImportMapper $importMapper,
 		private PermissionService $permissionService,
+		private BroadcastLibrary $library,
 		private Clock $clock,
 		private IDBConnection $db,
 	) {
@@ -230,6 +232,17 @@ class ChannelService {
 	 * @throws Exception
 	 */
 	public function delete(Channel $channel): void {
+		// Read before the rows go, used after they have.
+		//
+		// Prepared copies are keyed by track id, so once the rows are deleted there is
+		// nothing left to say which files belonged to this channel and they become
+		// unreclaimable — about a megabyte per minute of audio, in a directory nobody
+		// looks at. Collecting the ids first is the only chance to know.
+		$trackIds = array_map(
+			static fn (Track $track): int => (int)$track->getId(),
+			$this->trackMapper->findAllForChannel($channel->getId()),
+		);
+
 		$this->db->beginTransaction();
 		try {
 			$this->trackMapper->deleteAllForChannel($channel->getId());
@@ -246,6 +259,13 @@ class ChannelService {
 		} catch (\Throwable $e) {
 			$this->db->rollBack();
 			throw $e;
+		}
+
+		// Only once the transaction has committed. A rollback would put every track back,
+		// and files deleted on the way would not come with them — the channel would return
+		// with its audio silently unprepared.
+		foreach ($trackIds as $trackId) {
+			$this->library->forget($trackId);
 		}
 	}
 
