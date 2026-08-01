@@ -22,6 +22,7 @@ use OCA\MusicRadio\Service\ImportReaper;
 use OCA\MusicRadio\Service\ListenerPresence;
 use OCA\MusicRadio\Service\PermissionService;
 use OCA\MusicRadio\Service\PlaybackService;
+use OCA\MusicRadio\Service\ProgrammeStreamService;
 use OCA\MusicRadio\Service\ShareService;
 use OCA\MusicRadio\Service\TrackService;
 use OCA\MusicRadio\Service\UploadService;
@@ -64,6 +65,7 @@ class PublicApiController extends PublicShareController {
 		private TrackService $trackService,
 		private PlaybackService $playbackService,
 		private AudioStreamService $audioStreamService,
+		private ProgrammeStreamService $programmeStreamService,
 		private UploadService $uploadService,
 		private PermissionService $permissionService,
 		private ListenerPresence $listenerPresence,
@@ -263,6 +265,35 @@ class PublicApiController extends PublicShareController {
 				&& $this->share()?->getAllowImport() === true
 				&& $this->importService->availability()->available,
 		]);
+	}
+
+	/**
+	 * A stretch of the programme for an anonymous listener.
+	 *
+	 * The anonymous twin of StreamController::programme, and the thing a link visitor
+	 * actually plays. See there for why a span of the programme rather than one track: on
+	 * a locked iPhone nothing of ours runs when a track ends, so the audio has to already
+	 * contain what comes next.
+	 *
+	 * Not rate-limited, for the same reason the per-track stream below is not — this is a
+	 * media element fetching audio, and a limit here surfaces as playback stopping.
+	 *
+	 * @param int $from position in the programme, in milliseconds
+	 */
+	#[PublicPage]
+	#[NoCSRFRequired]
+	public function programme(int $from = 0): Response {
+		$channel = $this->channel();
+		if ($channel === null) {
+			return new DataResponse(['error' => 'Not found'], Http::STATUS_NOT_FOUND);
+		}
+
+		$stream = $this->programmeStreamService->stream($channel, $from);
+		if ($stream === null) {
+			return new DataResponse(['error' => 'Nothing to broadcast'], Http::STATUS_NOT_FOUND);
+		}
+
+		return $stream;
 	}
 
 	/**

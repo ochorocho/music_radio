@@ -6,13 +6,27 @@
  *
  * The shape of it:
  *
- *  - The server says which track is playing and *when that track started*, on its clock.
+ *  - The server says where in the programme the channel is, on its clock.
  *  - This client measures how far its own clock is from the server's.
  *  - A local tick then derives the position continuously, without asking again.
  *
  * Polling therefore only has to notice *changes* — someone skipping, pausing, editing
  * the playlist. Track progression never waits on the network, which is what makes a ten
  * second poll interval perfectly adequate for a radio station.
+ *
+ * What the element is given is a *segment of the programme*, not a track: half an hour of
+ * audio that runs across every track boundary inside it. That is the whole reason this
+ * file looks the way it does. The previous design loaded one track and swapped to the next
+ * when the first ended, which is fine until an iPhone locks its screen — iOS suspends page
+ * timers, so at the moment the swap is due there is no JavaScript running to do it, and the
+ * music simply stops. Audio the element is *already holding* keeps playing regardless, so
+ * handing it the programme rather than a track is what makes a pocketed phone play on.
+ *
+ * The cost is stated rather than hidden: playback lasts as long as the buffer. When the
+ * segment runs out on a locked phone there is still nothing awake to fetch another, so it
+ * stops there — about half an hour in. Fixing *that* needs a stream paced at playback
+ * speed, which holds a PHP worker per listener against a pool of eight, and is a worse
+ * trade than the one taken here.
  */
 import axios from '@nextcloud/axios'
 import { showError } from '@nextcloud/dialogs'
@@ -20,37 +34,27 @@ import { showError } from '@nextcloud/dialogs'
 import { ServerClock } from '../utils/serverClock.js'
 import { clientId } from '../utils/clientId.js'
 import { playerStore } from '../utils/playerStore.js'
-import { controlUrl, playbackSettingsUrl, stateUrl, streamUrl } from '../utils/api.js'
+import { controlUrl, playbackSettingsUrl, programmeUrl, stateUrl } from '../utils/api.js'
 import {
 	CLOCK_BURST,
 	CLOCK_BURST_SPACING_MS,
 	CLOCK_REFRESH_MS,
-	PRELOAD_LEAD_MS,
+	RECONNECT_MS,
 	RESEEK_MS,
+	SEGMENT_RELOAD_MS,
 	STALL_RECOVERY_MS,
 	TICK_MS,
 	WATCH_CLOCK_BURST,
 } from '../utils/syncConstants.js'
 
 /**
- * Whether this is an iOS device, including an iPad reporting itself as a Mac.
+ * Feature-detection for iOS is gone along with the second element.
  *
- * Two things this app does are wrong on iOS specifically, and both are silent rather than
- * an error, so they can only be avoided by asking:
- *
- *  - `preload` is ignored for `<audio>`, so the second element never actually buffers the
- *    next track — the work is done and nothing comes of it;
- *  - the audio session is exclusive, so telling that second element to load can interrupt
- *    the one currently making sound.
- *
- * iPadOS reports a desktop Safari user agent, which is why the touch-point test is there:
- * a real Mac reports `maxTouchPoints` of 0.
+ * It existed because Safari ignores `preload` on `<audio>` and holds an exclusive audio
+ * session, so priming a second element did no buffering and could interrupt the one making
+ * sound. With one element playing a continuous programme there is nothing to prime, and the
+ * platform no longer has to be asked about.
  */
-const IS_IOS = typeof navigator !== 'undefined' && (
-	/iP(hone|ad|od)/.test(navigator.platform || '')
-	|| /iP(hone|ad|od)/.test(navigator.userAgent || '')
-	|| (/Mac/.test(navigator.userAgent || '') && (navigator.maxTouchPoints || 0) > 1)
-)
 
 /**
  * A valid, empty WAV.
@@ -121,7 +125,25 @@ export default {
 			 */
 			boundaries: 0,
 			playRefusals: 0,
+			/**
+			 * Programme segments fetched.
+			 *
+			 * The number that says whether the buffered-programme design is doing its job. A
+			 * healthy listener collects roughly two an hour; one climbing steadily means
+			 * something keeps knocking the element out of the segment it holds, which is the
+			 * expensive failure and the one worth seeing from a phone.
+			 */
+			segmentLoads: 0,
 			playRetries: 0,
+			/**
+			 * True between losing contact with the server and getting it back.
+			 *
+			 * Drives the retry cadence and the status line. Reactive because both of those
+			 * are rendered — a listener who can see "reconnecting…" knows the silence is
+			 * the network rather than the channel having stopped.
+			 */
+			connectionLost: false,
+			reconnects: 0,
 			/**
 			 * Seconds of audio downloaded beyond the play position.
 			 *
@@ -166,12 +188,12 @@ export default {
 		this.pollTimer = null
 		this.tickTimer = null
 		this.clockTimer = null
-		this.audioA = null
-		this.audioB = null
 		this.activeAudio = null
-		this.idleAudio = null
-		this.preloadedTrackId = null
 		this.pendingSeek = false
+		// Programme position the loaded segment begins at, so the element's own
+		// currentTime can be read back as a position in the programme. Null when nothing
+		// is loaded.
+		this.segmentStartMs = null
 		// performance.now() at which the active element last ran out of data, or 0 when it
 		// has not. Everything about stall handling hangs off this one value.
 		this.stalledSince = 0
@@ -197,12 +219,12 @@ export default {
 				return
 			}
 
-			this.ensureAudioElements()
+			this.ensureAudioElement()
 
-			// Unlock both elements inside the gesture. The second one will not be touched
-			// until the first track ends, by which point the gesture is long gone and
-			// Safari would refuse to play it — so it is primed now.
-			await Promise.all([this.unlock(this.audioA), this.unlock(this.audioB)])
+			// One element, unlocked inside the gesture. There used to be a second one primed
+			// here for the next track; a segment carries its own track changes, so there is
+			// no second element and nothing to prime.
+			await this.unlock(this.activeAudio)
 
 			this.tunedIn = true
 
@@ -219,27 +241,22 @@ export default {
 			this.applyMute()
 		},
 
-		/** Applied to both elements, so a track change cannot un-silence things. */
 		applyMute() {
-			for (const audio of [this.audioA, this.audioB]) {
-				if (audio) {
-					audio.muted = this.muted
-				}
+			if (this.activeAudio) {
+				this.activeAudio.muted = this.muted
 			}
 		},
 
 		tuneOut() {
 			this.tunedIn = false
 			this.stopTimers()
-			for (const audio of [this.audioA, this.audioB]) {
-				if (audio) {
-					audio.pause()
-					audio.removeAttribute('src')
-					audio.load()
-				}
+			if (this.activeAudio) {
+				this.activeAudio.pause()
+				this.activeAudio.removeAttribute('src')
+				this.activeAudio.load()
 			}
 			this.localTrack = null
-			this.preloadedTrackId = null
+			this.segmentStartMs = null
 			this.advancedAtServerMs = 0
 			this.stalledSince = 0
 			this.stalled = false
@@ -251,47 +268,54 @@ export default {
 			this.stopWatching()
 			this.stopTimers()
 			this.tunedIn = false
-			for (const audio of [this.audioA, this.audioB]) {
-				audio?.pause()
-			}
-			this.removeAudioElements()
+			this.activeAudio?.pause()
+			this.removeAudioElement()
 		},
 
-		ensureAudioElements() {
-			if (this.audioA) {
+		/**
+		 * One element, for the whole session.
+		 *
+		 * There were two, ping-ponged, so that a track boundary did not cost the few hundred
+		 * milliseconds it takes to load. A segment contains its boundaries, so the swap has
+		 * nothing left to do — and the pair brought real problems with it: on iOS, priming
+		 * the idle one could interrupt the one making sound, and the play() issued against a
+		 * freshly-assigned src raced its own load.
+		 */
+		ensureAudioElement() {
+			if (this.activeAudio) {
 				return
 			}
 
-			// Two elements, ping-ponged. Creating one at a track boundary costs a few
-			// hundred milliseconds of silence while it loads — with a second element
-			// already buffered, the switch is immediate.
-			this.audioA = new Audio()
-			this.audioB = new Audio()
-			for (const audio of [this.audioA, this.audioB]) {
-				this.watchForStalls(audio)
-				audio.preload = 'auto'
-				// Resample rather than time-stretch when the rate is nudged.
-				//
-				// Browsers preserve pitch by default, which means every rate change engages
-				// a time-stretcher — expensive on a phone and audibly grainy. The correction
-				// here never goes past ±5 %, which as a pure resample is a pitch shift of
-				// well under a semitone: on music, next to nothing. The artefacts it
-				// replaces were not.
-				//
-				// `webkitPreservesPitch` is still what older Safari reads; assigning both is
-				// how one line covers the browsers this actually matters on.
-				audio.preservesPitch = false
-				audio.webkitPreservesPitch = false
-				audio.hidden = true
-				audio.dataset.musicRadioPlayer = 'true'
-				// Attached rather than left detached: a detached element still plays, but
-				// nothing can see it — not the browser's own media controls, not an
-				// accessibility tool, and not a test asserting that only one thing is
-				// making sound.
-				document.body.appendChild(audio)
+			const audio = new Audio()
+			this.watchForStalls(audio)
+			// The element must keep reading ahead of the play position without being asked:
+			// everything downloaded before a phone locks is everything it gets to play.
+			audio.preload = 'auto'
+			audio.hidden = true
+			audio.dataset.musicRadioPlayer = 'true'
+			// Attached rather than left detached: a detached element still plays, but
+			// nothing can see it — not the browser's own media controls, not an
+			// accessibility tool, and not a test asserting that only one thing is
+			// making sound.
+			document.body.appendChild(audio)
+
+			// The end of a segment is the one moment this design still needs JavaScript.
+			// Awake, it fetches the next half hour and carries on; asleep, this is where a
+			// locked phone falls silent, which is the limit the whole approach accepts —
+			// unless the body turned out to be a whole lap, in which case it never ends.
+			audio.addEventListener('ended', () => this.loadNextSegment())
+			// Re-asked as the browser learns more, not decided once.
+			//
+			// The body carries no duration header — a Xing frame would have to be written
+			// before the length is known, and this length depends on where the listener
+			// joined — so the element estimates from the first frames it sees and refines
+			// the answer as it downloads. On `loadedmetadata` that estimate can be out by a
+			// quarter, which is precisely the moment the old code committed to it.
+			for (const event of ['loadedmetadata', 'durationchange', 'canplaythrough']) {
+				audio.addEventListener(event, () => this.applyLoopMode())
 			}
-			this.activeAudio = this.audioA
-			this.idleAudio = this.audioB
+
+			this.activeAudio = audio
 		},
 
 		/**
@@ -362,11 +386,9 @@ export default {
 			return false
 		},
 
-		removeAudioElements() {
-			for (const audio of [this.audioA, this.audioB]) {
-				audio?.remove()
-			}
-			this.audioA = this.audioB = this.activeAudio = this.idleAudio = null
+		removeAudioElement() {
+			this.activeAudio?.remove()
+			this.activeAudio = null
 		},
 
 		/**
@@ -392,7 +414,6 @@ export default {
 			} finally {
 				audio.muted = false
 				audio.removeAttribute('src')
-				delete audio.dataset.trackId
 				audio.load()
 			}
 		},
@@ -465,9 +486,21 @@ export default {
 
 		scheduleNextPoll() {
 			clearTimeout(this.pollTimer)
-			const base = this.syncState?.pollAfterMs ?? 10_000
-			// Jitter so a room full of listeners does not poll in lockstep.
-			const delay = base * (0.85 + Math.random() * 0.3)
+
+			// While contact is lost, try again quickly and keep trying. The ordinary
+			// interval backs off to ten seconds on a quiet channel, which is the wrong
+			// answer for somebody whose connection dropped for two of them: the timeline
+			// keeps running locally, so every second spent not noticing the server is back
+			// is a second of being further out of step with everyone else.
+			//
+			// There is no attempt limit. A radio left playing in another tab should pick
+			// itself up whenever the network returns, not give up after a while and sit
+			// silent — and the cost of asking is one small request every two seconds.
+			const delay = this.connectionLost
+				? RECONNECT_MS
+				// Jitter so a room full of listeners does not poll in lockstep.
+				: (this.syncState?.pollAfterMs ?? 10_000) * (0.85 + Math.random() * 0.3)
+
 			this.pollTimer = setTimeout(async () => {
 				await this.refreshState()
 				this.scheduleNextPoll()
@@ -500,8 +533,25 @@ export default {
 				})
 				this.applyState(data, options)
 				this.syncError = null
+
+				if (this.connectionLost) {
+					// Back. The position has moved on without this listener, so put them
+					// where everyone else is rather than leaving them behind by however
+					// long the outage lasted — and start the audio again if it gave up
+					// while there was nothing to play.
+					// Nothing is done about the position here any more, and that is the
+					// point: the element is holding half an hour of programme, so an outage
+					// of a few seconds never interrupted it and it is already where it
+					// should be. Whatever the outage did cost is measured on the next tick
+					// and corrected there. Only the element being *stopped* — because it
+					// reached the end of what it had — needs anything from this branch.
+					this.connectionLost = false
+					this.reconnects++
+					this.resume()
+				}
 			} catch (error) {
-				this.syncError = t('music_radio', 'Lost contact with the channel')
+				this.connectionLost = true
+				this.syncError = t('music_radio', 'Lost contact with the channel — reconnecting…')
 			}
 		},
 
@@ -511,6 +561,22 @@ export default {
 
 			if (previous && state.playlistVersion !== previous.playlistVersion) {
 				this.$emit('playlist-changed')
+
+				// The one thing distance cannot see.
+				//
+				// Everywhere else the decision to fetch a fresh segment is how far the
+				// element is from the broadcast, which covers skips, seeks and a page that
+				// was asleep. It cannot cover this: a segment's positions are positions in
+				// the programme *as it was when the segment was fetched*, and an edit
+				// rewrites that map. Disable a track and everything after it slides back by
+				// its length — the element is not out of position, its idea of what
+				// position means is stale, and the audio it holds from that point on is
+				// simply the wrong music. Measuring agrees with itself all the way down.
+				//
+				// So the segment is discarded rather than corrected. This bumps on adding,
+				// removing, disabling and reordering, and on the vote that reorders, which
+				// is every way the running order can change.
+				this.segmentStartMs = null
 			}
 
 			// Somebody voted, or a track's votes were spent because it played. The counts
@@ -540,8 +606,6 @@ export default {
 				return
 			}
 
-			const trackChanged = this.localTrack?.trackId !== state.current?.trackId
-
 			if (!state.current || state.status === 'paused' || state.status === 'ended' || state.status === 'empty') {
 				this.localTrack = state.current
 					? { ...state.current }
@@ -549,37 +613,73 @@ export default {
 				if (state.status !== 'playing') {
 					this.activeAudio?.pause()
 				}
-				if (state.current) {
-					this.loadTrack(this.activeAudio, state.current)
+
+				// A paused channel is still put in the right place, so that pressing play
+				// starts sound — at the right moment of the programme — rather than starting
+				// a download. This is also where a seek made while paused is applied: the
+				// tick does not run on a stopped channel, so nothing else would apply it
+				// until after playback had resumed at the old position.
+				if (state.status === 'paused') {
+					this.alignSegment()
 				}
 				return
 			}
 
 			this.localTrack = { ...state.current }
 
-			if (trackChanged || options.force) {
-				this.loadTrack(this.activeAudio, state.current)
-				this.hardSeek(this.targetOffsetMs())
-				this.resume()
+			// What decides whether a fresh segment is needed is *how far out* this element
+			// is, never which event brought the state in.
+			//
+			// The old code reloaded on a track change or a forced apply, which is both too
+			// often and not often enough: a track change needs nothing now — the segment
+			// contains it — while a skip, a seek, or a playlist edit that shifts every
+			// position afterwards can arrive with no track change at all. Measuring the gap
+			// covers all of them without enumerating any of them.
+			this.alignSegment()
+			this.resume()
+		},
+
+		/**
+		 * Put the element where the broadcast is, as cheaply as that can be done.
+		 *
+		 * Three rungs, and everything that corrects a position climbs the same ladder:
+		 * leave it alone, seek inside the segment already downloaded, or fetch a segment
+		 * from where the listener should be. Says nothing about whether to *play* — that is
+		 * `status`, and getting the two mixed up is what once left a resumed channel silent.
+		 */
+		alignSegment() {
+			const target = this.programmeTargetMs()
+			if (target === null || !this.activeAudio) {
 				return
 			}
 
-			// Whether this element should be making sound is a property of `status`, not a
-			// consequence of the track changing — and getting that backwards is what left a
-			// resumed channel silent.
-			//
-			// The branch above only fires on a new track or a forced apply. A resume is
-			// neither: the track is the same, and the state arrives on an ordinary poll,
-			// because the instance that has the audio is not the one that pressed the
-			// button (see the note on this mixin). So nothing started the element again,
-			// and it stayed on the pause that the paused branch above had given it —
-			// indefinitely, while the rest of the UI reported a healthy broadcast.
-			if (this.activeAudio?.paused) {
-				// It froze where it was while the broadcast moved on, so put it back in
-				// step before starting.
-				this.hardSeek(this.targetOffsetMs())
-				this.resume()
+			if (this.segmentStartMs === null) {
+				this.loadSegment(target)
+				return
 			}
+
+			const elementMs = this.elementProgrammeMs()
+			if (elementMs === null) {
+				return
+			}
+
+			const diff = this.programmeDriftMs(elementMs, target)
+			this.driftMs = Math.round(diff)
+
+			// Anything short of RESEEK_MS is left alone. Nothing at all happens to the
+			// element — see the note on RESEEK_MS for why "do nothing" is the correction.
+			if (Math.abs(diff) < RESEEK_MS) {
+				return
+			}
+
+			if (Math.abs(diff) > SEGMENT_RELOAD_MS) {
+				// Too far out to be anywhere in what was downloaded — somebody skipped, or
+				// this page was asleep long enough for the programme to leave it behind.
+				this.loadSegment(target)
+				return
+			}
+
+			this.hardSeek(target)
 		},
 
 		/**
@@ -659,29 +759,177 @@ export default {
 		},
 
 		/**
-		 * @param {HTMLAudioElement} audio
-		 * @param {object} track
+		 * Hand the element half an hour of programme starting at `fromMs`.
+		 *
+		 * Every load is a gap of a few hundred milliseconds, so this is the expensive
+		 * operation in the file and everything else exists to avoid needing it. In steady
+		 * state it happens about twice an hour.
+		 *
+		 * @param {number} fromMs programme position the segment should begin at
 		 */
-		loadTrack(audio, track) {
-			if (!this.channel) {
+		loadSegment(fromMs) {
+			const audio = this.activeAudio
+			if (!this.channel || !audio) {
 				return
 			}
-			const url = streamUrl(this.channel.id, track.trackId, this.shareToken)
-			if (audio.dataset.trackId === String(track.trackId)) {
-				return
-			}
-			audio.dataset.trackId = String(track.trackId)
-			audio.src = url
+
+			this.segmentStartMs = Math.max(0, Math.round(fromMs))
+			this.segmentLoads++
+			// A new source, so any outstanding stall belonged to the old one.
+			this.stalledSince = 0
+			this.stalled = false
+
+			// Off until the new body's length has been seen; applyLoopMode decides on
+			// `loadedmetadata`. Carrying the last one's answer over would loop a half-hour
+			// segment as though it were the whole programme.
+			audio.loop = false
+			audio.src = programmeUrl(this.channel.id, this.segmentStartMs, this.shareToken)
 			audio.muted = this.muted
-			if (audio === this.activeAudio) {
-				// New source, so any outstanding stall belonged to the previous one.
-				this.stalledSince = 0
-				this.stalled = false
-			}
 			audio.load()
+
+			// Assigning a source stops the element, so every load has to start it again.
+			// Doing that here rather than at each call site is what stops one of them
+			// forgetting — which is a silent failure, and was the shape of a bug that once
+			// left a resumed channel playing nothing.
+			if (this.tunedIn && this.syncState?.status === 'playing') {
+				this.resume()
+			}
+		},
+
+		/**
+		 * Let the element repeat the body for ever, when the body is the whole programme.
+		 *
+		 * For a channel short enough to be sent whole this is the best outcome available:
+		 * no request is ever needed again, so the buffer ceiling that otherwise stops a
+		 * locked phone after half an hour does not exist. `loop` is the browser's own, and
+		 * costs no JavaScript at the seam — which is the entire test any of this has to
+		 * pass.
+		 *
+		 * The server's `programmeLoops` is an offer, not an instruction, and the length
+		 * check is what makes it safe to take. A lap the server could not finish — a file
+		 * missing, a copy not prepared yet — comes back short, and looping *that* would
+		 * repeat a fragment of the programme while claiming to be the programme, silently
+		 * and for as long as the tab stayed open. A partial lap is missing at least one
+		 * whole track, so it cannot pass a check this tight.
+		 *
+		 * The tolerance is per-track because the two lengths are measured differently: the
+		 * body is the prepared copies' actual bytes, `totalDurationMs` is what was read from
+		 * the originals, and re-encoding shifts each one by a frame or so.
+		 */
+		applyLoopMode() {
+			const audio = this.activeAudio
+			if (!audio) {
+				return
+			}
+
+			const total = this.syncState?.totalDurationMs ?? 0
+			const bodyMs = (audio.duration || 0) * 1000
+			const slackMs = 1000 + 100 * (this.syncState?.playableCount ?? 0)
+
+			audio.loop = this.syncState?.programmeLoops === true
+				&& total > 0
+				&& Math.abs(bodyMs - total) < slackMs
+		},
+
+		/**
+		 * Carry on where the last segment ran out.
+		 *
+		 * Fired from the element's own `ended`, which is the only place this design still
+		 * depends on JavaScript running at a particular moment. On a phone with the screen
+		 * locked it does not run, and that is where the music stops — half an hour in,
+		 * rather than at the end of the first song, which is the trade the whole approach
+		 * was for.
+		 *
+		 * The clock decides where to resume rather than "the end of the last segment": if
+		 * this page was throttled while the segment played out, those are not the same
+		 * position, and only one of them is where everybody else is.
+		 */
+		loadNextSegment() {
+			if (!this.tunedIn || this.syncState?.status !== 'playing') {
+				return
+			}
+
+			const target = this.programmeTargetMs()
+			if (target === null) {
+				return
+			}
+
+			this.loadSegment(target)
 		},
 
 		// ------------------------------------------------------------- the clock
+
+		/**
+		 * Where in the *programme* this client should be, right now.
+		 *
+		 * The server reports a programme position and the instant it was true; this adds
+		 * however long ago that was, measured on the shared clock. It is the one number the
+		 * audio side works in — which track that lands in is the UI's business, and derived
+		 * separately.
+		 *
+		 * Null when there is nothing to be positioned in: an empty playlist, or a state
+		 * that has not arrived yet.
+		 *
+		 * @return {number|null}
+		 */
+		programmeTargetMs() {
+			const state = this.syncState
+			if (!state || typeof state.programmePositionMs !== 'number') {
+				return null
+			}
+
+			if (state.status === 'paused') {
+				return state.programmePositionMs
+			}
+
+			return state.programmePositionMs + (this.clock.now() - state.serverTimeMs)
+		},
+
+		/**
+		 * Where in the programme the element has actually got to.
+		 *
+		 * `currentTime` is an offset into the segment, and the segment began at a known
+		 * programme position — so the two together are a position in the programme, which
+		 * is what makes a comparison against the clock meaningful.
+		 *
+		 * @return {number|null}
+		 */
+		elementProgrammeMs() {
+			if (this.segmentStartMs === null || !this.activeAudio) {
+				return null
+			}
+
+			return this.segmentStartMs + this.activeAudio.currentTime * 1000
+		},
+
+		/**
+		 * How far behind the broadcast the element is, signed, taking the loop into account.
+		 *
+		 * Both positions run forward for ever, but the server's is wrapped into the length
+		 * of the programme, so a listener who crosses the wrap would otherwise appear to be
+		 * a whole programme ahead. Taking the shorter way round the loop is what makes the
+		 * comparison survive that — the same reasoning as `TimelineService::wrap`, one step
+		 * further because this answer is signed.
+		 *
+		 * On a channel that does not loop the shorter way round is still taken; a genuine
+		 * error of more than half a programme would be misread, but nothing that far out is
+		 * recoverable by seeking anyway, and it reloads either way.
+		 *
+		 * @param {number} elementMs
+		 * @param {number} targetMs
+		 * @return {number} positive when the element is behind
+		 */
+		programmeDriftMs(elementMs, targetMs) {
+			const total = this.syncState?.totalDurationMs ?? 0
+			const diff = targetMs - elementMs
+			if (total <= 0) {
+				return diff
+			}
+
+			const wrapped = ((diff % total) + total) % total
+
+			return wrapped > total / 2 ? wrapped - total : wrapped
+		},
 
 		/** How far into the current track the broadcast is, right now. */
 		/**
@@ -737,18 +985,16 @@ export default {
 				return
 			}
 
-			const target = this.targetOffsetMs()
-
-			// Past the end of this track: move on immediately rather than waiting for the
-			// next poll, then confirm against the server.
-			if (target >= this.localTrack.durationMs) {
+			// Past the end of this track. Nothing happens to the audio — the segment
+			// already contains the next track and crossed into it on its own — but the
+			// UI's idea of what is on air has to move.
+			if (this.targetOffsetMs() >= this.localTrack.durationMs) {
 				this.advanceLocally()
 				return
 			}
 
 			this.sampleBuffer()
-			this.preloadNextIfDue(target)
-			this.correctDrift(target)
+			this.correctDrift()
 		},
 
 		/**
@@ -781,12 +1027,18 @@ export default {
 		},
 
 		/**
-		 * Cross a track boundary without waiting for the network.
+		 * Cross a track boundary in the UI.
 		 *
-		 * The server is the authority, but a poll may be seconds away and silence in the
-		 * meantime would be obvious. The next track and its length are already known, so
-		 * the switch happens now and the state is refreshed straight after to pick up the
-		 * track after that.
+		 * Audio no longer has any part in this. The element is playing a segment that
+		 * already contains the next track, so it crosses the boundary by itself, with no
+		 * load, no seek and no play() — which is precisely why a locked phone keeps
+		 * playing, and why the swap, the preload and the retry that used to live here are
+		 * all gone.
+		 *
+		 * What is left is bookkeeping: the server is authority for what is on air, but a
+		 * poll may be seconds away and a title that lags the audio by seconds looks broken.
+		 * The next track and its length are already known, so the display moves now and the
+		 * state is refreshed straight after to pick up the track after that.
 		 */
 		advanceLocally() {
 			const next = this.syncState?.next
@@ -797,18 +1049,6 @@ export default {
 
 			const startedAtMs = this.localTrack.startedAtMs + this.localTrack.durationMs
 
-			// Swap to the element that has been buffering this track.
-			if (this.idleAudio?.dataset.trackId === String(next.trackId)) {
-				const previous = this.activeAudio
-				this.activeAudio = this.idleAudio
-				this.idleAudio = previous
-				this.idleAudio.pause()
-				// The flag describes one element. Carrying the old one's stall across would
-				// suppress correction on a element that is perfectly healthy.
-				this.stalledSince = 0
-				this.stalled = false
-			}
-
 			this.localTrack = {
 				trackId: next.trackId,
 				durationMs: next.durationMs,
@@ -817,69 +1057,26 @@ export default {
 				startedAtMs,
 				offsetMs: 0,
 			}
-			this.preloadedTrackId = null
 			this.advancedAtServerMs = startedAtMs
 			this.boundaries++
 
-			this.loadTrack(this.activeAudio, this.localTrack)
-			this.hardSeek(this.targetOffsetMs())
-			this.resume()
-
-			// Re-derive from the server rather than trusting the local step.
-			//
-			// The optimistic advance above only covers the round trip; it steps exactly
-			// one track, which is not enough if this page's timers were throttled — a
-			// backgrounded tab gets its intervals cut to roughly one a second, so it can
-			// overrun a boundary by seconds and end up several tracks behind. Forcing the
-			// refresh makes the server the authority at every boundary, which is the one
-			// place accumulated error would otherwise become audible.
+			// Re-derive from the server rather than trusting the local step, which advances
+			// exactly one track: a page whose timers were throttled can overrun a boundary
+			// by seconds and be several tracks out. Cheap, and it keeps the display honest
+			// even though the sound no longer depends on it.
 			this.refreshState({ force: true })
-		},
-
-		/**
-		 * @param {number} target current position within the track, in ms
-		 */
-		/**
-		 * Get the next track into the idle element before it is needed.
-		 *
-		 * Skipped entirely on iOS, where it is worse than useless: Safari ignores `preload`
-		 * for `<audio>`, so nothing is actually buffered — and because the audio session is
-		 * exclusive, telling a second element to load can interrupt the one currently
-		 * playing. The cost of not doing it is a short gap at each track change; the cost
-		 * of doing it was the music stopping.
-		 *
-		 * @param {number} target current position in the track, in ms
-		 */
-		preloadNextIfDue(target) {
-			if (IS_IOS) {
-				return
-			}
-
-			const next = this.syncState?.next
-			if (!next || !this.idleAudio) {
-				return
-			}
-			if (this.preloadedTrackId === next.trackId) {
-				return
-			}
-			if (this.localTrack.durationMs - target > PRELOAD_LEAD_MS) {
-				return
-			}
-
-			this.loadTrack(this.idleAudio, next)
-			this.preloadedTrackId = next.trackId
 		},
 
 		/**
 		 * Pull this element back towards the broadcast.
 		 *
-		 * Small errors are absorbed by running fractionally fast or slow, which is
-		 * inaudible. Large ones are seeked, which is not — so the element is muted across
-		 * the seek to avoid the click.
-		 *
-		 * @param {number} target
+		 * Three outcomes, cheapest first: leave it alone, seek inside the segment it is
+		 * already holding, or give up on that segment and fetch one from where the listener
+		 * should be. Almost everything lands in the first — the element plays a linear
+		 * stream from a known position and has nothing to drift against except its own
+		 * clock.
 		 */
-		correctDrift(target) {
+		correctDrift() {
 			const audio = this.activeAudio
 			// A paused element is deliberately not corrected. While one is stopped the
 			// broadcast keeps moving, so the drift grows without limit and every correction
@@ -901,31 +1098,50 @@ export default {
 				return
 			}
 
-			const actual = audio.currentTime * 1000
-			const diff = target - actual
-			this.driftMs = Math.round(diff)
-
-			// Anything short of RESEEK_MS is left alone. Nothing at all happens to the
-			// element — see the note on RESEEK_MS for why "do nothing" is the correction.
-			if (Math.abs(diff) < RESEEK_MS) {
-				return
-			}
-
-			this.hardSeek(target)
+			// The correction itself is the same one a state response applies, so it lives in
+			// one place. All this method adds is *when* it is safe to make.
+			this.alignSegment()
 		},
 
-		hardSeek(targetMs) {
+		/**
+		 * Move the element to a programme position inside the segment it holds.
+		 *
+		 * @param {number} programmeMs
+		 */
+		hardSeek(programmeMs) {
 			const audio = this.activeAudio
-			if (!audio) {
+			if (!audio || this.segmentStartMs === null) {
 				return
 			}
 
-			// Never seek into audio that has not arrived yet while the element is already
-			// struggling. Assigning currentTime cancels whatever was downloading and asks
-			// for a fresh range starting somewhere else — which is the worst possible
-			// response to "the network is slow", and turns one stall into a series of them.
-			// The element is already loading the right region; let it finish.
-			if (this.stalledSince !== 0 && !this.isBuffered(audio, targetMs)) {
+			let withinMs = programmeMs - this.segmentStartMs
+
+			// A looping element has been round more times than anyone counted, so the
+			// distance from where the body started is only meaningful modulo the body.
+			if (audio.loop && audio.duration > 0) {
+				const bodyMs = audio.duration * 1000
+				withinMs = ((withinMs % bodyMs) + bodyMs) % bodyMs
+			}
+
+			if (withinMs < 0 || (audio.duration > 0 && withinMs > audio.duration * 1000)) {
+				// Outside the segment, so no seek can reach it.
+				this.loadSegment(programmeMs)
+				return
+			}
+
+			// Only ever into audio that has already arrived.
+			//
+			// The segment is served with `Accept-Ranges: none` — a programme position is not
+			// a byte offset into a file, and a stream computed from a moving position cannot
+			// honestly answer a range request. So there is nothing for the browser to fetch
+			// a seek with: it either lands in the buffer or it does not land at all.
+			//
+			// Waiting is also the right answer regardless of ranges. Seeking away cancels
+			// whatever was downloading, which is the worst possible response to a slow
+			// connection and turns one stall into a series of them. The correction is not
+			// lost — the position is measured again on the next tick, by which time the data
+			// is usually there.
+			if (!this.isBuffered(audio, withinMs)) {
 				return
 			}
 
@@ -945,7 +1161,7 @@ export default {
 			setTimeout(onSeeked, 1000)
 
 			try {
-				audio.currentTime = Math.max(0, targetMs) / 1000
+				audio.currentTime = Math.max(0, withinMs) / 1000
 			} catch (error) {
 				this.pendingSeek = false
 				audio.muted = this.muted

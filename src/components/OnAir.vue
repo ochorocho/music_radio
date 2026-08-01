@@ -510,11 +510,21 @@ export default {
 				{ label: t('music_radio', 'Speed'), value: (sync.playbackRate ?? 1).toFixed(3) },
 				{ label: t('music_radio', 'Re-seeks'), value: `${sync.hardSeeks ?? 0}×` },
 				{ label: t('music_radio', 'Track changes'), value: `${sync.boundaries ?? 0}×` },
+				// Roughly two an hour on a healthy listener. Climbing faster means something
+				// keeps knocking this browser out of the half hour it downloaded, which is
+				// the expensive way to be wrong and the one worth seeing from a phone.
+				{ label: t('music_radio', 'Programme loads'), value: `${sync.segmentLoads ?? 0}×` },
 				{
 					label: t('music_radio', 'Playback refused'),
 					value: `${sync.playRefusals ?? 0}× (${sync.playRetries ?? 0} retried)`,
 				},
 				{ label: t('music_radio', 'Clock round trip'), value: `${Math.round(sync.clockRttMs ?? 0)} ms` },
+				{
+					label: t('music_radio', 'Connection'),
+					value: sync.connectionLost
+						? t('music_radio', 'lost — retrying')
+						: t('music_radio', 'ok ({count} reconnects)', { count: sync.reconnects ?? 0 }),
+				},
 			]
 		},
 

@@ -380,3 +380,182 @@ test('the playback rate is never touched while a track plays', async ({ page, db
  * nearest stand-in — it shares the media stack — and the diagnostic panel this test reads
  * is what a real phone can be asked to report.
  */
+
+/**
+ * A dropped connection is recovered from, not given up on.
+ *
+ * The ordinary poll backs off to ten seconds on a quiet channel, which is the wrong
+ * cadence for somebody whose network went away for two of them: the timeline keeps running
+ * locally, so every second spent not noticing the server is back is a second further out
+ * of step. While contact is lost the player retries every two seconds, indefinitely — a
+ * radio left playing in another tab should pick itself up whenever the network returns.
+ *
+ * The outage is made by failing the state endpoint rather than by going offline, so the
+ * page, its assets and the audio stream are untouched and only the thing under test breaks.
+ */
+test('a lost connection is retried every couple of seconds until it comes back', async ({ page, db }) => {
+	test.setTimeout(120_000)
+
+	const title = `Reconnect ${Math.random().toString(36).slice(2, 8)}`
+	const channelId = await setUpChannel(page, db, title)
+
+	try {
+		await openChannel(page, title)
+		await tuneIn(page)
+
+		const statusLine = page.getByTestId('sync-status')
+		await expect(statusLine).not.toContainText(/reconnect/i)
+
+		// Cut it.
+		let attempts = 0
+		await page.route('**/api/v1/channels/*/state*', async (route) => {
+			attempts++
+			await route.abort('connectionfailed')
+		})
+
+		await expect(statusLine).toContainText(/reconnect/i, { timeout: 20_000 })
+
+		// Retried repeatedly while down, rather than once or not at all. Six seconds at a
+		// two-second cadence is at least two further attempts; asserted loosely because
+		// the exact count depends on where in the cycle the outage began.
+		const afterFirstFailure = attempts
+		await page.waitForTimeout(6000)
+		expect(attempts - afterFirstFailure,
+			'must keep retrying while the connection is down').toBeGreaterThanOrEqual(2)
+
+		// Restore it.
+		await page.unroute('**/api/v1/channels/*/state*')
+
+		// And it comes back on its own, without anything being pressed.
+		await expect(statusLine).not.toContainText(/reconnect/i, { timeout: 20_000 })
+		await expect
+			.poll(async () => (await readSync(page)).status, { timeout: 20_000 })
+			.toBe('playing')
+	} finally {
+		await api(page, 'DELETE', `${API}/channels/${channelId}`)
+	}
+})
+
+/**
+ * The bug that started all of this, as a test.
+ *
+ * On an iPhone with the screen locked, playback stopped at the end of a song and never
+ * resumed. iOS suspends a page's timers when the screen locks, so at the moment the next
+ * track was due, nothing of ours was running to load it — and no harness caught it because
+ * every harness runs in the foreground with timers ticking.
+ *
+ * So the timers are taken away here. Everything scheduled is cancelled and nothing new can
+ * be scheduled, which is as close as a browser gets to a phone in a pocket: no tick, no
+ * poll, no boundary handler. The `<audio>` element keeps playing, because media playback
+ * is not driven by page timers — and that is the whole mechanism. If the element is holding
+ * a segment of the programme it crosses into the next track on its own; if it were holding
+ * one track, as it used to be, it would stop dead at the end of it.
+ *
+ * `page.clock` would be the tidier instrument, but it fakes `Date.now()` as well, and this
+ * needs real time to keep passing for the audio while the page's schedule stops.
+ */
+async function freezeTimers(page: Page) {
+	await page.evaluate(() => {
+		const w = window as any
+		const highest = w.setTimeout(() => {}, 0) as number
+		for (let id = 0; id <= highest; id++) {
+			w.clearTimeout(id)
+			w.clearInterval(id)
+		}
+		w.setTimeout = () => 0
+		w.setInterval = () => 0
+		w.requestAnimationFrame = () => 0
+	})
+}
+
+async function readElement(page: Page) {
+	return await page.evaluate(() => {
+		const audio = document.querySelector('audio[data-music-radio-player]') as HTMLAudioElement | null
+		if (!audio) {
+			return null
+		}
+		return {
+			currentTime: audio.currentTime,
+			duration: audio.duration,
+			paused: audio.paused,
+			ended: audio.ended,
+			loop: audio.loop,
+		}
+	})
+}
+
+test('the element is given the whole programme, and loops it itself', async ({ page, db }) => {
+	const title = 'Programme Source Channel'
+	const channelId = await setUpChannel(page, db, title)
+
+	try {
+		await openChannel(page, title)
+		await tuneIn(page)
+
+		const state = await api(page, 'GET', `${API}/channels/${channelId}/state`)
+		const total = state.body.totalDurationMs as number
+		// The three fixture tones total 16s, which fits in a segment many times over — so
+		// this channel is sent once, whole, rather than repeated to fill half an hour.
+		expect(state.body.programmeLoops).toBe(true)
+
+		// Polled, not sampled: the body carries no duration header, so the element's first
+		// estimate is a guess from the opening frames and it settles as more arrives.
+		await expect
+			.poll(async () => (await readElement(page))?.loop ?? false, { timeout: 30_000, intervals: [500] })
+			.toBe(true)
+
+		const element = await readElement(page)
+		// One lap: not one track, and not half an hour of repeats.
+		expect(Math.abs(element!.duration * 1000 - total)).toBeLessThan(2000)
+	} finally {
+		await api(page, 'DELETE', `${API}/channels/${channelId}`)
+	}
+})
+
+test('playback crosses a track boundary with the page\'s timers stopped', async ({ page, db }) => {
+	const title = 'Locked Phone Channel'
+	const channelId = await setUpChannel(page, db, title)
+
+	try {
+		await openChannel(page, title)
+		await tuneIn(page)
+
+		// Wait for sound before taking the schedule away: freezing a page that has not
+		// started playing yet tests nothing.
+		await expect
+			.poll(async () => (await readElement(page))?.paused ?? true, { timeout: 30_000, intervals: [250] })
+			.toBe(false)
+
+		const before = await readElement(page)
+		expect(before).not.toBeNull()
+
+		await freezeTimers(page)
+
+		const startedAt = Date.now()
+		await page.waitForTimeout(14_000)
+		const elapsedS = (Date.now() - startedAt) / 1000
+
+		const after = await readElement(page)
+		expect(after).not.toBeNull()
+		expect(after!.paused).toBe(false)
+		expect(after!.ended).toBe(false)
+
+		// A looping element restarts at zero, so elapsed playback is measured round the
+		// body rather than by plain subtraction.
+		const bodyS = after!.duration
+		const raw = after!.currentTime - before!.currentTime
+		const playedS = after!.loop && raw < 0 ? raw + bodyS : raw
+
+		// It kept playing for the whole time, rather than stopping somewhere in the middle
+		// of it. A second of slack for the round trips either side of the wait.
+		expect(playedS).toBeGreaterThan(Math.min(elapsedS, bodyS) - 1.5)
+
+		// And that is decisively a boundary crossed. The longest fixture tone is 8s, so
+		// this much *uninterrupted* playback cannot have happened inside one track wherever
+		// it started — which is the claim, and the thing the old design could not do with
+		// the page's timers stopped.
+		expect(playedS).toBeGreaterThan(9)
+	} finally {
+		await api(page, 'DELETE', `${API}/channels/${channelId}`)
+	}
+})

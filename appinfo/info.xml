@@ -39,6 +39,7 @@ hears the same track at the same moment — the channel owner is the DJ, listene
 	<commands>
 		<command>OCA\MusicRadio\Command\YtDlpInstall</command>
 		<command>OCA\MusicRadio\Command\YtDlpStatus</command>
+		<command>OCA\MusicRadio\Command\BroadcastBuild</command>
 	</commands>
 	<!--
 	  Only the timed job belongs here. ImportYoutubeAudioJob is a QueuedJob added by the

@@ -64,8 +64,11 @@ export default {
 				stallCount: this.stallCount,
 				hardSeeks: this.hardSeeks,
 				boundaries: this.boundaries,
+				segmentLoads: this.segmentLoads,
 				playRefusals: this.playRefusals,
 				playRetries: this.playRetries,
+				connectionLost: this.connectionLost,
+				reconnects: this.reconnects,
 				playbackRate: this.activeAudio?.playbackRate ?? 1,
 			}
 		},
@@ -73,9 +76,59 @@ export default {
 		resumeRequest() {
 			return playerStore.resumeRequest
 		},
+
+		/** What the lock screen should say. Watched as one object so it updates together. */
+		mediaSessionState() {
+			return {
+				title: this.localTrack?.title ?? '',
+				artist: this.localTrack?.artist ?? '',
+				channel: this.channel?.title ?? '',
+				playing: this.tunedIn && this.isBroadcasting,
+			}
+		},
 	},
 
 	watch: {
+		/**
+		 * Tell the operating system what is playing.
+		 *
+		 * Without this a locked iPhone shows a blank card with a generic speaker icon, and
+		 * the AirPods pinch does nothing — the audio is an anonymous noise as far as iOS is
+		 * concerned. With it the lock screen names the track and the hardware controls work.
+		 *
+		 * Guarded rather than assumed: `mediaSession` is absent on older Safari and on
+		 * Firefox until recently, and a missing API here must not take the player down with
+		 * it. Everything below is decoration — nothing about playback depends on it.
+		 */
+		mediaSessionState: {
+			immediate: true,
+			deep: true,
+			handler(state) {
+				if (!('mediaSession' in navigator)) {
+					return
+				}
+
+				navigator.mediaSession.playbackState = state.playing ? 'playing' : 'paused'
+
+				if (!state.title) {
+					navigator.mediaSession.metadata = null
+					return
+				}
+
+				try {
+					navigator.mediaSession.metadata = new window.MediaMetadata({
+						title: state.title,
+						artist: state.artist || '',
+						album: state.channel || '',
+					})
+				} catch (error) {
+					// Some engines expose mediaSession without MediaMetadata. The playback
+					// state above still lands, which is the half that matters.
+				}
+			},
+		},
+
+
 		storeChannelId: {
 			immediate: true,
 			async handler(next, previous) {
@@ -123,6 +176,62 @@ export default {
 					this.resume()
 				}
 			},
+		},
+	},
+
+	mounted() {
+		this.wireMediaSessionControls()
+	},
+
+	beforeUnmount() {
+		if (!('mediaSession' in navigator)) {
+			return
+		}
+		for (const action of ['play', 'pause', 'stop']) {
+			try {
+				navigator.mediaSession.setActionHandler(action, null)
+			} catch (error) {
+				// An engine that does not know the action refuses to clear it either.
+			}
+		}
+	},
+
+	methods: {
+		/**
+		 * Make the lock screen and the headphone buttons work.
+		 *
+		 * Only the actions that mean something for a radio. There is deliberately no
+		 * `nexttrack` or `seekto`: this is a broadcast, and skipping would move it for
+		 * everybody listening rather than just for whoever pressed. That is a real
+		 * capability the app has — it is CONTROL, granted per share — but a lock-screen
+		 * button gives no way to know whether the person holding the phone has it, and a
+		 * control that silently does nothing is worse than one that is not offered.
+		 *
+		 * Pausing is different: it stops *this* listener's audio and leaves the broadcast
+		 * running, which is exactly what the mute and tune-out controls already do.
+		 */
+		wireMediaSessionControls() {
+			if (!('mediaSession' in navigator)) {
+				return
+			}
+
+			const set = (action, handler) => {
+				try {
+					navigator.mediaSession.setActionHandler(action, handler)
+				} catch (error) {
+					// Unsupported actions throw rather than being ignored.
+				}
+			}
+
+			set('play', () => {
+				if (this.tunedIn) {
+					// Straight through, not via the store: this handler *is* the user
+					// gesture, and deferring it to a watcher would spend it.
+					this.resume()
+				}
+			})
+			set('pause', () => this.activeAudio?.pause())
+			set('stop', () => this.activeAudio?.pause())
 		},
 	},
 }

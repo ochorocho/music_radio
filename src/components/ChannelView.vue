@@ -316,11 +316,33 @@ export default {
 		// Once on open, so an import started before a reload — or by somebody else — is
 		// picked up rather than appearing from nowhere when it finishes.
 		await this.refreshImports()
+
+		// And again whenever this tab is returned to.
+		//
+		// What the server can do is read once, into the initial state, and then only
+		// re-read while an import is running. That leaves a tab open across an
+		// administrator switching YouTube import *on* permanently convinced it is off —
+		// and unrecoverably so, because the button that would start an import is hidden by
+		// the very flag that is wrong, so nothing ever asks again. Only a reload escaped
+		// it, which is not something anyone would think to try.
+		//
+		// Coming back to the tab is the natural moment to ask: it is exactly when
+		// something may have changed elsewhere, and it costs one request.
+		this.capabilityHandler = () => {
+			if (document.visibilityState === 'visible') {
+				this.refreshImports()
+			}
+		}
+		document.addEventListener('visibilitychange', this.capabilityHandler)
 	},
 
 	beforeUnmount() {
 		this.stopImportPoll()
 		this.clearAutoDismissTimers()
+		if (this.capabilityHandler) {
+			document.removeEventListener('visibilitychange', this.capabilityHandler)
+			this.capabilityHandler = null
+		}
 	},
 
 	methods: {

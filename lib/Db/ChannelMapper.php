@@ -42,6 +42,26 @@ class ChannelMapper extends QBMapper {
 	}
 
 	/**
+	 * Every channel on the server, for maintenance that is not done on anyone's behalf.
+	 *
+	 * Deliberately not reachable from a controller — there is no request in which "all
+	 * channels regardless of who may see them" is a correct answer. It exists for
+	 * `occ music_radio:broadcast:build`, which runs as the administrator and has to be
+	 * able to prepare a server's whole library.
+	 *
+	 * @return Channel[]
+	 * @throws Exception
+	 */
+	public function findAll(): array {
+		$qb = $this->db->getQueryBuilder();
+		$qb->select('*')
+			->from($this->getTableName())
+			->orderBy('id', 'ASC');
+
+		return $this->findEntities($qb);
+	}
+
+	/**
 	 * @throws DoesNotExistException
 	 * @throws MultipleObjectsReturnedException
 	 * @throws Exception

@@ -142,6 +142,14 @@ class PlaybackService {
 			'trackCount' => count($tracks),
 			'playableCount' => count($playable),
 			'programmePositionMs' => $position,
+			// Whether the programme endpoint will hand over the whole thing at once, for
+			// the element to loop by itself. Only an offer: the client checks that what it
+			// actually received is a full lap before looping it, because a lap the server
+			// could not complete would otherwise be repeated as though it were the
+			// programme. See ProgrammeStreamService::lap().
+			'programmeLoops' => $channel->getLoopEnabled()
+				&& $total > 0
+				&& $total <= ProgrammeStreamService::BUDGET_MS,
 			'current' => $current,
 			'next' => $next,
 			'permissions' => $permissions,

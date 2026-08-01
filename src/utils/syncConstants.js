@@ -29,6 +29,21 @@
  */
 export const RESEEK_MS = 1000
 
+/**
+ * How often to try the server again once contact is lost.
+ *
+ * Much faster than the ordinary poll, which backs off to ten seconds when a channel is
+ * quiet — and a listener who has just come back through a tunnel should not wait out that
+ * interval in silence when the connection returned seconds ago.
+ *
+ * Deliberately not jittered, unlike the steady-state poll below. The trade is real — a
+ * room of listeners reconnecting after the same outage will arrive together, and a server
+ * that has only just come back gets them all at once — but the retry window is short and
+ * predictable behaviour is what was asked for. If a herd ever becomes the problem, this is
+ * the line to add jitter to.
+ */
+export const RECONNECT_MS = 2000
+
 /** How often the local position is recomputed and compared against the audio element. */
 export const TICK_MS = 250
 
@@ -49,8 +64,17 @@ export const WATCH_CLOCK_BURST = 2
 /** Steady-state re-probe interval. */
 export const CLOCK_REFRESH_MS = 45_000
 
-/** Start loading the next track this long before the current one ends. */
-export const PRELOAD_LEAD_MS = 15_000
+/**
+ * How far the element may be from the broadcast before the segment itself is reloaded
+ * rather than seeked within.
+ *
+ * A seek inside the loaded segment is nearly free — the audio is already downloaded — so
+ * ordinary correction stays there. Past this the position wanted is outside what was
+ * fetched, which no amount of seeking reaches; the only answer is a fresh segment starting
+ * where the listener should be. Generous, because a reload is the expensive option and the
+ * segment covers half an hour either way.
+ */
+export const SEGMENT_RELOAD_MS = 60_000
 
 /**
  * How long to wait for a stalled element to recover before forcing the issue.

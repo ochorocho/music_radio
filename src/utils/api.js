@@ -196,6 +196,27 @@ export function streamUrl(channelId, trackId, token = null) {
 }
 
 /**
+ * Half an hour of the programme from `fromMs`, as one continuous MP3.
+ *
+ * What a listener actually plays. The per-track URL above is still how a single track is
+ * fetched — the playlist preview uses it — but the player asks for this instead, because
+ * a programme crossing its own track boundaries is the only way a phone with the screen
+ * locked keeps playing: at that moment there is no JavaScript running to load anything.
+ *
+ * @param {number} channelId
+ * @param {number} fromMs programme position to start at
+ * @param {string|null} token
+ * @return {string}
+ */
+export function programmeUrl(channelId, fromMs, token = null) {
+	const from = `?from=${Math.max(0, Math.round(fromMs))}`
+
+	return token
+		? url(`/public/${token}/programme`) + from
+		: url(`/channels/${channelId}/programme`) + from
+}
+
+/**
  * Upload a file straight onto a channel through a public link.
  *
  * The file is stored in the channel owner's Music folder, so this is only permitted on

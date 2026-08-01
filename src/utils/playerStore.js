@@ -53,6 +53,8 @@ export const playerStore = reactive({
 		boundaries: 0,
 		playRefusals: 0,
 		playRetries: 0,
+		connectionLost: false,
+		reconnects: 0,
 		playbackRate: 1,
 	},
 

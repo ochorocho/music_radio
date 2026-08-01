@@ -45,6 +45,9 @@ return [
 		// Audio. Consumed by an <audio> element, so it carries no CSRF token — see
 		// StreamController for how access is checked instead.
 		['name' => 'stream#track', 'url' => '/api/v1/channels/{id}/tracks/{trackId}/stream', 'verb' => 'GET'],
+		// What a listener actually plays: a span of the programme rather than one track, so
+		// a locked phone crosses track boundaries without needing JavaScript to be awake.
+		['name' => 'stream#programme', 'url' => '/api/v1/channels/{id}/programme', 'verb' => 'GET'],
 
 		// Broadcast state and control.
 		['name' => 'playback#time', 'url' => '/api/v1/time', 'verb' => 'GET'],
@@ -73,6 +76,7 @@ return [
 		['name' => 'publicApi#state', 'url' => '/api/v1/public/{token}/state', 'verb' => 'GET'],
 		['name' => 'publicApi#tracks', 'url' => '/api/v1/public/{token}/tracks', 'verb' => 'GET'],
 		['name' => 'publicApi#stream', 'url' => '/api/v1/public/{token}/tracks/{trackId}/stream', 'verb' => 'GET'],
+		['name' => 'publicApi#programme', 'url' => '/api/v1/public/{token}/programme', 'verb' => 'GET'],
 		['name' => 'publicApi#upload', 'url' => '/api/v1/public/{token}/tracks', 'verb' => 'POST'],
 		// The visitor's own upload, or anything at all on a link that curates — see
 		// PublicApiController::destroyTrack.
