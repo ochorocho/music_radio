@@ -32,6 +32,12 @@ app works regardless, so you can install now and set importing up later, or neve
 Importing is unavailable — visibly, with a reason — if any of those is missing. It does not
 half-work.
 
+None of the "For YouTube import" column applies if you have the fetching done on **another
+machine** — no ffmpeg, no yt-dlp and no `proc_open` are needed on the server, and background
+jobs are needed only for tidying up. That is often the better arrangement, because YouTube
+routinely refuses servers in data centres whatever they have installed. See
+**[remote-import.md](remote-import.md)**, and skip sections 2, 4 and 5 below.
+
 The distributed cache (Redis or Memcached, configured as `memcache.distributed`) is only
 used for the listener count, which is the one thing that degrades rather than fails without
 it: presence is held in the cache because every listener would otherwise write to the
@@ -253,6 +259,40 @@ Then, in the app: open a channel, press **From YouTube**, paste a link. The butt
 shown when the server can actually do it, so if it is missing, the status command above will
 say why.
 
+## 7. Or have another machine do it
+
+Everything above assumes the server fetches its own imports. It does not have to, and often
+should not: YouTube asks datacentre addresses to prove they are not a bot, and no amount of
+installing helps with that.
+
+A **worker** on another machine — a NAS, a laptop, a small VM — collects queued imports over
+the API, runs yt-dlp there, and sends the audio back. The server then needs no ffmpeg, no
+yt-dlp and no `proc_open`.
+
+```bash
+occ user:add radio-worker
+occ config:app:set music_radio import_mode --value=remote
+occ config:app:set music_radio remote_worker_users --value=radio-worker
+occ user:add-app-password radio-worker      # what the worker signs in with
+
+occ music_radio:remote:status               # is anything collecting?
+```
+
+The worker itself is a single Python file shipped with the app
+(`apps/music_radio/worker/music-radio-worker`). Copy it to the other machine and let it set
+itself up:
+
+```bash
+sudo install -m 755 music-radio-worker /usr/local/bin/music-radio-worker
+sudo music-radio-worker install
+```
+
+That downloads and verifies yt-dlp, creates a service account, writes the credentials,
+installs a systemd service, and adds a timer that runs `music-radio-worker update` every
+quarter of an hour — so the yt-dlp staleness that section "Keeping yt-dlp working" is about
+becomes somebody else's problem, handled automatically.
+**[remote-import.md](remote-import.md)** has the whole procedure.
+
 ## Keeping yt-dlp working
 
 **Expect to update it every few weeks.** YouTube changes how videos are served, extractors
@@ -291,6 +331,9 @@ Everything below is also on the **Settings → Administration → Music Radio** 
 | `ffmpeg_path`             | *(empty)*   | Absolute path to `ffmpeg`; `ffprobe` must sit beside it     |
 | `import_max_duration`     | `5400`      | Longest video, **in seconds**. Refused before downloading   |
 | `import_max_source_bytes` | `314572800` | Largest download, **in bytes**, measured before transcoding |
+| `import_mode`             | `local`     | `remote` hands imports to a worker on another machine        |
+| `remote_worker_users`     | *(empty)*   | Comma-separated accounts allowed to collect imports          |
+| `remote_forward_cookies`  | `false`     | Whether a worker may borrow a channel owner's YouTube cookies |
 
 ```bash
 occ config:app:set music_radio import_max_duration --value=1800 --type=integer
@@ -356,6 +399,10 @@ occ log:watch | grep music_radio
 
 # What the server thinks it can do
 occ music_radio:ytdlp:status
+
+# Or, when the fetching happens on another machine: is it connected, and is the
+# queue moving?
+occ music_radio:remote:status
 
 # Whether the job was ever queued at all
 occ background-job:list | grep MusicRadio

@@ -40,6 +40,11 @@ final class ImportError {
 	public const JS_RUNTIME_MISSING = 'js_runtime_missing';
 	public const PROCESS_DISABLED = 'process_disabled';
 
+	// Remote mode: the work happens on another machine, and these are the two ways that
+	// arrangement can be missing a machine.
+	public const REMOTE_NOT_CONFIGURED = 'remote_not_configured';
+	public const REMOTE_WORKER_OFFLINE = 'remote_worker_offline';
+
 	// The video itself.
 	public const VIDEO_UNAVAILABLE = 'video_unavailable';
 	public const VIDEO_PRIVATE = 'video_private';
@@ -72,6 +77,35 @@ final class ImportError {
 	public const UNKNOWN = 'unknown';
 
 	/**
+	 * The codes a remote worker is allowed to name for itself.
+	 *
+	 * Deliberately short. Almost every reason an import fails is read out of yt-dlp's
+	 * stderr, and that reading happens *here* — {@see YtDlpFailure} is a hundred lines of
+	 * hard-won pattern matching, and a worker that classified failures itself would be a
+	 * second copy of it, going stale on somebody else's machine. So the worker sends what
+	 * yt-dlp said and the server decides what it means.
+	 *
+	 * What is left is the handful of things only the worker can know: that its own machine
+	 * is missing a tool, that it gave up waiting, that the file was bigger than it was
+	 * allowed to send, or that it was stopped.
+	 */
+	public const REPORTABLE_BY_WORKER = [
+		self::YTDLP_MISSING,
+		self::FFMPEG_MISSING,
+		self::JS_RUNTIME_MISSING,
+		self::TOO_LARGE,
+		self::TIMED_OUT,
+		self::NETWORK,
+		self::NO_AUDIO,
+		self::CANCELLED,
+		self::UNKNOWN,
+	];
+
+	public static function reportableByWorker(string $code): bool {
+		return in_array($code, self::REPORTABLE_BY_WORKER, true);
+	}
+
+	/**
 	 * @param int $maxDurationSeconds named in the message, because "too long" without a
 	 *                                number tells someone nothing about what would work
 	 */
@@ -86,6 +120,11 @@ final class ImportError {
 			self::FFMPEG_MISSING => $l->t('YouTube import needs ffmpeg, which is not installed on this server.'),
 			self::JS_RUNTIME_MISSING => $l->t('YouTube import needs a JavaScript runtime, which is not installed on this server. An administrator needs to install Deno or Node.'),
 			self::PROCESS_DISABLED => $l->t('This server does not allow running external programs, so YouTube import cannot work here.'),
+
+			// Both name the administrator, because both are settings rather than accidents,
+			// and neither is anything the person who pasted a link can do about.
+			self::REMOTE_NOT_CONFIGURED => $l->t('This server hands imports to a separate machine, and none has been set up yet. An administrator needs to finish configuring it.'),
+			self::REMOTE_WORKER_OFFLINE => $l->t('The machine that fetches audio for this server is not answering. An administrator needs to start it.'),
 
 			self::VIDEO_UNAVAILABLE => $l->t('That video is not available.'),
 			self::VIDEO_PRIVATE => $l->t('That video is private.'),

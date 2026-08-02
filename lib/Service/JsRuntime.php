@@ -63,4 +63,24 @@ final class JsRuntime {
 
 		return in_array($name, self::SUPPORTED, true) ? new self($name, $path) : null;
 	}
+
+	/**
+	 * The inverse of {@see spec()}: read back a runtime a remote worker declared.
+	 *
+	 * A worker reports what it found on its own machine, and that string goes onto a
+	 * command line — so it is parsed rather than trusted. The engine has to be one yt-dlp
+	 * knows and the path has to be an ordinary absolute one; anything else is treated as
+	 * "no runtime", which costs the worker cookies rather than breaking its imports.
+	 *
+	 * Absolute in the POSIX sense, deliberately. The command line this ends up on is built
+	 * for a worker that runs a shell and a python; a Windows path is not something this app
+	 * has any way to have tested.
+	 */
+	public static function fromSpec(string $spec): ?self {
+		if (preg_match('#^([a-z]+):(/[^\s:]+)$#', $spec, $matches) !== 1) {
+			return null;
+		}
+
+		return in_array($matches[1], self::SUPPORTED, true) ? new self($matches[1], $matches[2]) : null;
+	}
 }

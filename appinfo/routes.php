@@ -97,4 +97,36 @@ return [
 		['name' => 'publicApi#createImport', 'url' => '/api/v1/public/{token}/imports', 'verb' => 'POST'],
 		['name' => 'publicApi#destroyImport', 'url' => '/api/v1/public/{token}/imports/{importId}', 'verb' => 'DELETE'],
 	],
+
+	/**
+	 * The remote import worker.
+	 *
+	 * OCS rather than ordinary routes, and that is the whole point of them: an OCS
+	 * controller reached with `OCS-APIRequest: true` is the supported way for a client that
+	 * is not a browser to make an authenticated call, and it is what exempts these from a
+	 * CSRF token there is no session to get one from. The worker signs in with HTTP Basic
+	 * and an app password, exactly as any other Nextcloud client does.
+	 *
+	 * Reachable at /ocs/v2.php/apps/music_radio/api/v1/worker/… — see WorkerController for
+	 * why being signed in is not by itself enough to use any of them.
+	 */
+	'ocs' => [
+		['name' => 'worker#status', 'url' => '/api/v1/worker', 'verb' => 'GET'],
+		['name' => 'worker#claim', 'url' => '/api/v1/worker/claim', 'verb' => 'POST'],
+		// The worker script this app ships, so `music-radio-worker update` can keep itself
+		// in step with the server. Fetched only when the checksum on the greeting differs.
+		['name' => 'worker#script', 'url' => '/api/v1/worker/script', 'verb' => 'GET'],
+
+		// Everything below names a job, and holding its lease is what permits the call.
+		['name' => 'worker#metadata', 'url' => '/api/v1/worker/jobs/{importId}/metadata', 'verb' => 'POST'],
+		['name' => 'worker#progress', 'url' => '/api/v1/worker/jobs/{importId}/progress', 'verb' => 'POST'],
+		['name' => 'worker#cookies', 'url' => '/api/v1/worker/jobs/{importId}/cookies', 'verb' => 'GET'],
+		['name' => 'worker#returnCookies', 'url' => '/api/v1/worker/jobs/{importId}/cookies', 'verb' => 'POST'],
+		// PUT, and the audio is the entire body: that is what lets the server read it as a
+		// stream instead of holding a whole MP3 in memory. Its parameters are in the query
+		// string for the same reason.
+		['name' => 'worker#audio', 'url' => '/api/v1/worker/jobs/{importId}/audio', 'verb' => 'PUT'],
+		['name' => 'worker#fail', 'url' => '/api/v1/worker/jobs/{importId}/fail', 'verb' => 'POST'],
+		['name' => 'worker#release', 'url' => '/api/v1/worker/jobs/{importId}/release', 'verb' => 'POST'],
+	],
 ];

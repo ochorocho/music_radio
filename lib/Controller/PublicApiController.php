@@ -530,7 +530,25 @@ class PublicApiController extends PublicShareController {
 					static fn (Import $import): bool => $mine !== null && $import->getUserId() === $mine,
 				),
 			)),
-			'capabilities' => $this->importService->availability(),
+			// The same shape the signed-in endpoint answers with, sentence included — a
+			// visitor holding a link is owed the reason importing is off as much as a
+			// contributor is. See ImportController::index.
+			'capabilities' => $this->describeCapabilities(),
+		]);
+	}
+
+	/**
+	 * Whether importing is possible, and why not when it is not.
+	 *
+	 * @return array<string, mixed>
+	 */
+	private function describeCapabilities(): array {
+		$capabilities = $this->importService->availability();
+
+		return array_merge($capabilities->jsonSerialize(), [
+			'reasonText' => $capabilities->reason === null
+				? null
+				: ImportError::describe($capabilities->reason, $this->l10n),
 		]);
 	}
 

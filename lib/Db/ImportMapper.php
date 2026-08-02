@@ -142,6 +142,151 @@ class ImportMapper extends QBMapper {
 		return $qb->executeStatement();
 	}
 
+	// ------------------------------------------------------------------ remote
+
+	/**
+	 * The next job a remote worker should be offered: the oldest one waiting.
+	 *
+	 * Only the id, because between reading it and claiming it another worker may take it —
+	 * so nothing read here can be trusted anyway. {@see claimRemote()} is what decides.
+	 *
+	 * @throws Exception
+	 */
+	public function nextQueuedRemote(): ?int {
+		$qb = $this->db->getQueryBuilder();
+		$qb->select('id')
+			->from($this->getTableName())
+			->where($qb->expr()->eq('status', $qb->createNamedParameter(Import::STATUS_QUEUED, IQueryBuilder::PARAM_INT)))
+			->andWhere($qb->expr()->eq('remote', $qb->createNamedParameter(true, IQueryBuilder::PARAM_BOOL)))
+			->orderBy('id', 'ASC')
+			->setMaxResults(1);
+
+		$result = $qb->executeQuery();
+		$value = $result->fetchOne();
+		$result->closeCursor();
+
+		return $value === false ? null : (int)$value;
+	}
+
+	/**
+	 * Hand a queued job to one worker, and mint the token it will report with.
+	 *
+	 * The same lock {@see claim()} is, for the same reason and with one more condition: a
+	 * row written for a local background job is not collectable however idle a remote
+	 * worker is. Several workers polling the same queue is the ordinary case here, so the
+	 * loser of a race getting 0 back is expected rather than exceptional.
+	 *
+	 * @return int rows affected — 1 means this worker owns the job
+	 * @throws Exception
+	 */
+	public function claimRemote(int $id, int $now, string $leaseToken, string $workerId): int {
+		$qb = $this->db->getQueryBuilder();
+		$qb->update($this->getTableName())
+			->set('status', $qb->createNamedParameter(Import::STATUS_RUNNING, IQueryBuilder::PARAM_INT))
+			->set('phase', $qb->createNamedParameter(Import::PHASE_RESOLVING, IQueryBuilder::PARAM_INT))
+			->set('progress', $qb->createNamedParameter(0, IQueryBuilder::PARAM_INT))
+			->set('started_at', $qb->createNamedParameter($now, IQueryBuilder::PARAM_INT))
+			->set('heartbeat_at', $qb->createNamedParameter($now, IQueryBuilder::PARAM_INT))
+			->set('attempts', $qb->func()->add('attempts', $qb->expr()->literal(1)))
+			->set('lease_token', $qb->createNamedParameter($leaseToken))
+			->set('worker_id', $qb->createNamedParameter($workerId))
+			->where($qb->expr()->eq('id', $qb->createNamedParameter($id, IQueryBuilder::PARAM_INT)))
+			->andWhere($qb->expr()->eq('status', $qb->createNamedParameter(Import::STATUS_QUEUED, IQueryBuilder::PARAM_INT)))
+			->andWhere($qb->expr()->eq('remote', $qb->createNamedParameter(true, IQueryBuilder::PARAM_BOOL)));
+
+		return $qb->executeStatement();
+	}
+
+	/**
+	 * Give a claimed job back, unstarted.
+	 *
+	 * What a worker does when it is stopped mid-job — a deploy, a reboot, an operator
+	 * pressing Ctrl-C. Returning it immediately is much better than leaving it to the
+	 * lease to expire: the next worker picks it up seconds later instead of minutes, and
+	 * whoever asked for the import sees a queued row rather than a stalled one.
+	 *
+	 * The attempt is not given back. A job that keeps being released is one that keeps
+	 * killing its worker, and the attempt count is what eventually stops it.
+	 *
+	 * @return int rows affected; 0 means the lease was no longer valid
+	 * @throws Exception
+	 */
+	public function releaseRemote(int $id, string $leaseToken): int {
+		$qb = $this->db->getQueryBuilder();
+		$qb->update($this->getTableName())
+			->set('status', $qb->createNamedParameter(Import::STATUS_QUEUED, IQueryBuilder::PARAM_INT))
+			->set('phase', $qb->createNamedParameter(Import::PHASE_PENDING, IQueryBuilder::PARAM_INT))
+			->set('progress', $qb->createNamedParameter(0, IQueryBuilder::PARAM_INT))
+			->set('lease_token', $qb->createNamedParameter(null))
+			->set('worker_id', $qb->createNamedParameter(null))
+			->where($qb->expr()->eq('id', $qb->createNamedParameter($id, IQueryBuilder::PARAM_INT)))
+			->andWhere($qb->expr()->eq('status', $qb->createNamedParameter(Import::STATUS_RUNNING, IQueryBuilder::PARAM_INT)))
+			->andWhere($qb->expr()->eq('lease_token', $qb->createNamedParameter($leaseToken)));
+
+		return $qb->executeStatement();
+	}
+
+	/**
+	 * Put back jobs whose worker went quiet, so another one can have them.
+	 *
+	 * The difference between this and {@see failStalled()} is the difference between the
+	 * two kinds of worker. A local background job that died took the whole PHP process with
+	 * it and there is nothing to retry into; a remote worker going quiet usually means a
+	 * machine rebooted or a network dropped, and the job is perfectly good. So it is
+	 * requeued rather than failed — until it has used up its attempts, which is what stops
+	 * a job that kills every worker it touches from going round for ever.
+	 *
+	 * @param int $silentSince heartbeats older than this have lost the lease
+	 * @return int rows requeued
+	 * @throws Exception
+	 */
+	public function requeueExpiredLeases(int $silentSince, int $maxAttempts, ?int $channelId = null): int {
+		$qb = $this->db->getQueryBuilder();
+		$qb->update($this->getTableName())
+			->set('status', $qb->createNamedParameter(Import::STATUS_QUEUED, IQueryBuilder::PARAM_INT))
+			->set('phase', $qb->createNamedParameter(Import::PHASE_PENDING, IQueryBuilder::PARAM_INT))
+			->set('progress', $qb->createNamedParameter(0, IQueryBuilder::PARAM_INT))
+			->set('lease_token', $qb->createNamedParameter(null))
+			->set('worker_id', $qb->createNamedParameter(null))
+			->where($qb->expr()->eq('status', $qb->createNamedParameter(Import::STATUS_RUNNING, IQueryBuilder::PARAM_INT)))
+			->andWhere($qb->expr()->eq('remote', $qb->createNamedParameter(true, IQueryBuilder::PARAM_BOOL)))
+			->andWhere($qb->expr()->lt('heartbeat_at', $qb->createNamedParameter($silentSince, IQueryBuilder::PARAM_INT)))
+			->andWhere($qb->expr()->lt('attempts', $qb->createNamedParameter($maxAttempts, IQueryBuilder::PARAM_INT)));
+
+		if ($channelId !== null) {
+			$qb->andWhere($qb->expr()->eq('channel_id', $qb->createNamedParameter($channelId, IQueryBuilder::PARAM_INT)));
+		}
+
+		return $qb->executeStatement();
+	}
+
+	/**
+	 * How much work is waiting, and how much is out with a worker. For the status command
+	 * and the admin page, which are the two places anybody asks "is the queue moving".
+	 *
+	 * @return array{queued: int, running: int}
+	 * @throws Exception
+	 */
+	public function remoteQueueDepth(): array {
+		$qb = $this->db->getQueryBuilder();
+		$qb->select('status', $qb->func()->count('*', 'rows'))
+			->from($this->getTableName())
+			->where($qb->expr()->eq('remote', $qb->createNamedParameter(true, IQueryBuilder::PARAM_BOOL)))
+			->andWhere($this->activeStatuses($qb))
+			->groupBy('status');
+
+		$depth = ['queued' => 0, 'running' => 0];
+
+		$result = $qb->executeQuery();
+		foreach ($result->fetchAll() as $row) {
+			$key = (int)$row['status'] === Import::STATUS_QUEUED ? 'queued' : 'running';
+			$depth[$key] = (int)$row['rows'];
+		}
+		$result->closeCursor();
+
+		return $depth;
+	}
+
 	/**
 	 * Say that the work is still going, and how far along it is.
 	 *
@@ -213,20 +358,28 @@ class ImportMapper extends QBMapper {
 	 * spinner for ever.
 	 *
 	 * @param int $silentSince heartbeats older than this are considered dead
+	 * @param bool|null $remote which kind of worker to reap after; null for both. The two
+	 *                          are swept on different schedules — a remote job is requeued
+	 *                          long before this, and only reaches here having used up its
+	 *                          attempts.
 	 * @return int rows reaped
 	 * @throws Exception
 	 */
-	public function failStalled(int $silentSince, int $now, string $errorCode, ?int $channelId = null): int {
+	public function failStalled(int $silentSince, int $now, string $errorCode, ?int $channelId = null, ?bool $remote = null): int {
 		$qb = $this->db->getQueryBuilder();
 		$qb->update($this->getTableName())
 			->set('status', $qb->createNamedParameter(Import::STATUS_FAILED, IQueryBuilder::PARAM_INT))
 			->set('error_code', $qb->createNamedParameter($errorCode))
+			->set('lease_token', $qb->createNamedParameter(null))
 			->set('finished_at', $qb->createNamedParameter($now, IQueryBuilder::PARAM_INT))
 			->where($qb->expr()->eq('status', $qb->createNamedParameter(Import::STATUS_RUNNING, IQueryBuilder::PARAM_INT)))
 			->andWhere($qb->expr()->lt('heartbeat_at', $qb->createNamedParameter($silentSince, IQueryBuilder::PARAM_INT)));
 
 		if ($channelId !== null) {
 			$qb->andWhere($qb->expr()->eq('channel_id', $qb->createNamedParameter($channelId, IQueryBuilder::PARAM_INT)));
+		}
+		if ($remote !== null) {
+			$qb->andWhere($qb->expr()->eq('remote', $qb->createNamedParameter($remote, IQueryBuilder::PARAM_BOOL)));
 		}
 
 		return $qb->executeStatement();
@@ -240,10 +393,15 @@ class ImportMapper extends QBMapper {
 	 * for that code says so. It is the only way the app can report a broken cron, since
 	 * anything it could schedule to notice would be broken too.
 	 *
+	 * In remote mode the same row means something different — nothing collected it, so
+	 * either no worker is running or none is allowed to — which is why the caller passes a
+	 * different code as well as a different deadline.
+	 *
+	 * @param bool|null $remote which kind of worker was supposed to pick this up
 	 * @return int rows reaped
 	 * @throws Exception
 	 */
-	public function failNeverStarted(int $queuedBefore, int $now, string $errorCode, ?int $channelId = null): int {
+	public function failNeverStarted(int $queuedBefore, int $now, string $errorCode, ?int $channelId = null, ?bool $remote = null): int {
 		$qb = $this->db->getQueryBuilder();
 		$qb->update($this->getTableName())
 			->set('status', $qb->createNamedParameter(Import::STATUS_FAILED, IQueryBuilder::PARAM_INT))
@@ -254,6 +412,9 @@ class ImportMapper extends QBMapper {
 
 		if ($channelId !== null) {
 			$qb->andWhere($qb->expr()->eq('channel_id', $qb->createNamedParameter($channelId, IQueryBuilder::PARAM_INT)));
+		}
+		if ($remote !== null) {
+			$qb->andWhere($qb->expr()->eq('remote', $qb->createNamedParameter($remote, IQueryBuilder::PARAM_BOOL)));
 		}
 
 		return $qb->executeStatement();

@@ -9,6 +9,7 @@ declare(strict_types=1);
 namespace OCA\MusicRadio\SetupCheck;
 
 use OCA\MusicRadio\Service\ImportError;
+use OCA\MusicRadio\Service\RemoteImportSettings;
 use OCA\MusicRadio\Service\YtDlpLocator;
 use OCP\IL10N;
 use OCP\IURLGenerator;
@@ -31,6 +32,7 @@ class YoutubeImportSetupCheck implements ISetupCheck {
 
 	public function __construct(
 		private YtDlpLocator $locator,
+		private RemoteImportSettings $remote,
 		private IL10N $l10n,
 		private IURLGenerator $urlGenerator,
 	) {
@@ -60,6 +62,13 @@ class YoutubeImportSetupCheck implements ISetupCheck {
 	}
 
 	public function run(): SetupResult {
+		// A server that hands imports to another machine is not missing anything by having
+		// no yt-dlp, and saying it is would send an administrator to install a program this
+		// server will never run. What matters there is whether a worker is answering.
+		if ($this->remote->isRemote()) {
+			return $this->runRemote();
+		}
+
 		$status = $this->locator->status();
 
 		if (!$status->available) {
@@ -104,5 +113,44 @@ class YoutubeImportSetupCheck implements ISetupCheck {
 				$status->jsRuntime->name,
 			]),
 		);
+	}
+
+	/**
+	 * The same check for a server whose imports are fetched elsewhere.
+	 *
+	 * A worker that has stopped answering is a *warning* rather than info, unlike a missing
+	 * yt-dlp: somebody deliberately set this up, so a silent worker is a thing that has
+	 * broken rather than a feature nobody wanted. The remaining state — nothing configured
+	 * yet — is the halfway point of a setup and says which half is missing.
+	 */
+	private function runRemote(): SetupResult {
+		$status = $this->remote->status();
+
+		if ($status->available) {
+			$name = $this->remote->seenName();
+			$message = $name === ''
+				? $this->l10n->t('Imports are fetched by a separate machine, which is answering.')
+				: $this->l10n->t('Imports are fetched by "%1$s", which is answering.', [$name]);
+
+			// The worker's own runtime, because it is the worker that needs one — and
+			// without it the same intermittent failures happen there as here.
+			return $this->remote->seenJsRuntime() === null
+				? SetupResult::warning($message . ' ' . $this->l10n->t('It has no JavaScript runtime, so some imports will fail unpredictably. Install Deno or Node on that machine.'))
+				: SetupResult::success($message);
+		}
+
+		return match ($status->reason) {
+			ImportError::DISABLED => SetupResult::success(
+				$this->l10n->t('YouTube import is switched off.'),
+			),
+			ImportError::REMOTE_NOT_CONFIGURED => SetupResult::info(
+				$this->l10n->t('Music Radio is set to have imports fetched by a separate machine, but no account may collect them yet. Name one in the Music Radio settings.'),
+				$this->settingsLink(),
+			),
+			default => SetupResult::warning(
+				$this->l10n->t('No import worker has checked in recently, so nothing will fetch audio from YouTube. Start the worker on the machine that does the fetching, or switch Music Radio back to importing on this server.'),
+				$this->settingsLink(),
+			),
+		};
 	}
 }

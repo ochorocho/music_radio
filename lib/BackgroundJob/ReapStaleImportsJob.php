@@ -61,12 +61,24 @@ class ReapStaleImportsJob extends TimedJob {
 		}
 
 		if ($reaped['stalled'] > 0 || $reaped['neverStarted'] > 0) {
-			// Worth a log line: repeated never-started rows mean cron is not running, and
-			// that is the sort of thing an administrator finds by grepping.
+			// Worth a log line: repeated never-started rows mean cron is not running — or,
+			// in remote mode, that nothing is collecting — and that is the sort of thing an
+			// administrator finds by grepping.
 			$this->logger->warning('Released imports that will never finish', [
 				'app' => Application::APP_ID,
 				'stalled' => $reaped['stalled'],
 				'neverStarted' => $reaped['neverStarted'],
+			]);
+		}
+
+		if ($reaped['requeued'] > 0) {
+			// A different event from the one above, and a much less alarming one: a remote
+			// worker went away mid-job and somebody else will now do it. Logged at info
+			// because a few of these is a normal week, and a lot of them is a machine that
+			// keeps rebooting.
+			$this->logger->info('Gave imports back to the queue after a worker went quiet', [
+				'app' => Application::APP_ID,
+				'requeued' => $reaped['requeued'],
 			]);
 		}
 	}

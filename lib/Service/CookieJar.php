@@ -322,6 +322,35 @@ class CookieJar {
 	}
 
 	/**
+	 * Hand the jar to a remote worker.
+	 *
+	 * This is the read path the class docblock says does not exist, and it is worth being
+	 * explicit about why it now does and what it is fenced with. When the download happens
+	 * on another machine, yt-dlp runs there — so either the cookies go there too or an
+	 * owner who stored them gets an anonymous import and no explanation.
+	 *
+	 * Four things have to be true before a byte of this leaves the server, and they are
+	 * checked by {@see RemoteImportQueue::cookiesFor()} rather than here:
+	 *
+	 *  - an administrator has switched cookie forwarding on, which is off by default,
+	 *    because this is the only part of an import that is a secret rather than a job;
+	 *  - the account asking is on the worker allow-list;
+	 *  - it holds the lease on a job that is running *right now* — the jar is available
+	 *    for the length of one import and not otherwise;
+	 *  - the job belongs to the channel whose owner these cookies are.
+	 *
+	 * What that adds up to: the same trust an administrator already places in the worker
+	 * machine by letting it write files into people's storage, and no wider. It is still a
+	 * credential leaving the server, which is why the setting exists and why the
+	 * documentation says to use a throwaway account.
+	 *
+	 * @return string|null the stored jar, or null when there is none
+	 */
+	public function lend(string $userId): ?string {
+		return $this->read($userId);
+	}
+
+	/**
 	 * Take back whatever yt-dlp left in the file.
 	 *
 	 * YouTube rotates its session cookies, and yt-dlp writes the rotated jar back out when
@@ -343,6 +372,18 @@ class CookieJar {
 			return;
 		}
 
+		$this->refreshWith($userId, $written);
+	}
+
+	/**
+	 * The same, for a jar that came back over the API rather than off the local disk.
+	 *
+	 * A remote worker returns what yt-dlp left in the file it was lent, for exactly the
+	 * reason above: without this the stored copy is the one that was pasted, going staler
+	 * every run. Held to every check a paste is held to, because it arrives over the
+	 * network from a machine this server does not administer.
+	 */
+	public function refreshWith(string $userId, string $written): void {
 		$written = trim($written);
 
 		// Unchanged is the common case, and writing anyway would mean a config write on

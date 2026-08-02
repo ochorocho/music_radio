@@ -18,6 +18,59 @@
 		</p>
 
 		<!--
+			Where the fetching happens.
+
+			First, because it decides what the rest of this page even means: on a server
+			that hands imports to another machine, its own yt-dlp is irrelevant and the
+			fields describing it are hidden rather than left to mislead.
+		-->
+		<div class="music-radio-settings__field" data-testid="setting-import-mode">
+			<NcCheckboxRadioSwitch
+				v-model="values.import_mode"
+				value="local"
+				name="import_mode"
+				type="radio">
+				{{ t('music_radio', 'Fetch on this server') }}
+			</NcCheckboxRadioSwitch>
+			<NcCheckboxRadioSwitch
+				v-model="values.import_mode"
+				value="remote"
+				name="import_mode"
+				type="radio">
+				{{ t('music_radio', 'Fetch on another machine') }}
+			</NcCheckboxRadioSwitch>
+		</div>
+		<p class="music-radio-settings__hint">
+			{{ t('music_radio', 'YouTube often refuses servers in data centres, and a server may have no yt-dlp at all. A worker running somewhere else — a NAS, a machine at home — collects queued imports over the API and sends the audio back. Everything else stays here: who may import, what is allowed, and whose storage it lands in.') }}
+		</p>
+
+		<!-- The remote half: who may collect, whether they are collecting, and cookies. -->
+		<template v-if="remote">
+			<div class="music-radio-settings__field" data-testid="setting-worker-users">
+				<NcTextField
+					v-model="values.remote_worker_users"
+					:label="t('music_radio', 'Accounts that may collect imports')"
+					:placeholder="t('music_radio', 'radio-worker')"
+					:error="Boolean(errors.remote_worker_users)"
+					:helper-text="errors.remote_worker_users || t('music_radio', 'Comma separated. Use a dedicated account: it can put audio into any channel owner’s files, so it should be able to do nothing else. Give it an app password with “occ user:add-app-password”.')" />
+			</div>
+
+			<p class="music-radio-settings__status" data-testid="admin-worker-status">
+				<strong>{{ t('music_radio', 'Worker') }}:</strong>
+				{{ workerStatus }}
+			</p>
+
+			<span data-testid="setting-forward-cookies">
+				<NcCheckboxRadioSwitch v-model="values.remote_forward_cookies" type="switch">
+					{{ t('music_radio', 'Send stored YouTube cookies to the worker') }}
+				</NcCheckboxRadioSwitch>
+			</span>
+			<p class="music-radio-settings__hint">
+				{{ t('music_radio', 'Cookies are the one part of an import that is a secret rather than a job. Off unless you trust the worker machine as much as this server — with it off, imports for channels whose owner stored cookies are made anonymously instead.') }}
+			</p>
+		</template>
+
+		<!--
 			The downloader, and the one button that keeps it working.
 
 			YouTube breaks yt-dlp's extractors every few weeks, so updating it is routine
@@ -27,7 +80,7 @@
 			problem, and no help at all to anyone administering a server they have no
 			terminal on.
 		-->
-		<div class="music-radio-settings__ytdlp">
+		<div v-if="!remote" class="music-radio-settings__ytdlp">
 			<p class="music-radio-settings__version" data-testid="admin-ytdlp-version">
 				<strong>{{ t('music_radio', 'Downloader') }}:</strong>
 				{{ state.ytDlpVersion
@@ -50,7 +103,7 @@
 						: t('music_radio', 'Install yt-dlp')) }}
 			</NcButton>
 		</div>
-		<p class="music-radio-settings__hint">
+		<p v-if="!remote" class="music-radio-settings__hint">
 			{{ t('music_radio', 'Downloads the current release into this server’s data directory. Do this when videos start failing to import — it is usually the fix.') }}
 		</p>
 
@@ -63,7 +116,7 @@
 			{{ t('music_radio', 'People who may add tracks to a channel can paste a link, and the server fetches the audio as an MP3. It is stored in the channel owner’s files and counts against their quota.') }}
 		</p>
 
-		<div class="music-radio-settings__field" data-testid="setting-ytdlp-path">
+		<div v-if="!remote" class="music-radio-settings__field" data-testid="setting-ytdlp-path">
 			<NcTextField
 				v-model="values.ytdlp_path"
 				:label="t('music_radio', 'Path to yt-dlp')"
@@ -144,6 +197,7 @@ export default {
 	data() {
 		const state = loadState('music_radio', 'admin-settings', {
 			values: {}, summary: '', ytDlp: '', ytDlpVersion: null,
+			remote: { online: false, name: '', seenAt: 0, secondsAgo: null, jsRuntime: null },
 		})
 
 		return {
@@ -163,10 +217,53 @@ export default {
 		dirty() {
 			return JSON.stringify(this.values) !== this.saved
 		},
+
+		/**
+		 * Follows the radio buttons rather than the saved setting, so choosing "another
+		 * machine" reveals the fields that go with it before Save is pressed.
+		 */
+		remote() {
+			return this.values.import_mode === 'remote'
+		},
+
+		/**
+		 * Whether anything is out there collecting, in one sentence.
+		 *
+		 * The only fact on this page that cannot be found out any other way: the worker is
+		 * on a machine the administrator may not be sitting at, and the alternative way of
+		 * asking is to try an import and wait.
+		 */
+		workerStatus() {
+			const worker = this.state.remote ?? {}
+
+			if (!worker.seenAt) {
+				return t('music_radio', 'none has ever checked in')
+			}
+
+			const ago = this.since(worker.secondsAgo ?? 0)
+
+			return worker.online
+				? t('music_radio', '“{name}” checked in {ago}', { name: worker.name, ago })
+				: t('music_radio', '“{name}” last checked in {ago} — it looks stopped', { name: worker.name, ago })
+		},
 	},
 
 	methods: {
 		t,
+
+		/**
+		 * How long ago, roughly. The server sends an age in seconds rather than a
+		 * timestamp, because the browser's clock is not the server's.
+		 */
+		since(seconds) {
+			if (seconds < 90) {
+				return t('music_radio', '{count} seconds ago', { count: Math.max(0, Math.round(seconds)) })
+			}
+			if (seconds < 5400) {
+				return t('music_radio', '{count} minutes ago', { count: Math.round(seconds / 60) })
+			}
+			return t('music_radio', '{count} hours ago', { count: Math.round(seconds / 3600) })
+		},
 
 		/**
 		 * Fetch the current yt-dlp, replacing whatever is there.

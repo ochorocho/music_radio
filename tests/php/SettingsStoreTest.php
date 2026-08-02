@@ -8,8 +8,10 @@ declare(strict_types=1);
 
 namespace OCA\MusicRadio\Tests;
 
+use OCA\MusicRadio\Service\Clock;
 use OCA\MusicRadio\Service\CookieJar;
 use OCA\MusicRadio\Service\MusicLibrary;
+use OCA\MusicRadio\Service\RemoteImportSettings;
 use OCA\MusicRadio\Service\SettingsStore;
 use OCA\MusicRadio\Service\ToolStatus;
 use OCA\MusicRadio\Service\YoutubeImportService;
@@ -19,6 +21,7 @@ use OCP\Files\Folder;
 use OCP\Files\IRootFolder;
 use OCP\IAppConfig;
 use OCP\IL10N;
+use OCP\IUserManager;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\MockObject\MockObject;
 use PHPUnit\Framework\TestCase;
@@ -40,6 +43,7 @@ use Psr\Log\NullLogger;
 class SettingsStoreTest extends TestCase {
 
 	private const USER = 'alice';
+	private const NOW = 1_700_000_000;
 
 	/** @var array<string, mixed> */
 	private array $appValues = [];
@@ -47,9 +51,12 @@ class SettingsStoreTest extends TestCase {
 	private array $userValues = [];
 	/** @var list<string> paths the user's files do not contain */
 	private array $missingFolders = [];
+	/** @var list<string> accounts this server does not have */
+	private array $missingAccounts = [];
 
 	private IAppConfig&MockObject $appConfig;
 	private CookieJar&MockObject $cookieJar;
+	private RemoteImportSettings&MockObject $remote;
 	private SettingsStore $store;
 
 	protected function setUp(): void {
@@ -115,12 +122,30 @@ class SettingsStoreTest extends TestCase {
 
 		$this->cookieJar = $this->createMock(CookieJar::class);
 
+		// Local mode, which is what a server does until somebody hands the fetching to
+		// another machine. The remote page has its own cases below.
+		$this->remote = $this->createMock(RemoteImportSettings::class);
+		$this->remote->method('mode')->willReturn(RemoteImportSettings::MODE_LOCAL);
+		$this->remote->method('workerAccounts')->willReturn([]);
+
+		$userManager = $this->createMock(IUserManager::class);
+		// Every account a test names exists unless it says otherwise.
+		$userManager->method('userExists')->willReturnCallback(
+			fn (string $id): bool => !in_array($id, $this->missingAccounts, true),
+		);
+
+		$clock = $this->createMock(Clock::class);
+		$clock->method('nowSeconds')->willReturn(self::NOW);
+
 		$this->store = new SettingsStore(
 			$this->appConfig,
 			$userConfig,
 			$locator,
+			$this->remote,
+			$userManager,
 			$this->cookieJar,
 			$rootFolder,
+			$clock,
 			$l10n,
 			new NullLogger(),
 		);
@@ -296,5 +321,54 @@ class SettingsStoreTest extends TestCase {
 		self::assertArrayHasKey('summary', $state);
 		self::assertArrayHasKey('ytDlp', $state);
 		self::assertArrayHasKey('values', $state);
+		// Whether a worker is answering, which is the one thing on that page that cannot be
+		// found out any other way.
+		self::assertArrayHasKey('remote', $state);
+	}
+
+	// ------------------------------------------------- where imports happen
+
+	public function testTheWorkerAllowListIsSavedTidily(): void {
+		$errors = $this->store->saveAdmin([
+			RemoteImportSettings::CONFIG_WORKERS => ' radio-worker , nas ',
+		]);
+
+		self::assertSame([], $errors);
+		self::assertSame('radio-worker,nas', $this->appValues[RemoteImportSettings::CONFIG_WORKERS]);
+	}
+
+	public function testAnAccountThatDoesNotExistIsRefusedRatherThanStored(): void {
+		// Naming the wrong account here does not fail loudly later — it produces a worker
+		// that authenticates perfectly and is never allowed to collect anything, which is a
+		// miserable thing to debug. So it is refused while somebody is looking at the page.
+		$this->missingAccounts = ['radio-wroker'];
+
+		$errors = $this->store->saveAdmin([
+			RemoteImportSettings::CONFIG_WORKERS => 'radio-wroker',
+		]);
+
+		self::assertArrayHasKey(RemoteImportSettings::CONFIG_WORKERS, $errors);
+		self::assertStringContainsString('radio-wroker', $errors[RemoteImportSettings::CONFIG_WORKERS]);
+		// Nothing written: a list that is half right would grant the capability to whichever
+		// half happened to be spelled correctly.
+		self::assertArrayNotHasKey(RemoteImportSettings::CONFIG_WORKERS, $this->appValues);
+	}
+
+	public function testTheModeOnlyEverTakesOneOfTwoValues(): void {
+		$this->store->saveAdmin([RemoteImportSettings::CONFIG_MODE => 'somewhere-else']);
+
+		// Anything unrecognised means this server keeps doing the work, which is the safe
+		// direction: the other one is waiting for a machine that does not exist.
+		self::assertSame(
+			RemoteImportSettings::MODE_LOCAL,
+			$this->appValues[RemoteImportSettings::CONFIG_MODE],
+		);
+
+		$this->store->saveAdmin([RemoteImportSettings::CONFIG_MODE => 'remote']);
+
+		self::assertSame(
+			RemoteImportSettings::MODE_REMOTE,
+			$this->appValues[RemoteImportSettings::CONFIG_MODE],
+		);
 	}
 }

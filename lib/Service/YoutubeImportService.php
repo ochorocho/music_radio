@@ -59,8 +59,13 @@ class YoutubeImportService {
 	public const CONFIG_MAX_DURATION = 'import_max_duration';
 	public const CONFIG_MAX_SOURCE_BYTES = 'import_max_source_bytes';
 
-	private const PROBE_TIMEOUT_SECONDS = 60;
-	private const DOWNLOAD_TIMEOUT_SECONDS = 900;
+	/**
+	 * Public because a remote worker runs the same two passes on its own machine and is
+	 * told how long each is allowed to take, rather than inventing its own limits. One
+	 * server, one answer to "when is this taking too long".
+	 */
+	public const PROBE_TIMEOUT_SECONDS = 60;
+	public const DOWNLOAD_TIMEOUT_SECONDS = 900;
 
 	/**
 	 * How often the row is updated while a download runs. Every progress line would be
@@ -81,6 +86,7 @@ class YoutubeImportService {
 		private ImportMapper $importMapper,
 		private ChannelMapper $channelMapper,
 		private YtDlpLocator $locator,
+		private RemoteImportSettings $remote,
 		private IProcessRunner $runner,
 		private MusicLibrary $library,
 		private ITempManager $tempManager,
@@ -98,7 +104,10 @@ class YoutubeImportService {
 	 *
 	 * Only ever used to find whose cookies to borrow, so a channel that has gone missing is
 	 * not an error here — the import proceeds anonymously and fails, if it fails, on its own
-	 * merits. {@see store()} is where a deleted channel actually matters.
+	 * merits. {@see completeFrom()} is where a deleted channel actually matters.
+	 *
+	 * Public because the remote path needs the same answer: whose cookies to lend a worker
+	 * that is about to fetch for this channel.
 	 */
 	/**
 	 * Whether presenting cookies would help or ruin this run.
@@ -118,7 +127,7 @@ class YoutubeImportService {
 	 * doing before anybody stored one. Said out loud rather than done quietly: the settings
 	 * page reports it, and this writes it to the log.
 	 */
-	private function cookiesAreUsable(ToolStatus $status): bool {
+	public function cookiesAreUsable(ToolStatus $status): bool {
 		if ($status->jsRuntime !== null) {
 			return true;
 		}
@@ -132,7 +141,7 @@ class YoutubeImportService {
 		return false;
 	}
 
-	private function ownerOf(int $channelId): ?string {
+	public function ownerOf(int $channelId): ?string {
 		try {
 			return $this->channelMapper->find($channelId)->getUserId();
 		} catch (\Throwable) {
@@ -140,8 +149,15 @@ class YoutubeImportService {
 		}
 	}
 
+	/**
+	 * Whether an import asked for right now could be done, and if not, why not.
+	 *
+	 * Which question that is depends on where the work happens. On this server it is about
+	 * binaries; on a remote worker it is about whether one is listening — and *nothing*
+	 * downstream should have to know which, so both answers come back in the same shape.
+	 */
 	public function availability(): ToolStatus {
-		return $this->locator->status();
+		return $this->remote->isRemote() ? $this->remote->status() : $this->locator->status();
 	}
 
 	public function maxDurationSeconds(): int {
@@ -152,7 +168,8 @@ class YoutubeImportService {
 		));
 	}
 
-	private function maxSourceBytes(): int {
+	/** Public because the job descriptor a remote worker is given has to carry it. */
+	public function maxSourceBytes(): int {
 		return max(1024 * 1024, $this->appConfig->getValueInt(
 			Application::APP_ID,
 			self::CONFIG_MAX_SOURCE_BYTES,
@@ -200,6 +217,9 @@ class YoutubeImportService {
 		}
 
 		$now = $this->clock->nowSeconds();
+		// Read once and written onto the row, because the mode can be changed while this
+		// import is in flight and the two workers must never both be able to have it.
+		$isRemote = $this->remote->isRemote();
 
 		$import = new Import();
 		$import->setChannelId($channel->getId());
@@ -208,6 +228,7 @@ class YoutubeImportService {
 		$import->setVideoId($videoId);
 		$import->setStatus(Import::STATUS_QUEUED);
 		$import->setApproved($approved ?? true);
+		$import->setRemote($isRemote);
 		$import->setPhase(Import::PHASE_PENDING);
 		$import->setProgress(0);
 		$import->setAttempts(0);
@@ -217,6 +238,13 @@ class YoutubeImportService {
 		$import->setFinishedAt(0);
 
 		$import = $this->importMapper->insert($import);
+
+		// In remote mode there is nothing more to do: the row *is* the queue, and a worker
+		// will collect it within a poll interval. No background job is scheduled, because
+		// the one thing this server must not do is fetch the video itself.
+		if ($isRemote) {
+			return $import;
+		}
 
 		// The row is committed before the job is queued, so a worker can never be handed
 		// an id that is not there yet. The other order is a race that only shows up under
@@ -256,6 +284,14 @@ class YoutubeImportService {
 	 * Deliberately does not throw: every path ends with the row saying what happened.
 	 */
 	public function perform(Import $import): void {
+		// A row written for a remote worker is not this server's to do, even though a job
+		// for it exists — the mode was switched after the job was scheduled, or somebody
+		// queued one by hand. Left alone rather than failed: a worker will still collect
+		// it, and failing it here would take an import away from somebody for no reason.
+		if ($import->getRemote()) {
+			return;
+		}
+
 		if ($this->importMapper->claim($import->getId(), $this->clock->nowSeconds()) === 0) {
 			// Somebody else has it, or it was cancelled before it started. Either way this
 			// worker must not do the work again.
@@ -397,13 +433,22 @@ class YoutubeImportService {
 
 		// --- file it ------------------------------------------------------------
 		$this->advance($import, Import::PHASE_SAVING, 100);
-		$this->store($import, $produced ?? '');
+		$this->completeFrom($import, $produced ?? '');
 	}
 
 	/**
 	 * Put the finished file in the channel owner's music folder and on the playlist.
+	 *
+	 * Public because it is the end of *both* roads. A remote worker sends the finished MP3
+	 * back over the API, and from the moment it is a file on this server's disk nothing
+	 * about filing it differs — same owner, same quota, same credit to whoever pasted the
+	 * link, same rollback when it cannot become a track. Two copies of that would be two
+	 * chances to get the ownership rules wrong.
+	 *
+	 * @param string $path a file on this server's own disk. The caller owns it; this only
+	 *                     reads it.
 	 */
-	private function store(Import $import, string $path): void {
+	public function completeFrom(Import $import, string $path): void {
 		try {
 			$channel = $this->channelMapper->find($import->getChannelId());
 		} catch (\Throwable) {
@@ -449,6 +494,9 @@ class YoutubeImportService {
 		$import->setProgress(100);
 		$import->setTrackId($track->getId());
 		$import->setErrorCode(null);
+		// A lease outlives nothing. Cleared on the way out so a finished row cannot be
+		// reported on again by the worker that did it.
+		$import->setLeaseToken(null);
 		$import->setFinishedAt($this->clock->nowSeconds());
 		$this->importMapper->update($import);
 
@@ -470,9 +518,14 @@ class YoutubeImportService {
 	 * it up front means saying "that video is longer than 90 minutes" instead of noticing
 	 * afterwards that no file appeared.
 	 *
+	 * Public because a remote worker asks this question over the API: it sends what the
+	 * probe pass on its machine produced, and this server decides whether the download is
+	 * worth doing. The rule about what may be imported stays here, where changing it
+	 * changes it for both kinds of worker at once.
+	 *
 	 * @param array<string, mixed> $metadata
 	 */
-	private function inspect(array $metadata): ?string {
+	public function inspect(array $metadata): ?string {
 		$liveStatus = $metadata['live_status'] ?? null;
 		if (($metadata['is_live'] ?? false) === true
 			|| in_array($liveStatus, ['is_live', 'is_upcoming', 'post_live'], true)) {
@@ -499,9 +552,12 @@ class YoutubeImportService {
 	}
 
 	/**
+	 * Public for the same reason {@see inspect()} is: the metadata may have been fetched on
+	 * another machine, and the row is named from it either way.
+	 *
 	 * @param array<string, mixed> $metadata
 	 */
-	private function recordMetadata(Import $import, array $metadata): void {
+	public function recordMetadata(Import $import, array $metadata): void {
 		$title = $metadata['title'] ?? null;
 		if (is_string($title) && trim($title) !== '') {
 			$import->setTitle(mb_substr(trim($title), 0, 255));
@@ -619,12 +675,16 @@ class YoutubeImportService {
 	}
 
 	/**
+	 * Public for the same reason {@see completeFrom()} is: a remote worker's failures end up
+	 * on the row through exactly this path, including the "cancelled stays cancelled" rule
+	 * below, which is easy to forget and easy to get wrong twice.
+	 *
 	 * @param string|null $detail what yt-dlp said, already cut down by
 	 *                            {@see YtDlpFailure::detail()}. Only worth carrying when
 	 *                            the code itself does not explain the failure — the
 	 *                            recognised causes have their own sentences.
 	 */
-	private function fail(Import $import, string $code, ?string $detail = null): void {
+	public function fail(Import $import, string $code, ?string $detail = null): void {
 		// A cancelled import that then fails is still cancelled: the person stopped it, and
 		// being told it "failed" would be misleading.
 		$current = $this->importMapper->statusOf($import->getId());
@@ -635,6 +695,7 @@ class YoutubeImportService {
 		$import->setStatus(Import::STATUS_FAILED);
 		$import->setErrorCode($code);
 		$import->setErrorDetail($code === ImportError::UNKNOWN ? $detail : null);
+		$import->setLeaseToken(null);
 		$import->setFinishedAt($this->clock->nowSeconds());
 
 		try {

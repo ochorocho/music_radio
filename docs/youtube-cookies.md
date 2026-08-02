@@ -96,6 +96,22 @@ read, and no reason to let a setting point a file read at one.
   pasted the link. A public-link visitor therefore never causes a stranger's session to be
   used — only the owner's, on the owner's own channel.
 
+### If imports are fetched on another machine
+
+Some servers hand the fetching to a **worker** elsewhere
+(see [remote-import.md](remote-import.md)). yt-dlp then runs there, so the jar has to travel
+there for it to be any use — and because it is the one part of an import that is a secret
+rather than a job, it does not travel unless the administrator has switched that on.
+
+If they have not, imports for your channels are made anonymously, exactly as they were
+before you stored anything. The personal settings page says so rather than leaving you to
+wonder why nothing changed.
+
+If they have, the worker fetches the jar for the length of one import, holds it in a file
+that dies with that import, and hands the rotated version back — the same handling as on the
+server, on a machine the administrator chose. The advice above about using a throwaway
+account applies with rather more force.
+
 ## When they stop working
 
 Cookies expire, and Google ends the session if you sign in to that account somewhere else.

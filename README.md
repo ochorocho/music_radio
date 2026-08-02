@@ -170,6 +170,42 @@ signs its audio links with JavaScript that yt-dlp has to execute. Without one it
 to a route yt-dlp has deprecated and YouTube refuses at random, which looks like a stale
 downloader or a flaky network and is neither. The Overview page says so when none is found.
 
+### Importing on another machine
+
+A Nextcloud host is often the worst machine available for fetching from YouTube: a
+datacentre address is what a bot check is looking at, a distribution's yt-dlp is frequently
+a year old, and shared hosting may have no ffmpeg, no JavaScript runtime and no
+`proc_open`.
+
+So the fetching can be moved somewhere that has none of those problems — a NAS, a laptop, a
+small VM. Music Radio keeps the queue and a **worker** collects from it over the API, runs
+yt-dlp, and sends the audio back. Nothing else changes: who may import, what is allowed,
+whose storage it lands in and why a failure happened are all still decided by the server.
+
+```bash
+# on the server
+occ user:add radio-worker
+occ config:app:set music_radio import_mode --value=remote
+occ config:app:set music_radio remote_worker_users --value=radio-worker
+occ user:add-app-password radio-worker
+
+# on the machine that will do the fetching
+sudo music-radio-worker install
+```
+
+`install` does the rest: downloads and verifies yt-dlp, makes a service account, writes the
+credentials, installs the systemd service, and adds a timer that runs `music-radio-worker
+update` every quarter of an hour — which keeps yt-dlp current, the part that otherwise goes
+stale in weeks and takes importing with it.
+
+The worker signs in as an ordinary account with an app password, needs no inbound
+connectivity, and hands its job back if you stop it. It keeps the audio it produces in a
+bounded local cache, so the same video imported onto a second channel is not downloaded
+again. `occ music_radio:remote:status` says whether one is collecting.
+
+**[docs/remote-import.md](docs/remote-import.md)** has the full setup, the systemd unit, how
+cancelling and retries work, and what to do when nothing is collecting.
+
 ### Bot checks, and cookies
 
 Some servers get *"YouTube asked this server to prove it is not a bot"* — a judgement about

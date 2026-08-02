@@ -20,6 +20,7 @@ use OCA\MusicRadio\Service\CookieJar;
 use OCA\MusicRadio\Service\ImportError;
 use OCA\MusicRadio\Service\JsRuntime;
 use OCA\MusicRadio\Service\MusicLibrary;
+use OCA\MusicRadio\Service\RemoteImportSettings;
 use OCA\MusicRadio\Service\ToolStatus;
 use OCA\MusicRadio\Service\YoutubeImportService;
 use OCA\MusicRadio\Service\YtDlpLocator;
@@ -61,6 +62,7 @@ class YoutubeImportServiceTest extends TestCase {
 	private IJobList&MockObject $jobList;
 	private IAppConfig&MockObject $appConfig;
 	private CookieJar&MockObject $cookieJar;
+	private RemoteImportSettings&MockObject $remote;
 	private FakeProcessRunner $runner;
 	private YoutubeImportService $service;
 	private string $temporaryDirectory;
@@ -79,6 +81,10 @@ class YoutubeImportServiceTest extends TestCase {
 		// No stored jar unless a test says otherwise: writeTo() returning null is what an
 		// owner who has never pasted cookies looks like.
 		$this->cookieJar = $this->createMock(CookieJar::class);
+		// Local mode unless a test says otherwise, which is the default a server has until
+		// an administrator hands the work to another machine.
+		$this->remote = $this->createMock(RemoteImportSettings::class);
+		$this->remote->method('isRemote')->willReturn(false);
 		$this->runner = new FakeProcessRunner();
 
 		// A real directory, so the service's own file discovery and cleanup are exercised
@@ -113,6 +119,7 @@ class YoutubeImportServiceTest extends TestCase {
 			$this->importMapper,
 			$this->channelMapper,
 			$this->locator,
+			$this->remote,
 			$this->runner,
 			$this->library,
 			$tempManager,
@@ -207,6 +214,43 @@ class YoutubeImportServiceTest extends TestCase {
 		// Stored canonical, never the string that was pasted.
 		self::assertSame(self::VIDEO_ID, $import->getVideoId());
 		self::assertSame(self::IMPORTER, $import->getUserId());
+	}
+
+	public function testInRemoteModeTheRowIsTheQueueAndNoJobIsScheduled(): void {
+		// The whole of remote mode from this end: the row is written exactly as before and
+		// nothing on this server is asked to do the work. A background job here would mean
+		// the video being fetched twice and filed twice.
+		$service = $this->serviceInRemoteMode();
+
+		$this->importMapper->method('hasActiveForVideo')->willReturn(false);
+		$this->importMapper->method('countActiveForUser')->willReturn(0);
+		$this->importMapper->method('countActiveForChannel')->willReturn(0);
+		$this->importMapper->method('insert')->willReturnCallback(static function (Import $import): Import {
+			$import->setId(99);
+
+			return $import;
+		});
+
+		$this->jobList->expects(self::never())->method('add');
+
+		$import = $service->request(self::channel(), self::IMPORTER, self::URL);
+
+		self::assertSame(Import::STATUS_QUEUED, $import->getStatus());
+		// Recorded on the row rather than left to be read from the setting later: the mode
+		// can be changed while this import is in flight.
+		self::assertTrue($import->getRemote());
+	}
+
+	public function testAJobWrittenForARemoteWorkerIsLeftAloneByThisServer(): void {
+		// Reachable when the mode was switched after a job was already scheduled. Left
+		// queued rather than failed: a worker will still collect it, and failing it would
+		// take somebody's import away for no reason.
+		$import = self::import();
+		$import->setRemote(true);
+
+		$this->importMapper->expects(self::never())->method('claim');
+
+		$this->service->perform($import);
 	}
 
 	public function testRequestRefusesSomethingThatIsNotAYoutubeLink(): void {
@@ -782,6 +826,44 @@ class YoutubeImportServiceTest extends TestCase {
 		return $this->savedImports[array_key_last($this->savedImports)];
 	}
 
+	/**
+	 * The same service, on a server that hands its imports to another machine.
+	 *
+	 * A second instance rather than reconfiguring the shared one, because `isRemote()` is
+	 * already stubbed on the mock in setUp() and a mode is not something an import should
+	 * see change underneath it.
+	 */
+	private function serviceInRemoteMode(): YoutubeImportService {
+		$remote = $this->createMock(RemoteImportSettings::class);
+		$remote->method('isRemote')->willReturn(true);
+		$remote->method('status')->willReturn(new ToolStatus(available: true, reason: null));
+
+		$tempManager = $this->createMock(ITempManager::class);
+		$tempManager->method('getTemporaryFolder')->willReturn($this->temporaryDirectory);
+
+		$clock = $this->createMock(Clock::class);
+		$clock->method('nowSeconds')->willReturn(self::NOW);
+
+		$config = $this->createMock(IConfig::class);
+		$config->method('getSystemValueString')->willReturn('');
+
+		return new YoutubeImportService(
+			$this->importMapper,
+			$this->channelMapper,
+			$this->locator,
+			$remote,
+			$this->runner,
+			$this->library,
+			$tempManager,
+			$this->jobList,
+			$this->appConfig,
+			$config,
+			$clock,
+			$this->cookieJar,
+			new NullLogger(),
+		);
+	}
+
 	private function serviceWith(YtDlpLocator $locator): YoutubeImportService {
 		$tempManager = $this->createMock(ITempManager::class);
 		$tempManager->method('getTemporaryFolder')->willReturn($this->temporaryDirectory);
@@ -796,6 +878,7 @@ class YoutubeImportServiceTest extends TestCase {
 			$this->importMapper,
 			$this->channelMapper,
 			$locator,
+			$this->remote,
 			$this->runner,
 			$this->library,
 			$tempManager,

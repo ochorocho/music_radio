@@ -1,0 +1,2588 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-or-later
+"""
+Fetch queued Music Radio imports on a machine that is not the Nextcloud server.
+
+A Nextcloud host is often the worst machine available for this. YouTube looks at the
+address a request comes from and asks datacentre ranges to prove they are not a bot; the
+yt-dlp a distribution ships is frequently a year old, which for that program means broken;
+and a server may have no ffmpeg and no JavaScript runtime at all. None of that is fixable
+from inside a PHP app.
+
+So the server keeps the queue and this keeps the network. It signs in as an ordinary
+Nextcloud account, asks for a job, runs yt-dlp, and hands the finished MP3 back. Everything
+else — who may import, what may be imported, whose storage it lands in, what a failure
+means — is decided on the server, which is why this script is as unopinionated as it is.
+
+Two things are worth knowing before reading further.
+
+**The server writes the command line.** A job arrives with the exact argv for both yt-dlp
+passes, containing three placeholders for the paths only this machine knows: `{ytdlp}`,
+`{ffmpeg}` and `{dir}` (and `{cookies}` when a jar is being lent). That is deliberate — the
+flags that make a run safe are the ones the app has tests for, and a worker installed six
+months ago picks up a change to them without being updated. What this script owes in
+return is `check_argv()`: the command it runs must start with the placeholder and must not
+carry an option that would make yt-dlp run something else.
+
+**Failures are reported, not diagnosed.** Working out why yt-dlp failed is a hundred lines
+of pattern matching against messages YouTube changes; the server already has it, and a copy
+here would be a copy going stale. So this sends back the exit code and the output, and the
+server decides what to tell the person waiting.
+
+Finished audio is kept in a bounded local cache, so the same video imported twice is fetched
+once — see `Cache`, including the two cases where a copy is deliberately not kept.
+
+Nothing outside the standard library is imported, so this file can simply be copied onto a
+machine that has python3, yt-dlp and ffmpeg.
+
+Usage:
+
+    export MUSIC_RADIO_SERVER=https://cloud.example.com
+    export MUSIC_RADIO_USER=radio-worker
+    export MUSIC_RADIO_PASSWORD_FILE=/etc/music-radio/app-password
+    music-radio-worker --check       # verify the credentials and the local tools
+    music-radio-worker               # collect jobs until stopped
+
+Get the password with `occ user:add-app-password radio-worker` on the server, and put that
+account on the allow-list in Settings → Administration → Music Radio.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import glob
+import hashlib
+import json
+import os
+import queue
+import re
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+# The version of the job descriptor this script understands. The server sends its own; a
+# mismatch is reported loudly rather than left to produce baffling failures on every job.
+PROTOCOL = 1
+
+# The runtimes yt-dlp knows how to drive, in its own order of preference. Kept in that
+# order so a machine with two installed gets the one yt-dlp itself would have picked.
+JS_RUNTIMES = ("deno", "node", "quickjs", "bun")
+
+# Options that would turn "run yt-dlp with these flags" into "run anything at all". The
+# server never sends them; refusing them here is what keeps that a fact rather than a
+# promise, and it costs one loop over a list.
+FORBIDDEN_FLAGS = (
+    "--exec",
+    "--exec-before-download",
+    "--config-location",
+    "--config-locations",
+    "--load-info-json",
+    "--load-info",
+    "--batch-file",
+)
+
+# How long to wait after a network error before asking again. Backs off so a server that
+# is down for an hour is not asked twice a second for an hour.
+RETRY_DELAYS = (2, 5, 15, 30, 60)
+
+
+class Stop(Exception):
+    """Raised inside a job when the operator has asked the worker to stop."""
+
+
+class LeaseLost(Exception):
+    """The server no longer considers this job ours: cancelled, taken back, or gone."""
+
+
+class ApiError(Exception):
+    def __init__(self, status: int, code: str, body: str = "") -> None:
+        super().__init__(f"HTTP {status}: {code or body}")
+        self.status = status
+        self.code = code
+
+
+# ----------------------------------------------------------------------- logging
+
+_verbose = False
+
+
+def log(message: str) -> None:
+    print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}", flush=True)
+
+
+def debug(message: str) -> None:
+    if _verbose:
+        log(f"  {message}")
+
+
+# --------------------------------------------------------------------------- api
+
+
+class Api:
+    """
+    The Nextcloud end of the conversation.
+
+    Authentication is HTTP Basic with an **app password**, which is how every non-browser
+    Nextcloud client signs in: the server checks it with the same code that checks
+    everything else, so brute-force protection and revocation behave the way an
+    administrator already expects. The header is sent on every request rather than waiting
+    to be challenged — urllib's authentication handlers only react to a 401, which would
+    double every call and, worse, log a failed sign-in each time.
+
+    `OCS-APIRequest: true` is not decoration. It is what marks this as an API client rather
+    than a browser, and it is what exempts the call from a CSRF token there is no session
+    to get one from.
+    """
+
+    def __init__(self, base: str, user: str, password: str, timeout: int = 30) -> None:
+        self.base = base.rstrip("/") + "/ocs/v2.php/apps/music_radio/api/v1/worker"
+        self.timeout = timeout
+        credentials = base64.b64encode(f"{user}:{password}".encode()).decode()
+        self.headers = {
+            "Authorization": f"Basic {credentials}",
+            "OCS-APIRequest": "true",
+            "Accept": "application/json",
+            "User-Agent": "music-radio-worker/1.0",
+        }
+
+    def call(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: dict | None = None,
+        body: dict | None = None,
+        data=None,
+        length: int | None = None,
+        content_type: str | None = None,
+        timeout: int | None = None,
+    ) -> dict:
+        query = dict(params or {})
+        # OCS answers XML unless asked otherwise, and every client asks in the URL.
+        query["format"] = "json"
+        url = f"{self.base}{path}?{urllib.parse.urlencode(query)}"
+
+        headers = dict(self.headers)
+        payload = data
+        if body is not None:
+            payload = json.dumps(body).encode()
+            headers["Content-Type"] = "application/json"
+        if content_type is not None:
+            headers["Content-Type"] = content_type
+        if length is not None:
+            # Set explicitly so http.client streams the body in blocks instead of reading
+            # a whole MP3 into memory to measure it.
+            headers["Content-Length"] = str(length)
+
+        request = urllib.request.Request(url, data=payload, headers=headers, method=method)
+
+        try:
+            with urllib.request.urlopen(request, timeout=timeout or self.timeout) as response:
+                return self._unwrap(response.read())
+        except urllib.error.HTTPError as error:
+            raw = error.read().decode("utf-8", "replace")
+            code = ""
+            try:
+                code = str(self._unwrap(raw.encode()).get("error", ""))
+            except Exception:
+                pass
+            raise ApiError(error.code, code, raw[:500]) from None
+
+    @staticmethod
+    def _unwrap(raw: bytes) -> dict:
+        """Take the payload out of the OCS envelope."""
+        if not raw:
+            return {}
+        document = json.loads(raw.decode("utf-8", "replace"))
+        data = document.get("ocs", {}).get("data", {})
+        return data if isinstance(data, dict) else {"data": data}
+
+    def call_with_retries(self, method: str, path: str, **kwargs) -> dict:
+        """
+        The same, for calls where a dropped connection is not a reason to abandon a job.
+
+        Only the transport is retried. An answer from the server — including a refusal — is
+        the answer, and asking again would not change it.
+        """
+        for attempt, delay in enumerate((*RETRY_DELAYS, None)):
+            try:
+                return self.call(method, path, **kwargs)
+            except (urllib.error.URLError, socket.timeout, ConnectionError) as error:
+                if delay is None:
+                    raise
+                debug(f"network error ({error}); retrying in {delay}s")
+                sleep_interruptibly(delay)
+        raise AssertionError("unreachable")
+
+
+# ------------------------------------------------------------------- local tools
+
+
+class Tools:
+    """What this machine has to offer, worked out once at start-up."""
+
+    def __init__(self, yt_dlp: str, ffmpeg_dir: str, js_runtime: str | None) -> None:
+        self.yt_dlp = yt_dlp
+        self.ffmpeg_dir = ffmpeg_dir
+        self.js_runtime = js_runtime
+
+    @property
+    def js_spec(self) -> str:
+        """What `--js-runtimes` wants, and what the server is told: `name:/path`."""
+        if not self.js_runtime:
+            return ""
+        return f"{os.path.basename(self.js_runtime)}:{self.js_runtime}"
+
+    def version(self) -> str:
+        if not self.yt_dlp:
+            return "not installed"
+        try:
+            done = subprocess.run(
+                [self.yt_dlp, "--version"], capture_output=True, text=True, timeout=30
+            )
+            return done.stdout.strip().splitlines()[0] if done.stdout.strip() else "?"
+        except Exception:
+            return "?"
+
+
+def discover_tools(args, required: bool = True) -> Tools:
+    """
+    Find yt-dlp, ffmpeg and something to run YouTube's JavaScript in.
+
+    yt-dlp is looked for in three places, in the order the Nextcloud app uses for exactly
+    the same reasons: a path somebody set explicitly, then the copy `install` and `update`
+    manage, then whatever is on PATH. The managed copy comes before the system one on
+    purpose — a distribution's yt-dlp is frequently a year old, which for this program means
+    reliably broken, while a copy this script installed is one it can refresh in a quarter
+    of an hour.
+
+    The JavaScript runtime is the one people are surprised by. YouTube signs its media URLs
+    with JavaScript that yt-dlp has to execute, and yt-dlp enables only `deno` by default —
+    so a machine with node and no deno looks to it like a machine with nothing. Finding one
+    here and naming it on the command line is what makes the difference between imports
+    that work and imports that fail at random.
+
+    @param required whether a missing tool should stop the program. False for `install` and
+                    `update`, whose whole purpose is to be run on a machine that has not got
+                    them yet.
+    """
+    yt_dlp = ""
+    for candidate in [args.yt_dlp, *managed_ytdlp_paths(), shutil.which("yt-dlp") or ""]:
+        if candidate and os.access(candidate, os.X_OK) and os.path.isfile(candidate):
+            yt_dlp = candidate
+            break
+    if not yt_dlp and required:
+        die("yt-dlp was not found. Install it with `music-radio-worker install`, "
+            "or give --yt-dlp /path/to/yt-dlp.")
+
+    ffmpeg = args.ffmpeg or shutil.which("ffmpeg")
+    if (not ffmpeg or not os.access(ffmpeg, os.X_OK)) and required:
+        die("ffmpeg was not found. Install it, or give --ffmpeg /path/to/ffmpeg.")
+
+    ffmpeg_dir = ""
+    if ffmpeg and os.access(ffmpeg, os.X_OK):
+        ffmpeg_dir = os.path.dirname(os.path.abspath(ffmpeg))
+        # yt-dlp's audio postprocessor uses both, and finding only ffmpeg turns a clear
+        # complaint now into a confusing mid-download failure later.
+        if not os.access(os.path.join(ffmpeg_dir, "ffprobe"), os.X_OK):
+            if required:
+                die(f"ffprobe was not found next to ffmpeg in {ffmpeg_dir}. Both are needed.")
+            ffmpeg_dir = ""
+
+    runtime = args.js_runtime
+    if runtime and not os.access(runtime, os.X_OK):
+        if required:
+            die(f"No JavaScript runtime can be run at {runtime}.")
+        runtime = ""
+    if not runtime:
+        for name in JS_RUNTIMES:
+            found = shutil.which(name)
+            if found:
+                runtime = found
+                break
+
+    return Tools(
+        os.path.abspath(yt_dlp) if yt_dlp else "",
+        ffmpeg_dir,
+        os.path.abspath(runtime) if runtime else None,
+    )
+
+
+# --------------------------------------------------------------------- the cache
+
+
+class Cache:
+    """
+    Finished audio, kept between jobs.
+
+    The same video really does get imported more than once — onto a second channel, after a
+    track was deleted, or because a job was retried — and each of those is otherwise a fresh
+    download and a fresh transcode. A hit here turns a job that takes half a minute into one
+    that takes as long as the upload.
+
+    **What is stored.** One MP3 per video id, with a small JSON sidecar holding the metadata
+    the server is sent (title, duration, availability) and a fingerprint of the audio
+    settings the file was produced with. The fingerprint is what keeps a stale entry from
+    being served if the server ever asks for a different format: it is taken from the
+    `--audio-format` and `--audio-quality` the server put on the command line, so a change
+    there invalidates the cache without anybody having to remember to.
+
+    **What is deliberately not stored.** Anything fetched with the channel owner's cookies.
+    A cached copy would be reused for somebody else's import, and YouTube's answer to a
+    signed-in request is not the same as its answer to an anonymous one — a members-only
+    track fetched for the account that has access could otherwise turn up on a channel whose
+    owner has none. Those jobs skip the cache in both directions.
+
+    **It is a cache, not a library.** Entries are evicted, least-recently-used first, to stay
+    under a byte budget, and it is safe to delete the whole directory at any time. Nothing
+    depends on an entry being there.
+    """
+
+    #: Video ids as YouTube writes them. The id arrives from the server, which has already
+    #: reduced it to this shape — checked again because it is about to become a filename.
+    SAFE_ID = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
+
+    def __init__(self, directory: str | None, max_bytes: int) -> None:
+        self.max_bytes = max_bytes
+        self.directory = directory if max_bytes > 0 else None
+
+        if self.directory is None:
+            return
+
+        try:
+            os.makedirs(self.directory, mode=0o700, exist_ok=True)
+        except OSError as error:
+            # Not fatal, and deliberately so: a worker that cannot write a cache is a worker
+            # that does slightly more work, not a broken one. Common enough to say plainly —
+            # a hardened systemd unit without a CacheDirectory= lands exactly here.
+            log(f"warning: no cache at {self.directory} ({error}); every import will be downloaded")
+            self.directory = None
+
+    @property
+    def enabled(self) -> bool:
+        return self.directory is not None
+
+    # -- reading ------------------------------------------------------------
+
+    def get(self, video_id: str, fingerprint: str) -> tuple[str, dict] | None:
+        """The stored audio and its metadata, if this exact thing is here."""
+        paths = self._paths(video_id)
+        if paths is None:
+            return None
+        audio, sidecar = paths
+
+        try:
+            with open(sidecar, encoding="utf-8") as file:
+                stored = json.load(file)
+            size = os.path.getsize(audio)
+        except (OSError, json.JSONDecodeError):
+            return None
+
+        if size <= 0 or stored.get("fingerprint") != fingerprint:
+            return None
+
+        # Least-recently-*used*, so a video imported every week outlives one fetched once
+        # and forgotten. Nothing else reads these timestamps.
+        now = time.time()
+        for path in (audio, sidecar):
+            try:
+                os.utime(path, (now, now))
+            except OSError:
+                pass
+
+        return audio, stored.get("metadata", {})
+
+    # -- writing ------------------------------------------------------------
+
+    def put(self, video_id: str, source: str, metadata: dict, fingerprint: str) -> None:
+        """
+        Keep a copy of a file that has just been produced.
+
+        Best effort throughout. A cache that cannot be written is not a reason to fail an
+        import that has otherwise worked.
+        """
+        paths = self._paths(video_id)
+        if paths is None:
+            return
+        audio, sidecar = paths
+
+        try:
+            size = os.path.getsize(source)
+        except OSError:
+            return
+
+        # One file that would fill the whole budget is not worth evicting everything else
+        # for; the next hit would be its own eviction.
+        if size > self.max_bytes:
+            debug(f"not caching {video_id}: {size} bytes is larger than the whole cache")
+            return
+
+        def copy(handle) -> None:
+            with open(source, "rb") as original:
+                shutil.copyfileobj(original, handle)
+
+        try:
+            # Written under another name and moved into place, because a worker killed
+            # mid-copy would otherwise leave a truncated MP3 that a later job would upload
+            # as somebody's track. os.replace is atomic within a directory.
+            self._write(audio, copy)
+            self._write(
+                sidecar,
+                lambda handle: handle.write(json.dumps({
+                    "fingerprint": fingerprint,
+                    "metadata": metadata,
+                }).encode()),
+            )
+        except OSError as error:
+            debug(f"could not cache {video_id}: {error}")
+            self._remove(video_id)
+            return
+
+        self._evict()
+
+    def _write(self, path: str, fill) -> None:
+        temporary = path + f".{os.getpid()}.part"
+        try:
+            handle = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(handle, "wb") as file:
+                fill(file)
+            os.replace(temporary, path)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+
+    # -- housekeeping -------------------------------------------------------
+
+    def _evict(self) -> None:
+        """Drop the least recently used entries until the budget is met."""
+        entries = self._entries()
+        total = sum(size for _, size, _ in entries)
+        if total <= self.max_bytes:
+            return
+
+        for video_id, size, _ in sorted(entries, key=lambda entry: entry[2]):
+            if total <= self.max_bytes:
+                break
+            self._remove(video_id)
+            total -= size
+            debug(f"evicted {video_id} from the cache")
+
+    def _entries(self) -> list[tuple[str, int, float]]:
+        """Every stored video as (id, bytes on disk, last used)."""
+        if self.directory is None:
+            return []
+
+        found = []
+        for name in os.listdir(self.directory):
+            if not name.endswith(".mp3"):
+                continue
+            video_id = name[:-4]
+            paths = self._paths(video_id)
+            if paths is None:
+                continue
+            try:
+                size = sum(os.path.getsize(path) for path in paths if os.path.exists(path))
+                used = os.path.getmtime(paths[0])
+            except OSError:
+                continue
+            found.append((video_id, size, used))
+
+        return found
+
+    def _remove(self, video_id: str) -> None:
+        paths = self._paths(video_id)
+        if paths is None:
+            return
+        for path in paths:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+    def _paths(self, video_id: str) -> tuple[str, str] | None:
+        if self.directory is None or not self.SAFE_ID.match(video_id):
+            return None
+
+        stem = os.path.join(self.directory, video_id)
+
+        return stem + ".mp3", stem + ".json"
+
+    def summary(self) -> str:
+        if self.directory is None:
+            return "off"
+
+        entries = self._entries()
+        used = sum(size for _, size, _ in entries) / 1024 / 1024
+
+        return (f"{self.directory} — {len(entries)} tracks, {used:.0f} MB "
+                f"of {self.max_bytes / 1024 / 1024:.0f} MB")
+
+
+def default_cache_dir() -> str:
+    """
+    Where a cache lives when nobody says otherwise.
+
+    The XDG location, which is what a person running this from a shell expects. The systemd
+    unit overrides it with a `CacheDirectory=`, because that unit forbids writing to a home
+    directory — and the worker's account has not got one anyway.
+    """
+    base = os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
+
+    return os.path.join(base, "music-radio-worker")
+
+
+def audio_fingerprint(argv: list[str]) -> str:
+    """
+    What the server asked the audio to be, as a short string.
+
+    Only the settings that decide what the produced file *is* — not the limits, the paths or
+    the cookie flags, which change the run without changing its output. Stored beside a
+    cached file so that a change of format on the server retires the old entries by itself.
+    """
+    settings = []
+    for flag in ("--audio-format", "--audio-quality"):
+        if flag in argv:
+            settings.append(argv[argv.index(flag) + 1])
+
+    return "/".join(settings) or "unknown"
+
+
+# ------------------------------------------------------------------ the machine
+
+
+class Layout:
+    """
+    Every path this script owns, in one place.
+
+    Two arrangements, chosen by whether the person running `install` is root. A machine with
+    an administrator gets the ordinary system locations and a service account; somebody
+    setting a worker up on a NAS they log into as themselves gets the XDG ones and a user
+    unit. Nothing else in the script has to know which happened.
+    """
+
+    SERVICE_USER = "music-radio"
+
+    def __init__(self, root: bool) -> None:
+        self.root = root
+
+        if root:
+            self.script = "/usr/local/bin/music-radio-worker"
+            self.config_dir = "/etc/music-radio"
+            self.state_dir = "/var/lib/music-radio-worker"
+            self.unit_dir = "/etc/systemd/system"
+            self.service_user: str | None = self.SERVICE_USER
+            self.work_dir = "/run/music-radio-worker"
+            self.cache_dir = "/var/cache/music-radio-worker"
+            self.wanted_by = "multi-user.target"
+        else:
+            home = os.path.expanduser("~")
+            config = os.environ.get("XDG_CONFIG_HOME") or os.path.join(home, ".config")
+            data = os.environ.get("XDG_DATA_HOME") or os.path.join(home, ".local", "share")
+
+            self.script = os.path.join(home, ".local", "bin", "music-radio-worker")
+            self.config_dir = os.path.join(config, "music-radio-worker")
+            self.state_dir = os.path.join(data, "music-radio-worker")
+            self.unit_dir = os.path.join(config, "systemd", "user")
+            # A user unit runs as the person who owns it; naming an account would be an
+            # error rather than a restriction.
+            self.service_user = None
+            self.work_dir = ""
+            self.cache_dir = ""
+            self.wanted_by = "default.target"
+
+    @property
+    def env_file(self) -> str:
+        return os.path.join(self.config_dir, "worker.env")
+
+    @property
+    def password_file(self) -> str:
+        return os.path.join(self.config_dir, "app-password")
+
+    @property
+    def yt_dlp(self) -> str:
+        return os.path.join(self.state_dir, "bin", "yt-dlp")
+
+
+def managed_ytdlp_paths() -> list[str]:
+    """
+    Where an installed copy of yt-dlp might be, whoever is asking.
+
+    Both layouts, always — and that is the point. The worker runs as the service account,
+    which has neither the home directory the user layout would look in nor any reason to
+    know that root installed the copy it is about to run.
+    """
+    return [Layout(root=True).yt_dlp, Layout(root=False).yt_dlp]
+
+
+class Packages:
+    """
+    What to tell somebody to install, in the words their system uses.
+
+    Prints, never runs. Installing system packages is a root-level change to a machine, and
+    a script that does it on its own initiative is a script that has decided something that
+    was not its to decide — the more so on the two distributions where ffmpeg needs a
+    third-party repository enabled first, which no amount of `install -y` can arrange.
+    """
+
+    #: binary, install command, ffmpeg package, JavaScript package, anything else to say
+    MANAGERS = (
+        ("apt-get", "apt-get install -y", "ffmpeg", "nodejs", ""),
+        ("dnf", "dnf install -y", "ffmpeg", "nodejs",
+         "ffmpeg comes from RPM Fusion on this distribution; enable it first."),
+        ("yum", "yum install -y", "ffmpeg", "nodejs",
+         "ffmpeg comes from RPM Fusion on this distribution; enable it first."),
+        ("zypper", "zypper install -y", "ffmpeg", "nodejs",
+         "ffmpeg comes from Packman on openSUSE; add that repository first."),
+        ("apk", "apk add", "ffmpeg", "nodejs", ""),
+        ("pacman", "pacman -S --noconfirm", "ffmpeg", "nodejs", ""),
+        ("brew", "brew install", "ffmpeg", "node", ""),
+    )
+
+    def __init__(self) -> None:
+        self.manager = None
+        for entry in self.MANAGERS:
+            if shutil.which(entry[0]):
+                self.manager = entry
+                break
+
+    def advise(self, need_ffmpeg: bool, need_js: bool) -> None:
+        """Say what is missing and exactly how to get it."""
+        if not need_ffmpeg and not need_js:
+            return
+
+        wanted = []
+        if need_ffmpeg:
+            wanted.append("ffmpeg (with ffprobe)")
+        if need_js:
+            wanted.append("a JavaScript runtime — YouTube signs its audio links with "
+                          "JavaScript that yt-dlp has to run")
+
+        log(f"missing: {', and '.join(wanted)}")
+
+        if self.manager is None:
+            log("  install them with this system's package manager.")
+            return
+
+        _, command, ffmpeg_package, js_package, note = self.manager
+        packages = ([ffmpeg_package] if need_ffmpeg else []) + ([js_package] if need_js else [])
+        prefix = "" if os.geteuid() == 0 else "sudo "
+        log(f"  {prefix}{command} {' '.join(packages)}")
+        if note:
+            log(f"  {note}")
+
+
+class Systemd:
+    """
+    Writing units and telling systemd about them.
+
+    Absent on purpose in a container, which is both a real way to run this and how it gets
+    tested — so everything here degrades to saying what it would have done rather than
+    failing.
+    """
+
+    def __init__(self, layout: Layout, dry_run: bool) -> None:
+        self.layout = layout
+        self.dry_run = dry_run
+        # `systemctl` being on PATH is not the question — a Debian container has it and no
+        # systemd behind it, which is exactly the case this has to get right. /run/systemd/
+        # system is the canonical "systemd is the init system here" test, and it is the one
+        # systemd's own tooling uses.
+        self.available = bool(shutil.which("systemctl")) and os.path.isdir("/run/systemd/system")
+
+    def user_flag(self) -> list[str]:
+        return [] if self.layout.root else ["--user"]
+
+    def write(self, name: str, body: str) -> None:
+        path = os.path.join(self.layout.unit_dir, name)
+        if self.dry_run:
+            log(f"  would write {path}")
+            return
+        os.makedirs(self.layout.unit_dir, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as file:
+            file.write(body)
+        os.chmod(path, 0o644)
+        log(f"  wrote {path}")
+
+    def run(self, *arguments: str) -> bool:
+        command = ["systemctl", *self.user_flag(), *arguments]
+        if self.dry_run:
+            log(f"  would run {' '.join(command)}")
+            return True
+        try:
+            done = subprocess.run(command, capture_output=True, text=True, timeout=60)
+        except Exception as error:  # noqa: BLE001
+            log(f"  {' '.join(command)} failed: {error}")
+            return False
+        if done.returncode != 0:
+            log(f"  {' '.join(command)} failed: {done.stderr.strip() or done.stdout.strip()}")
+            return False
+        return True
+
+    def is_active(self, unit: str) -> bool:
+        if not self.available:
+            return False
+        try:
+            done = subprocess.run(["systemctl", *self.user_flag(), "is-active", "--quiet", unit],
+                                  capture_output=True, timeout=30)
+            return done.returncode == 0
+        except Exception:  # noqa: BLE001
+            return False
+
+
+# ------------------------------------------------------------------ the download
+
+
+class YtDlp:
+    """
+    Fetching yt-dlp, the same way the Nextcloud app does it for a server.
+
+    This is a port of `lib/Service/YtDlpInstaller.php`, and deliberately a faithful one —
+    the asset matrix and the checksum handling are the parts that took a while to get right,
+    and two implementations that disagree about which build suits a machine would be worse
+    than one.
+
+    **On the choice of asset.** The obvious `yt-dlp_linux` is a ~38 MB PyInstaller bundle,
+    one per architecture and libc, and picking the wrong one produces a file that exists, is
+    executable, and cannot run. The plain `yt-dlp` asset is a ~3 MB zipimport archive with a
+    `#!/usr/bin/env python3` shebang: the same program, any CPU, any libc, a thirteenth of
+    the download. It is preferred wherever python3 will run it — which on a machine running
+    *this script* is always, so in practice the matrix below is a fallback for the
+    impossible case.
+
+    **On the checksum.** It comes from the same host over the same TLS connection as the
+    binary, so it is not an independent signature — GitHub and TLS remain the trust anchor.
+    What it catches is a truncated transfer and a mismatch between the file asked for and
+    the file received, both of which would otherwise fail confusingly much later.
+    """
+
+    RELEASE_BASE = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/"
+    CHECKSUMS = RELEASE_BASE + "SHA2-256SUMS"
+    MIN_PYTHON = (3, 9)
+    TIMEOUT = 300
+
+    @staticmethod
+    def asset_for(system: str, machine: str, musl: bool, python_ok: bool) -> str | None:
+        """Which release asset suits this machine. Pure, so the whole matrix is checkable."""
+        if python_ok:
+            return "yt-dlp"
+
+        if system == "Darwin":
+            return "yt-dlp_macos"
+        if system != "Linux":
+            # Windows builds exist; nothing about this script has ever been run there and
+            # claiming support without having tried it would be a lie.
+            return None
+
+        machine = machine.lower()
+        if machine in ("x86_64", "amd64"):
+            return "yt-dlp_musllinux" if musl else "yt-dlp_linux"
+        if machine in ("aarch64", "arm64"):
+            return "yt-dlp_musllinux_aarch64" if musl else "yt-dlp_linux_aarch64"
+
+        # Published only as a zip, which would need unpacking; python is the better answer
+        # on a 32-bit ARM box anyway.
+        return None
+
+    @classmethod
+    def asset_here(cls) -> str | None:
+        import platform
+
+        # This script is running, so python3 is present by definition; the version is the
+        # only open question.
+        python_ok = sys.version_info >= cls.MIN_PYTHON
+        musl = bool(glob.glob("/lib/ld-musl-*"))
+
+        return cls.asset_for(platform.system(), platform.machine(), musl, python_ok)
+
+    @classmethod
+    def published_checksum(cls, asset: str) -> str | None:
+        """
+        The checksum published beside the current release.
+
+        Fetched on its own, and that is what makes a fifteen-minute update timer reasonable:
+        a few kilobytes of text answers "is there anything new" without pulling the binary.
+        """
+        try:
+            sums = fetch(cls.CHECKSUMS, timeout=60).decode("utf-8", "replace")
+        except Exception as error:  # noqa: BLE001
+            log(f"could not fetch the yt-dlp checksums: {error}")
+            return None
+
+        for line in sums.splitlines():
+            fields = line.split()
+            if len(fields) >= 2 and os.path.basename(fields[1]) == asset:
+                return fields[0].lower()
+
+        return None
+
+    @classmethod
+    def install(cls, target: str, expected: str | None = None) -> tuple[str, str] | None:
+        """
+        Download, verify, prove it runs, and move it into place.
+
+        @return (version, asset), or None when anything went wrong — said out loud first.
+        """
+        asset = cls.asset_here()
+        if asset is None:
+            import platform
+            log(f"no yt-dlp build is published for {platform.system()}/{platform.machine()}. "
+                f"Install yt-dlp yourself and point at it with --yt-dlp.")
+            return None
+
+        checksum = expected if expected is not None else cls.published_checksum(asset)
+        if checksum is None:
+            log(f"no published checksum for {asset}; refusing to install it")
+            return None
+
+        try:
+            binary = fetch(cls.RELEASE_BASE + asset, timeout=cls.TIMEOUT)
+        except Exception as error:  # noqa: BLE001
+            log(f"could not download {asset}: {error}")
+            return None
+
+        actual = hashlib.sha256(binary).hexdigest()
+        if actual != checksum:
+            log(f"the downloaded {asset} does not match its published checksum, so it was discarded")
+            return None
+
+        os.makedirs(os.path.dirname(target), mode=0o755, exist_ok=True)
+
+        # Written under another name, proved, and only then moved into place: a download
+        # that dies half way through must not leave a truncated binary where a working one
+        # was. 0755 rather than the server's 0700, because here the account that installs it
+        # is not the account that runs it.
+        staging = target + ".new"
+        with open(staging, "wb") as file:
+            file.write(binary)
+        os.chmod(staging, 0o755)
+
+        version = cls.confirm_it_runs(staging, asset)
+        if version is None:
+            os.unlink(staging)
+            return None
+
+        os.replace(staging, target)
+
+        return version, asset
+
+    @staticmethod
+    def confirm_it_runs(path: str, asset: str) -> str | None:
+        """
+        Run the thing before trusting it.
+
+        A file of the right size with the right checksum can still be unusable — the python
+        archive needs an interpreter, a PyInstaller build needs a matching libc. Finding
+        that out now, with the old copy still in place, is much better than finding out
+        during somebody's first import.
+        """
+        try:
+            done = subprocess.run([path, "--version"], capture_output=True, text=True, timeout=60,
+                                  env={"PATH": "/usr/local/bin:/usr/bin:/bin", "LC_ALL": "C"})
+        except Exception as error:  # noqa: BLE001
+            log(f"the downloaded {asset} could not be run: {error}")
+            return None
+
+        version = (done.stdout or "").strip().splitlines()
+        if not version or not re.match(r"^\d{4}\.\d{2}\.\d{2}", version[0]):
+            log(f"the downloaded {asset} did not report a version, so it was discarded. "
+                f"{(done.stderr or '')[-300:].strip()}")
+            return None
+
+        return version[0]
+
+
+def fetch(url: str, timeout: int = 60) -> bytes:
+    """A plain GET. GitHub answers some clients differently, so it is given a name."""
+    request = urllib.request.Request(url, headers={"User-Agent": "music-radio-worker/1.0"})
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return response.read()
+
+
+def sha256_of(path: str) -> str | None:
+    try:
+        digest = hashlib.sha256()
+        with open(path, "rb") as file:
+            for block in iter(lambda: file.read(1024 * 1024), b""):
+                digest.update(block)
+        return digest.hexdigest()
+    except OSError:
+        return None
+
+
+# -------------------------------------------------------------------- templates
+#
+# The unit files live here rather than beside this script, so that `install` works from a
+# copy of this one file — which is how the documentation tells people to deploy it, and
+# would be a strange thing to promise and then break. Review them before installing with
+# `music-radio-worker install --print-unit` and `--print-env`.
+
+WORKER_UNIT = """\
+# Written by `music-radio-worker install`. Edit freely; install will not overwrite it
+# without --force.
+[Unit]
+Description=Music Radio import worker
+Documentation=https://github.com/rothjochen/music_radio/blob/main/docs/remote-import.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+@ACCOUNT@EnvironmentFile=@ENV_FILE@
+ExecStart=@SCRIPT@
+Restart=always
+RestartSec=10
+
+# Stopping is not an interruption: SIGTERM makes the worker give its current job back to
+# the queue, so another worker picks it up in seconds rather than the server waiting for
+# the lease to expire. Long enough for that plus a yt-dlp shutting down politely.
+KillSignal=SIGTERM
+TimeoutStopSec=60
+
+# It downloads from the internet and runs a program that parses whatever it is given, so
+# it is worth confining even though it holds no data of its own.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+
+# Downloads land here, and nowhere else is writable. Cleared when the service stops, so a
+# worker killed mid-job leaves nothing behind.
+RuntimeDirectory=music-radio-worker
+
+# Finished audio is kept between jobs, so the same video imported twice is downloaded once.
+# ProtectHome above means the default location under ~/.cache would not be writable, and
+# the service account has no home anyway.
+# Empty it with: systemctl clean --what=cache music-radio-worker
+CacheDirectory=music-radio-worker
+
+[Install]
+WantedBy=@WANTEDBY@
+"""
+
+UPDATE_UNIT = """\
+# Written by `music-radio-worker install`.
+[Unit]
+Description=Update yt-dlp for the Music Radio import worker
+Documentation=https://github.com/rothjochen/music_radio/blob/main/docs/remote-import.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Runs as root, unlike the worker: it writes the managed yt-dlp and restarts the service.
+# --quiet keeps the journal empty on the runs where nothing has changed, which is nearly
+# all of them.
+ExecStart=@SCRIPT@ update --quiet
+"""
+
+UPDATE_TIMER = """\
+# Written by `music-radio-worker install`.
+#
+# Quarter-hourly, because yt-dlp goes stale in weeks and the check costs a few kilobytes:
+# `update` compares published checksums before it downloads anything, so a run with nothing
+# to do is one small request and no output.
+[Unit]
+Description=Keep the Music Radio import worker up to date
+Documentation=https://github.com/rothjochen/music_radio/blob/main/docs/remote-import.md
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=15min
+# So a fleet of workers does not arrive at GitHub in the same second.
+RandomizedDelaySec=2min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+"""
+
+ENV_TEMPLATE = """\
+# Settings for the Music Radio import worker, written by `music-radio-worker install`.
+#
+# Every one of these can also be given as a command-line flag; see
+# `music-radio-worker --help` and docs/remote-import.md.
+
+# The Nextcloud this worker collects jobs from. Must be https: the app password is sent
+# with every request.
+MUSIC_RADIO_SERVER=@SERVER@
+
+# The account it signs in as. A dedicated one — it needs no files, no groups and no admin
+# rights, only a place on the worker allow-list in the Music Radio admin settings.
+MUSIC_RADIO_USER=@USER@
+
+# Its app password, in a file readable only by the worker. Create one on the server with:
+#   occ user:add-app-password @USER@
+MUSIC_RADIO_PASSWORD_FILE=@PASSWORD_FILE@
+
+# What this worker calls itself in the queue. Defaults to the machine's hostname.
+#MUSIC_RADIO_WORKER_NAME=@NAME@
+
+# Where to find the tools, when they are not on PATH. yt-dlp is looked for here first, then
+# at the copy `music-radio-worker update` manages, then on PATH.
+#MUSIC_RADIO_YTDLP=@YTDLP@
+#MUSIC_RADIO_FFMPEG=/usr/bin/ffmpeg
+#MUSIC_RADIO_JS_RUNTIME=/usr/bin/deno
+
+# Finished audio is kept between jobs, so importing the same video twice downloads it once.
+# It is a cache: entries are dropped, least recently used first, to stay under the budget,
+# and deleting the directory at any time is safe. Set the budget to 0 to keep nothing.
+#MUSIC_RADIO_CACHE_MAX_MB=2048
+
+# Whether `update` may replace this script with the copy the server ships. On by default,
+# and worth understanding before turning it off — or leaving on. See docs/remote-import.md.
+#MUSIC_RADIO_SELF_UPDATE=1
+
+# How long to wait when the queue is empty.
+#MUSIC_RADIO_POLL_INTERVAL=5
+"""
+
+
+# ------------------------------------------------------------------- the command
+
+
+def check_argv(argv: list[str]) -> None:
+    """
+    Refuse a command line that is not the one this script agreed to run.
+
+    The server dictating the flags is what keeps them in one tested place, and the price of
+    that is being explicit about the trust involved: a Nextcloud that has been taken over
+    could otherwise ask its workers to run anything. Two checks close that off — the
+    program run is always this machine's yt-dlp, and no option may hand execution to
+    something else — and neither can be got around by a cleverer job descriptor.
+    """
+    if not argv or argv[0] != "{ytdlp}":
+        raise ValueError("the command does not start with the yt-dlp placeholder")
+
+    for argument in argv[1:]:
+        for flag in FORBIDDEN_FLAGS:
+            if argument == flag or argument.startswith(flag + "="):
+                raise ValueError(f"the command carries a forbidden option: {flag}")
+
+
+def substitute(argv: list[str], tools: Tools, work_dir: str, cookie_file: str | None) -> list[str]:
+    """Fill in the three or four paths only this machine knows."""
+    replacements = {
+        "{ytdlp}": tools.yt_dlp,
+        "{ffmpeg}": tools.ffmpeg_dir,
+        "{dir}": work_dir,
+        "{cookies}": cookie_file or "",
+    }
+
+    filled = []
+    for argument in argv:
+        for placeholder, value in replacements.items():
+            argument = argument.replace(placeholder, value)
+        filled.append(argument)
+    return filled
+
+
+def child_environment(work_dir: str) -> dict:
+    """
+    The environment yt-dlp gets: small, and pointing at a directory that is about to be
+    deleted.
+
+    Anything the program decides to write beside itself — a cache, a .pyc — should land
+    somewhere temporary rather than in the worker user's home, which may be shared, may be
+    unwritable, and is not something an import should be leaving traces in.
+
+    The proxy variables are the exception, and are passed through deliberately: a worker
+    behind one needs it, and unlike the server this machine's route to the internet is the
+    whole reason it is doing the job.
+    """
+    environment = {
+        "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
+        "HOME": work_dir,
+        "XDG_CACHE_HOME": work_dir,
+        "TMPDIR": work_dir,
+        "LC_ALL": "C",
+        "PYTHONDONTWRITEBYTECODE": "1",
+    }
+    for name in ("http_proxy", "https_proxy", "no_proxy", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY"):
+        if name in os.environ:
+            environment[name] = os.environ[name]
+    return environment
+
+
+# ----------------------------------------------------------------------- running
+
+_stopping = threading.Event()
+
+
+def sleep_interruptibly(seconds: float) -> None:
+    if _stopping.wait(seconds):
+        raise Stop()
+
+
+def parse_progress(line: str, prefix: str) -> float | None:
+    """
+    How far along a download is, from one line of yt-dlp's output.
+
+    The template is the server's — it asks for `downloaded, estimate, total` — and both
+    size fields are read because either can be `NA`: a progressive file knows its length up
+    front, a fragmented one only has an estimate, and a small file can report `NA` for the
+    estimate and a real number for the total. Preferring whichever is numeric is the
+    difference between a progress bar and a division by zero.
+    """
+    if not line.startswith(prefix + ":"):
+        return None
+
+    fields = line[len(prefix) + 1:].split()
+    if len(fields) < 3:
+        return None
+
+    def number(field: str) -> float | None:
+        try:
+            return float(field)
+        except ValueError:
+            return None
+
+    downloaded = number(fields[0])
+    total = number(fields[1]) or number(fields[2])
+    if downloaded is None or total is None or total <= 0:
+        return None
+
+    return min(1.0, downloaded / total)
+
+
+def run_capturing(argv: list[str], environment: dict, work_dir: str, timeout: int):
+    """Run to completion, keeping the output. Used for the probe pass, which is quick."""
+    try:
+        done = subprocess.run(
+            argv,
+            cwd=work_dir,
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        return done.returncode, done.stdout, done.stderr, False
+    except subprocess.TimeoutExpired as expired:
+        return 1, _text(expired.stdout), _text(expired.stderr), True
+
+
+def _text(value) -> str:
+    if value is None:
+        return ""
+    return value if isinstance(value, str) else value.decode("utf-8", "replace")
+
+
+def run_download(argv, environment, work_dir, timeout, on_progress):
+    """
+    Run the download, watching it as it goes.
+
+    Both pipes are drained by threads, which is not decoration: yt-dlp writes a progress
+    line every fraction of a second and several kilobytes to stderr, and a full pipe stops
+    the child dead. Reading one pipe in the main loop while the other fills is the classic
+    way to deadlock a subprocess.
+
+    The main loop waits on the queue with a short timeout rather than blocking on a read,
+    so that `on_progress` is still called during the long quiet stretch when yt-dlp has
+    finished downloading and ffmpeg is transcoding with nothing to say. That silence is
+    exactly when a server left unheartbeaten would conclude this worker had died.
+    """
+    process = subprocess.Popen(
+        argv,
+        cwd=work_dir,
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+
+    lines: queue.Queue = queue.Queue()
+    errors: list[str] = []
+
+    def pump_stdout() -> None:
+        assert process.stdout is not None
+        for line in process.stdout:
+            lines.put(line.rstrip("\n"))
+        lines.put(None)
+
+    def pump_stderr() -> None:
+        assert process.stderr is not None
+        for line in process.stderr:
+            errors.append(line.rstrip("\n"))
+
+    threading.Thread(target=pump_stdout, daemon=True).start()
+    threading.Thread(target=pump_stderr, daemon=True).start()
+
+    stdout: list[str] = []
+    deadline = time.monotonic() + timeout
+    timed_out = False
+    finished = False
+
+    while not finished:
+        if _stopping.is_set():
+            terminate(process)
+            raise Stop()
+
+        if time.monotonic() > deadline:
+            timed_out = True
+            terminate(process)
+            break
+
+        try:
+            line = lines.get(timeout=1.0)
+        except queue.Empty:
+            line = ""
+        if line is None:
+            finished = True
+        elif line:
+            stdout.append(line)
+
+        # Called on every turn of the loop, including the empty ones. Whether it reports
+        # anything is its own decision; what matters here is that it gets the chance.
+        if on_progress(line or "", process) is False:
+            terminate(process)
+            raise LeaseLost()
+
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        process.kill()
+
+    code = process.returncode if process.returncode is not None else 1
+
+    return code, "\n".join(stdout), "\n".join(errors), timed_out
+
+
+def terminate(process) -> None:
+    """Ask, then insist. yt-dlp cleans up partial files when it is asked politely."""
+    try:
+        process.terminate()
+        process.wait(timeout=10)
+    except Exception:
+        try:
+            process.kill()
+        except Exception:
+            pass
+
+
+# -------------------------------------------------------------------- one import
+
+
+class Worker:
+    def __init__(self, api: Api, tools: Tools, cache: Cache, name: str, args) -> None:
+        self.api = api
+        self.tools = tools
+        self.cache = cache
+        self.name = name
+        self.args = args
+        self.job: dict | None = None
+
+    # -- the loop ----------------------------------------------------------
+
+    def run_forever(self) -> int:
+        log(f"worker '{self.name}' ready — yt-dlp {self.tools.version()}, "
+            f"ffmpeg in {self.tools.ffmpeg_dir}, "
+            f"javascript {self.tools.js_spec or 'none (imports may fail)'}")
+        log(f"cache: {self.cache.summary()}")
+
+        idle_since = None
+        while not _stopping.is_set():
+            try:
+                job = self.claim()
+            except Stop:
+                break
+            except ApiError as error:
+                if error.status == 409:
+                    log("this server is not handing out imports (it is in local mode); waiting")
+                    self._sleep(60)
+                    continue
+                if error.status in (401, 403):
+                    log(f"refused: {error}. Check the account, the app password and the "
+                        f"worker allow-list on the server.")
+                    return 1
+                log(f"could not ask for work: {error}")
+                self._sleep(30)
+                continue
+            except Exception as error:  # noqa: BLE001 - the loop must survive anything
+                log(f"could not ask for work: {error}")
+                self._sleep(30)
+                continue
+
+            if job is None:
+                if idle_since is None:
+                    idle_since = time.monotonic()
+                    debug("nothing waiting")
+                self._sleep(self.args.poll_interval)
+                continue
+
+            idle_since = None
+            try:
+                self.handle(job)
+            except Stop:
+                break
+            except Exception as error:  # noqa: BLE001
+                log(f"job {job.get('importId')} ended badly: {error}")
+                # Only worth reporting if the job is still ours. Anything that took the
+                # lease away has already put a reason on the row.
+                if self.job is not None:
+                    self.report_failure(job, "download", code="unknown", stderr=str(error))
+
+            if self.args.once:
+                break
+
+        # A job still in hand on the way out is given back rather than left to time out:
+        # another worker can have it seconds from now, and whoever is waiting sees a queued
+        # row instead of a stalled one.
+        self.release_current()
+        log("stopped")
+        return 0
+
+    def _sleep(self, seconds: float) -> None:
+        sleep_interruptibly(seconds)
+
+    # -- the API calls ------------------------------------------------------
+
+    def claim(self) -> dict | None:
+        answer = self.api.call(
+            "POST",
+            "/claim",
+            body={"worker": self.name, "jsRuntime": self.tools.js_spec},
+        )
+        job = answer.get("job")
+        if not job:
+            return None
+
+        if job.get("protocol", PROTOCOL) != PROTOCOL:
+            log(f"warning: the server speaks protocol {job.get('protocol')} and this worker "
+                f"speaks {PROTOCOL}. Update the worker script.")
+
+        self.job = job
+        log(f"job {job['importId']}: {job['url']}")
+        return job
+
+    def report_failure(self, job, stage, *, code="", exit_code=1, timed_out=False,
+                       produced=False, cookies_used=False, stdout="", stderr="") -> None:
+        # Said out loud, not only sent. The server turns this into a sentence for whoever
+        # asked for the import, but somebody watching the worker's journal would otherwise
+        # see a job start and then nothing at all — which is the same thing they would see
+        # if it had hung.
+        reason = code or ("timed out" if timed_out else f"exit {exit_code}")
+        detail = next((line for line in reversed(stderr.splitlines()) if line.strip()), "")
+        doing = "asking what the video is" if stage == "probe" else "downloading"
+        log(f"job {job['importId']}: failed while {doing} — {reason}"
+            + (f": {detail.strip()[:160]}" if detail else ""))
+
+        try:
+            self.api.call_with_retries(
+                "POST",
+                f"/jobs/{job['importId']}/fail",
+                body={
+                    "lease": job["lease"],
+                    "stage": stage,
+                    "code": code,
+                    "exitCode": exit_code,
+                    "timedOut": timed_out,
+                    "producedFile": produced,
+                    "cookiesUsed": cookies_used,
+                    "jsRuntime": bool(self.tools.js_runtime),
+                    # Tails only. The first lines of a yt-dlp failure are the download it
+                    # was attempting; the last are why it stopped.
+                    "stdout": stdout[-4000:],
+                    "stderr": stderr[-8000:],
+                },
+            )
+        except Exception as error:  # noqa: BLE001
+            log(f"could not report the failure of job {job['importId']}: {error}")
+        finally:
+            self.job = None
+
+    def release_current(self) -> None:
+        job = self.job
+        if job is None:
+            return
+        self.job = None
+        try:
+            self.api.call("POST", f"/jobs/{job['importId']}/release", body={"lease": job["lease"]})
+            log(f"job {job['importId']} given back to the queue")
+        except Exception as error:  # noqa: BLE001
+            log(f"could not give job {job['importId']} back: {error}")
+
+    # -- doing the work ------------------------------------------------------
+
+    def handle(self, job: dict) -> None:
+        work_dir = tempfile.mkdtemp(prefix="music-radio-", dir=self.args.work_dir or None)
+        try:
+            self.process(job, work_dir)
+        except ApiError as error:
+            if error.status not in (403, 404):
+                raise
+            raise LeaseLost() from None
+        except LeaseLost:
+            # Cancelled, taken back after a silence, or the channel was deleted. The server
+            # already knows what it thinks; there is nothing to report and nothing to undo.
+            log(f"job {job['importId']} is no longer ours")
+            self.job = None
+        finally:
+            shutil.rmtree(work_dir, ignore_errors=True)
+
+    def process(self, job: dict, work_dir: str) -> None:
+        try:
+            check_argv(job["probeArgv"])
+            check_argv(job["downloadArgv"])
+        except ValueError as error:
+            # Loud, and the job goes back rather than being failed: this is a disagreement
+            # about what the server is allowed to ask for, not a bad video, and somebody
+            # needs to look at it.
+            log(f"refusing job {job['importId']}: {error}")
+            self.release_current()
+            return
+
+        if self.serve_from_cache(job):
+            return
+
+        environment = child_environment(work_dir)
+        cookie_file = self.fetch_cookies(job, work_dir)
+
+        # --- what is this? -------------------------------------------------
+        argv = substitute(job["probeArgv"], self.tools, work_dir, cookie_file)
+        debug(f"probe: {' '.join(argv)}")
+        code, stdout, stderr, timed_out = run_capturing(
+            argv, environment, work_dir, job["probeTimeoutSeconds"]
+        )
+
+        if code != 0 or timed_out:
+            self.return_cookies(job, cookie_file)
+            self.report_failure(job, "probe", exit_code=code, timed_out=timed_out,
+                                cookies_used=bool(cookie_file), stdout=stdout, stderr=stderr)
+            return
+
+        try:
+            metadata = json.loads(stdout)
+        except json.JSONDecodeError:
+            self.report_failure(job, "probe", code="unknown", exit_code=code,
+                                cookies_used=bool(cookie_file), stdout=stdout, stderr=stderr)
+            return
+
+        answer = self.api.call_with_retries(
+            "POST",
+            f"/jobs/{job['importId']}/metadata",
+            body={"lease": job["lease"], "metadata": self.trim_metadata(metadata)},
+        )
+        if not answer.get("proceed"):
+            # The server has refused it — too long, a live stream, an age gate — and has
+            # already written that on the row. Nothing more to say.
+            log(f"job {job['importId']} refused by the server: {answer.get('code')}")
+            self.job = None
+            return
+
+        title = metadata.get("title") or job["videoId"]
+        log(f"job {job['importId']}: fetching “{title}”")
+
+        # --- fetch it -------------------------------------------------------
+        argv = substitute(job["downloadArgv"], self.tools, work_dir, cookie_file)
+        debug(f"download: {' '.join(argv)}")
+
+        beat = Heartbeat(self.api, job, job["heartbeatSeconds"], job["progressPrefix"])
+        code, stdout, stderr, timed_out = run_download(
+            argv, environment, work_dir, job["downloadTimeoutSeconds"], beat.saw
+        )
+
+        self.return_cookies(job, cookie_file)
+
+        produced = self.produced_file(work_dir, job["outputStem"])
+        if code != 0 or timed_out or produced is None:
+            self.report_failure(job, "download", exit_code=code, timed_out=timed_out,
+                                produced=produced is not None, cookies_used=bool(cookie_file),
+                                stdout=stdout, stderr=stderr)
+            return
+
+        # --- keep a copy ------------------------------------------------------
+        # Before the upload rather than after it, so a file that took a minute to produce
+        # survives even if handing it back fails. A cookie-authenticated run is never
+        # stored — see Cache for why that is not merely caution.
+        if not cookie_file:
+            self.cache.put(
+                job["videoId"],
+                produced,
+                self.trim_metadata(metadata),
+                audio_fingerprint(job["downloadArgv"]),
+            )
+
+        # --- hand it back ----------------------------------------------------
+        self.upload(job, produced, metadata)
+
+    def serve_from_cache(self, job: dict) -> bool:
+        """
+        Hand back a copy already on this machine, if there is one.
+
+        The server is still asked. It records the title and duration from the metadata and
+        applies its own rules to it — the length limit may have been lowered since this was
+        fetched, and it is the server's business either way, not this script's. What is
+        skipped is the two yt-dlp runs, which is the whole cost of an import.
+
+        Cookie jobs never look, for the reason in {@see Cache}: what YouTube served to one
+        signed-in account is not what it would serve to an anonymous request.
+        """
+        if job.get("cookies") or not self.cache.enabled:
+            return False
+
+        found = self.cache.get(job["videoId"], audio_fingerprint(job["downloadArgv"]))
+        if found is None:
+            return False
+
+        path, metadata = found
+
+        answer = self.api.call_with_retries(
+            "POST",
+            f"/jobs/{job['importId']}/metadata",
+            body={"lease": job["lease"], "metadata": metadata},
+        )
+        if not answer.get("proceed"):
+            log(f"job {job['importId']} refused by the server: {answer.get('code')}")
+            self.job = None
+            return True
+
+        log(f"job {job['importId']}: already on this machine — “{metadata.get('title') or job['videoId']}”")
+        # Uploaded straight out of the cache. Nothing here deletes it: the copy is the point,
+        # and eviction is the only thing that removes one.
+        self.upload(job, path, metadata)
+
+        return True
+
+    def trim_metadata(self, metadata: dict) -> dict:
+        """
+        Send the fields the server actually reads, and not the rest.
+
+        `--dump-single-json` produces a document of a few hundred kilobytes, most of it
+        format lists, thumbnails and subtitle URLs. The server wants five values out of it.
+        """
+        wanted = (
+            "title", "duration", "is_live", "live_status", "availability",
+            "age_limit", "uploader", "channel", "extractor",
+        )
+        return {key: metadata[key] for key in wanted if key in metadata}
+
+    def produced_file(self, work_dir: str, stem: str) -> str | None:
+        """
+        The single audio file the download should have left behind.
+
+        More than one match means something unexpected happened and it is not clear which
+        file is the track, so nothing is guessed at.
+        """
+        candidates = [
+            path
+            for path in glob.glob(os.path.join(work_dir, stem + ".*"))
+            if os.path.isfile(path)
+            and not path.endswith(".info.json")
+            and not path.endswith(".part")
+        ]
+        return candidates[0] if len(candidates) == 1 else None
+
+    def upload(self, job: dict, path: str, metadata: dict) -> None:
+        size = os.path.getsize(path)
+        if size > job["maxUploadBytes"]:
+            self.report_failure(job, "download", code="too_large", exit_code=0, produced=True)
+            return
+
+        duration = metadata.get("duration")
+        duration_ms = int(float(duration) * 1000) if isinstance(duration, (int, float)) else 0
+
+        log(f"job {job['importId']}: uploading {size / 1024 / 1024:.1f} MB")
+
+        with open(path, "rb") as audio:
+            try:
+                answer = self.api.call(
+                    "PUT",
+                    f"/jobs/{job['importId']}/audio",
+                    params={"lease": job["lease"], "durationMs": duration_ms},
+                    data=audio,
+                    length=size,
+                    content_type="audio/mpeg",
+                    # Generous: this is a whole file over whatever connection the worker
+                    # has, and the server writes it into somebody's storage at the far end.
+                    timeout=600,
+                )
+            except ApiError as error:
+                # 403 here is the good kind of failure. The lease is cleared the moment a
+                # job is filed, so a retried upload — the one whose answer was lost on the
+                # way back — is refused rather than filed twice.
+                if error.status in (403, 404):
+                    log(f"job {job['importId']}: the server has already finished with it")
+                    self.job = None
+                    return
+                log(f"job {job['importId']}: the server refused the upload ({error})")
+                self.job = None
+                return
+
+        log(f"job {job['importId']}: done — track {answer.get('trackId')}")
+        self.job = None
+
+    # -- cookies -------------------------------------------------------------
+
+    def fetch_cookies(self, job: dict, work_dir: str) -> str | None:
+        """
+        Borrow the channel owner's YouTube cookies, if the server lends them at all.
+
+        Off unless an administrator switched it on. What arrives is somebody's session, so
+        it is written 0600 into a directory that is deleted when the job ends, and it is
+        never logged.
+        """
+        if not job.get("cookies"):
+            return None
+
+        try:
+            answer = self.api.call("GET", f"/jobs/{job['importId']}/cookies",
+                                   params={"lease": job["lease"]})
+        except ApiError as error:
+            log(f"job {job['importId']}: could not fetch cookies ({error}); going without")
+            return None
+
+        jar = answer.get("cookies")
+        if not jar:
+            return None
+
+        path = os.path.join(work_dir, "cookies.txt")
+        # Created empty and locked down before anything is written to it: writing first and
+        # chmod'ing after leaves the cookies readable for the width of that gap.
+        handle = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(handle, "w") as file:
+            file.write(jar)
+
+        debug("using the channel owner's cookies")
+        return path
+
+    def return_cookies(self, job: dict, cookie_file: str | None) -> None:
+        """
+        Give back the jar as yt-dlp left it.
+
+        YouTube rotates session cookies and yt-dlp writes the rotated set out. Without this
+        the stored copy would be the one that was pasted, going staler every run — and it
+        would go stale fastest on exactly the channels whose imports are struggling.
+
+        Sent after failures too, for that reason.
+        """
+        if not cookie_file or not os.path.isfile(cookie_file):
+            return
+
+        try:
+            with open(cookie_file, encoding="utf-8", errors="replace") as file:
+                jar = file.read()
+        except OSError:
+            return
+
+        if not jar.strip():
+            return
+
+        try:
+            self.api.call("POST", f"/jobs/{job['importId']}/cookies",
+                          body={"lease": job["lease"], "cookies": jar})
+        except Exception as error:  # noqa: BLE001
+            debug(f"could not return the cookie jar: {error}")
+
+
+class Heartbeat:
+    """
+    Telling the server this job is still alive, and hearing back that it is not wanted.
+
+    The answer is the only way a cancellation reaches this machine: whoever pressed the
+    button is talking to the Nextcloud, not to us. So the reply is read every time, and a
+    false return aborts the download.
+    """
+
+    # How many missed beats a download survives. Ten at fifteen seconds is well over two
+    # minutes of network trouble — longer than the lease, so the server will have given the
+    # job to somebody else by then anyway.
+    TOLERATED_FAILURES = 10
+
+    def __init__(self, api: Api, job: dict, interval: int, prefix: str) -> None:
+        self.api = api
+        self.job = job
+        self.interval = max(2, interval)
+        self.prefix = prefix
+        self.fraction = 0.0
+        self.last = 0.0
+        self.failures = 0
+
+    def saw(self, line: str, process) -> bool:
+        fraction = parse_progress(line, self.prefix)
+        if fraction is not None:
+            self.fraction = fraction
+
+        now = time.monotonic()
+        if now - self.last < self.interval:
+            return True
+        self.last = now
+
+        # Once the bytes are in, yt-dlp hands over to ffmpeg and says nothing for a while.
+        # Reported as its own phase so the interface can show something honest instead of a
+        # bar stuck at 100%.
+        phase = "converting" if self.fraction >= 1.0 else "downloading"
+
+        try:
+            answer = self.api.call(
+                "POST",
+                f"/jobs/{self.job['importId']}/progress",
+                body={
+                    "lease": self.job["lease"],
+                    "phase": phase,
+                    "progress": int(self.fraction * 100),
+                },
+            )
+        except ApiError as error:
+            if error.status in (403, 404):
+                # The lease is gone: cancelled, taken back after a silence, or the channel
+                # was deleted. Either way this download is no longer wanted.
+                return False
+            self.failures += 1
+            return self.failures <= self.TOLERATED_FAILURES
+        except Exception:  # noqa: BLE001
+            # A dropped connection is not a reason to throw away a download that is going
+            # perfectly well. The lease outlives several missed beats, and the job is given
+            # back automatically if the network never comes back at all.
+            self.failures += 1
+            return self.failures <= self.TOLERATED_FAILURES
+
+        self.failures = 0
+
+        return not answer.get("cancelled", False)
+
+
+# ------------------------------------------------------------------------- entry
+
+
+# ----------------------------------------------------------------- setting up
+
+
+def install(args) -> int:
+    """
+    Make this machine into a worker.
+
+    Idempotent, and never destructive: everything it writes it checks for first, and the one
+    file it will not replace without being told twice is the password. Re-running it after
+    changing something is the intended way to use it, not a risk.
+
+    What it does *not* do is install system packages. ffmpeg and a JavaScript runtime are
+    root-level changes to a machine, and on two distributions ffmpeg needs a third-party
+    repository enabled first — a decision that belongs to whoever runs the box. So those are
+    reported, with the exact command, and the final check says they are still missing.
+    """
+    layout = Layout(root=os.geteuid() == 0)
+    systemd = Systemd(layout, args.dry_run)
+    packages = Packages()
+
+    log(f"installing as {'root' if layout.root else os.environ.get('USER') or 'this user'}"
+        f"{' (dry run — nothing will be written)' if args.dry_run else ''}")
+    log(f"python:     {sys.version.split()[0]}")
+
+    # --- what is already here ------------------------------------------------
+    tools = discover_tools(args, required=False)
+    log(f"ffmpeg:     {tools.ffmpeg_dir or 'not found'}")
+    log(f"javascript: {tools.js_spec or 'not found'}")
+    packages.advise(need_ffmpeg=tools.ffmpeg_dir is None, need_js=tools.js_runtime is None)
+
+    # --- yt-dlp --------------------------------------------------------------
+    if tools.yt_dlp and not args.force:
+        log(f"yt-dlp:     {tools.yt_dlp} ({tools.version()}) — already installed")
+    elif args.dry_run:
+        log(f"  would install yt-dlp ({YtDlp.asset_here()}) at {layout.yt_dlp}")
+    else:
+        log(f"→ downloading yt-dlp ({YtDlp.asset_here()})")
+        installed = YtDlp.install(layout.yt_dlp)
+        if installed is None:
+            return 1
+        version, asset = installed
+        log(f"  installed yt-dlp {version} ({asset}) at {layout.yt_dlp}")
+
+    # --- the account ---------------------------------------------------------
+    if layout.root:
+        create_service_account(layout, args.dry_run)
+
+    # --- credentials ---------------------------------------------------------
+    server, user, password = collect_credentials(args, layout)
+    if server is None:
+        return 1
+
+    write_config(layout, args, server, user, password)
+
+    # --- this script ---------------------------------------------------------
+    install_self(layout, args.dry_run)
+
+    # --- the service ---------------------------------------------------------
+    if args.no_systemd or not systemd.available:
+        log("systemd: not available here, so no service was installed.")
+        log(f"  run the worker with: {layout.script}")
+    else:
+        install_units(layout, systemd, args)
+
+    # --- and does it work? ---------------------------------------------------
+    if args.dry_run:
+        log("dry run finished — nothing was written")
+        return 0
+
+    # Before the check below, which runs as root and therefore cannot discover this.
+    check_service_can_read(layout)
+
+    log("")
+    api = Api(server, user, password)
+    return check(api, discover_tools(args, required=False), build_cache(args), args)
+
+
+def create_service_account(layout: Layout, dry_run: bool) -> None:
+    """An account with no home, no shell and nothing else to do."""
+    import pwd
+
+    try:
+        pwd.getpwnam(Layout.SERVICE_USER)
+        log(f"account:    {Layout.SERVICE_USER} — already exists")
+        return
+    except KeyError:
+        pass
+
+    command = ["useradd", "--system", "--no-create-home", "--shell", "/usr/sbin/nologin",
+               Layout.SERVICE_USER]
+    if dry_run:
+        log(f"  would run {' '.join(command)}")
+        return
+
+    try:
+        done = subprocess.run(command, capture_output=True, text=True, timeout=60)
+    except Exception as error:  # noqa: BLE001
+        log(f"could not create the {Layout.SERVICE_USER} account: {error}")
+        return
+
+    if done.returncode != 0:
+        log(f"could not create the {Layout.SERVICE_USER} account: "
+            f"{done.stderr.strip() or done.stdout.strip()}")
+        return
+
+    log(f"→ created the {Layout.SERVICE_USER} account")
+
+
+def collect_credentials(args, layout: Layout) -> tuple[str | None, str, str]:
+    """
+    What the worker signs in with, from the flags, the environment, or a person.
+
+    An existing password file counts as an answer, so re-running install on a configured
+    machine asks nothing.
+    """
+    import getpass
+
+    server = (args.server or "").rstrip("/")
+    user = args.user or ""
+    password = args.password or ""
+
+    if args.password_file and not password:
+        try:
+            with open(args.password_file, encoding="utf-8") as file:
+                password = file.read().strip()
+        except OSError as error:
+            log(f"could not read {args.password_file}: {error}")
+
+    if not password and os.path.isfile(layout.password_file) and not args.force:
+        try:
+            with open(layout.password_file, encoding="utf-8") as file:
+                password = file.read().strip()
+            log(f"password:   kept the one already in {layout.password_file}")
+        except OSError:
+            pass
+
+    interactive = sys.stdin.isatty() and not args.dry_run
+
+    if not server and interactive:
+        server = input("Nextcloud URL (https://cloud.example.com): ").strip().rstrip("/")
+    if not user and interactive:
+        user = input("worker account [radio-worker]: ").strip() or "radio-worker"
+    if not password and interactive:
+        # Never echoed, and never passed as an argument — a command line is visible in ps.
+        password = getpass.getpass("app password (occ user:add-app-password): ").strip()
+
+    if not server:
+        log("no server given. Use --server, or set MUSIC_RADIO_SERVER.")
+        return None, user, password
+    if not https_enough(server):
+        log("the server URL must be https:// — the app password is sent with every request.")
+        return None, user, password
+    if not user:
+        log("no account given. Use --user, or set MUSIC_RADIO_USER.")
+        return None, user, password
+    if not password:
+        log("no app password given. Make one on the server with: "
+            f"occ user:add-app-password {user}")
+        return None, user, password
+
+    return server, user, password
+
+
+def write_config(layout: Layout, args, server: str, user: str, password: str) -> None:
+    """The env file and the password, with the permissions each of them needs."""
+    if not args.dry_run:
+        prepare_config_dir(layout)
+
+    body = (ENV_TEMPLATE
+            .replace("@SERVER@", server)
+            .replace("@USER@", user)
+            .replace("@PASSWORD_FILE@", layout.password_file)
+            .replace("@NAME@", socket.gethostname())
+            .replace("@YTDLP@", layout.yt_dlp))
+
+    # The existence rules are checked before the dry run reports anything, so what it says
+    # is what a real run would do — a dry run that promises to write a file it would in fact
+    # leave alone is worse than no dry run.
+    if os.path.isfile(layout.env_file) and not args.force:
+        log(f"config:     {layout.env_file} — left alone (--force to replace)")
+    elif args.dry_run:
+        log(f"  would write {layout.env_file}")
+    else:
+        write_private(layout.env_file, body, 0o640, layout.service_user, group_only=True)
+        log(f"→ wrote {layout.env_file}")
+
+    # The one file that is never replaced by accident. Its content is a credential, and an
+    # install re-run with an empty prompt must not blank it.
+    if os.path.isfile(layout.password_file) and not args.force:
+        log(f"password:   {layout.password_file} — left alone (--force to replace)")
+        return
+
+    if args.dry_run:
+        log(f"  would write {layout.password_file}")
+        return
+
+    write_private(layout.password_file, password + "\n", 0o600, layout.service_user)
+    log(f"→ wrote {layout.password_file}")
+
+
+def prepare_config_dir(layout: Layout) -> None:
+    """
+    The directory the credentials live in, owned so that the service can get at them.
+
+    The group is the point, and it is easy to get wrong in a way that looks right: a
+    password file owned by the service account with mode 0600 is still unreadable to it if
+    the directory above is `root:root 0750`, because reading a file means traversing every
+    directory on the way to it. That produces a worker that installs cleanly, passes its own
+    check as root, and then fails at startup with a permission error naming a file whose
+    permissions are perfectly correct.
+
+    So the directory is `root:<service account> 0750`: nobody else can look in it, and the
+    one account that has to can.
+
+    Set on every install rather than only at creation, because a directory left behind by an
+    earlier version is exactly the case that needs fixing.
+    """
+    os.makedirs(layout.config_dir, exist_ok=True)
+    os.chmod(layout.config_dir, 0o750)
+
+    if layout.service_user is None:
+        return
+
+    try:
+        shutil.chown(layout.config_dir, "root", layout.service_user)
+    except (LookupError, PermissionError, OSError) as error:
+        log(f"  could not set ownership on {layout.config_dir}: {error}")
+
+
+def readable_by(path: str, uid: int, gid: int) -> bool:
+    """
+    Whether this account could actually open that file.
+
+    Walks the whole path, because permission to read a file is permission to traverse every
+    directory above it — the part that had to be learned the hard way. Groups beyond the
+    account's primary one are consulted too, so an administrator who has arranged access
+    some other way is not told they have not.
+    """
+    def allowed(target: str, need: int) -> bool:
+        try:
+            info = os.stat(target)
+        except OSError:
+            return False
+
+        if uid == 0:
+            return True
+        if info.st_uid == uid:
+            return bool(info.st_mode & (need << 6))
+        if info.st_gid == gid or info.st_gid in supplementary_groups(uid):
+            return bool(info.st_mode & (need << 3))
+
+        return bool(info.st_mode & need)
+
+    # 4 is read, 1 is execute — which on a directory means "may be traversed".
+    if not allowed(path, 4):
+        return False
+
+    directory = os.path.dirname(os.path.abspath(path))
+    while True:
+        if not allowed(directory, 1):
+            return False
+        parent = os.path.dirname(directory)
+        if parent == directory:
+            return True
+        directory = parent
+
+
+def supplementary_groups(uid: int) -> list[int]:
+    try:
+        import grp
+        import pwd
+
+        name = pwd.getpwuid(uid).pw_name
+
+        return [group.gr_gid for group in grp.getgrall() if name in group.gr_mem]
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def check_service_can_read(layout: Layout) -> None:
+    """
+    Prove the account the service runs as can read what the service needs.
+
+    Checked here because the alternative place to find out is `journalctl` after a failed
+    start, and because everything else `install` does it does as root — which can read
+    anything and therefore proves nothing.
+    """
+    if layout.service_user is None:
+        return
+
+    try:
+        import pwd
+
+        account = pwd.getpwnam(layout.service_user)
+    except (KeyError, ImportError):
+        return
+
+    for path in (layout.password_file, layout.env_file):
+        if os.path.isfile(path) and not readable_by(path, account.pw_uid, account.pw_gid):
+            log(f"warning: {layout.service_user} cannot read {path}, so the service will not "
+                f"start. Check the ownership of {os.path.dirname(path)}.")
+
+
+def write_private(path: str, body: str, mode: int, owner: str | None, group_only: bool = False) -> None:
+    """
+    Write a secret, locked down before a byte of it exists.
+
+    Created empty with the right mode rather than written and chmod'ed after: the other
+    order leaves the contents readable for the width of that gap.
+    """
+    handle = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    with os.fdopen(handle, "w", encoding="utf-8") as file:
+        file.write(body)
+    os.chmod(path, mode)
+
+    if owner is None:
+        return
+
+    try:
+        # The env file is root's, readable by the group the service runs as; the password
+        # belongs to the service account outright.
+        shutil.chown(path, "root" if group_only else owner, owner)
+    except (LookupError, PermissionError, OSError) as error:
+        log(f"  could not set ownership on {path}: {error}")
+
+
+def install_self(layout: Layout, dry_run: bool) -> None:
+    """Put this script where the unit expects to find it."""
+    source = os.path.abspath(__file__)
+    if source == layout.script:
+        log(f"script:     {layout.script} — already in place")
+        return
+
+    if dry_run:
+        log(f"  would copy this script to {layout.script}")
+        return
+
+    os.makedirs(os.path.dirname(layout.script), exist_ok=True)
+    shutil.copyfile(source, layout.script)
+    os.chmod(layout.script, 0o755)
+    log(f"→ installed this script at {layout.script}")
+
+
+def install_units(layout: Layout, systemd: Systemd, args) -> bool:
+    """The worker service, and the timer that keeps it current."""
+    account = ""
+    if layout.service_user:
+        account = (f"# A user of its own, with no login and nothing else to do. The worker needs "
+                   f"only to\n# run yt-dlp and reach the network.\n"
+                   f"User={layout.service_user}\nGroup={layout.service_user}\n")
+
+    worker_unit = os.path.join(layout.unit_dir, "music-radio-worker.service")
+    if os.path.isfile(worker_unit) and not args.force:
+        log(f"service:    {worker_unit} — left alone (--force to replace)")
+    else:
+        systemd.write("music-radio-worker.service", WORKER_UNIT
+                      .replace("@ACCOUNT@", account)
+                      .replace("@ENV_FILE@", layout.env_file)
+                      .replace("@SCRIPT@", layout.script)
+                      .replace("@WANTEDBY@", layout.wanted_by))
+
+    if not args.no_timer:
+        systemd.write("music-radio-worker-update.service",
+                      UPDATE_UNIT.replace("@SCRIPT@", layout.script))
+        systemd.write("music-radio-worker-update.timer", UPDATE_TIMER)
+
+    systemd.run("daemon-reload")
+
+    if args.no_start:
+        log("  not started (--no-start). Start it with: "
+            f"systemctl {'--user ' if not layout.root else ''}enable --now music-radio-worker")
+        return False
+
+    # Reported from what actually happened, not from having tried. A worker that failed to
+    # start and said it was running is the one message here that would send somebody looking
+    # in the wrong place.
+    started = systemd.run("enable", "--now", "music-radio-worker.service")
+    if not args.no_timer:
+        systemd.run("enable", "--now", "music-radio-worker-update.timer")
+
+    if started:
+        log("→ the worker is running; follow it with: journalctl -fu music-radio-worker")
+    else:
+        log("  the service was installed but would not start; see: "
+            "systemctl status music-radio-worker")
+
+    return started
+
+
+# ---------------------------------------------------------------- keeping up
+
+
+def update(args) -> int:
+    """
+    Keep this machine current: yt-dlp, this script, and the prerequisites.
+
+    Written to be *cheap when there is nothing to do*, because a timer runs it every quarter
+    of an hour. The two questions it asks — has the release changed, has the server's copy
+    of this script changed — are both answered by a few kilobytes, and nothing is downloaded
+    until one of them says yes. With `--quiet` a run that changed nothing prints nothing at
+    all, so the journal stays readable.
+    """
+    layout = Layout(root=os.geteuid() == 0)
+    systemd = Systemd(layout, args.dry_run)
+    changed = False
+
+    def say(message: str) -> None:
+        if not args.quiet:
+            log(message)
+
+    # --- this script ---------------------------------------------------------
+    # A server that cannot be reached is not a reason to skip the rest. The two halves of
+    # this command are independent, and the yt-dlp half is the one that fails imports when
+    # it is left undone.
+    if args.script:
+        changed = bool(update_script(args, layout, systemd)) or changed
+
+    # --- yt-dlp --------------------------------------------------------------
+    target = existing_managed_ytdlp() or layout.yt_dlp
+    asset = YtDlp.asset_here()
+    if asset is None:
+        log("no yt-dlp build is published for this machine; install one yourself")
+        return 1
+
+    published = YtDlp.published_checksum(asset)
+    if published is None:
+        return 1
+
+    if not args.force and sha256_of(target) == published:
+        say(f"yt-dlp is current at {target}")
+    elif args.dry_run:
+        log(f"would update yt-dlp at {target}")
+    else:
+        before = Tools(target, "", None).version() if os.path.isfile(target) else "none"
+        installed = YtDlp.install(target, expected=published)
+        if installed is None:
+            return 1
+        version, asset = installed
+        log(f"updated yt-dlp {before} → {version} ({asset}) at {target}")
+        changed = True
+
+    # A worker in use elsewhere would otherwise be updated invisibly and never used.
+    in_use = discover_tools(args, required=False).yt_dlp
+    if in_use and os.path.abspath(in_use) != os.path.abspath(target):
+        log(f"note: imports use {in_use}, not the copy this command manages ({target}).")
+
+    # --- the prerequisites ---------------------------------------------------
+    tools = discover_tools(args, required=False)
+    if tools.ffmpeg_dir is None or tools.js_runtime is None:
+        Packages().advise(need_ffmpeg=tools.ffmpeg_dir is None, need_js=tools.js_runtime is None)
+        changed = True
+
+    if sys.version_info < YtDlp.MIN_PYTHON:
+        log(f"warning: python {'.'.join(map(str, sys.version_info[:2]))} is older than "
+            f"{'.'.join(map(str, YtDlp.MIN_PYTHON))}, which yt-dlp needs")
+
+    # --- and the server ------------------------------------------------------
+    protocol = args.__dict__.get("_server_protocol")
+    if protocol is not None and protocol != PROTOCOL:
+        log(f"warning: the server speaks protocol {protocol} and this worker speaks "
+            f"{PROTOCOL}. Update whichever is behind.")
+
+    if not changed:
+        say("nothing to do")
+
+    return 0
+
+
+def update_script(args, layout: Layout, systemd: Systemd) -> bool | None:
+    """
+    Take the worker script the server ships, when it differs from this one.
+
+    The server holds the copy that matches its own protocol, so this is what keeps a worker
+    installed months ago from drifting out of step. It is also, plainly, the server deciding
+    what code this machine runs — so the bytes are checked against the checksum it declared,
+    they have to compile, and the previous script is kept as `.bak`. `--no-script` turns the
+    whole thing off.
+
+    @return whether anything changed, or None on a failure worth exiting for
+    """
+    if not args.server or not args.user:
+        # Never installed, or installed without credentials. Nothing to check against.
+        return None
+
+    try:
+        password = read_password(args)
+    except SystemExit:
+        return None
+
+    api = Api(args.server, args.user, password)
+
+    try:
+        status = api.call("GET", "")
+    except Exception as error:  # noqa: BLE001
+        log(f"could not reach the server: {error}")
+        return None
+
+    # Stashed for the protocol warning at the end, so this stays one round trip.
+    args.__dict__["_server_protocol"] = status.get("protocol")
+
+    offered = status.get("workerScript") or {}
+    wanted = offered.get("sha256")
+    if not wanted:
+        # An install with no worker directory. Nothing to update to, and not a fault.
+        return False
+
+    mine = sha256_of(os.path.abspath(__file__))
+    if mine == wanted:
+        return False
+
+    if args.dry_run:
+        log(f"would replace this script with the server's copy ({offered.get('version')})")
+        return True
+
+    try:
+        answer = api.call("GET", "/script")
+    except Exception as error:  # noqa: BLE001
+        log(f"could not fetch the worker script: {error}")
+        return None
+
+    body = answer.get("script") or ""
+    encoded = body.encode()
+
+    if hashlib.sha256(encoded).hexdigest() != wanted:
+        log("the worker script the server sent does not match the checksum it declared, "
+            "so it was discarded")
+        return None
+
+    try:
+        compile(body, "music-radio-worker", "exec")
+    except SyntaxError as error:
+        log(f"the worker script the server sent will not compile ({error}); keeping this one")
+        return None
+
+    target = layout.script if os.path.isfile(layout.script) else os.path.abspath(__file__)
+
+    try:
+        shutil.copyfile(target, target + ".bak")
+        staging = target + ".new"
+        with open(staging, "wb") as file:
+            file.write(encoded)
+        os.chmod(staging, 0o755)
+        os.replace(staging, target)
+    except OSError as error:
+        log(f"could not replace {target}: {error}")
+        return None
+
+    log(f"updated the worker script to {offered.get('version')} at {target} "
+        f"(previous kept as {os.path.basename(target)}.bak)")
+
+    # The running worker has already read its own code, so nothing changes until it is
+    # restarted. Safe at any moment: SIGTERM makes it hand its current job back first.
+    if systemd.available and systemd.is_active("music-radio-worker.service"):
+        systemd.run("restart", "music-radio-worker.service")
+        log("  restarted the worker")
+
+    return True
+
+
+def read_env_file(path: str) -> dict:
+    """The KEY=VALUE lines of an env file, and nothing cleverer."""
+    values = {}
+    try:
+        with open(path, encoding="utf-8") as file:
+            for line in file:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                values[key.strip()] = value.strip().strip('"').strip("'")
+    except OSError:
+        return {}
+
+    return values
+
+
+def load_installed_config(args) -> None:
+    """
+    Fill in whatever an earlier install already answered.
+
+    Two things need this. Re-running `install` on a configured machine should not ask again
+    for a URL that is written down three lines away — and the update timer runs
+    `music-radio-worker update` as a systemd oneshot with *no* EnvironmentFile, which is
+    deliberate (it runs as root, the worker does not) but leaves it with no idea which
+    server to ask about a new script.
+
+    Anything given explicitly wins; this only supplies what is missing.
+    """
+    layouts = [Layout(root=True), Layout(root=False)]
+    if os.geteuid() != 0:
+        layouts.reverse()
+
+    for layout in layouts:
+        values = read_env_file(layout.env_file)
+        if not values:
+            continue
+
+        args.server = args.server or values.get("MUSIC_RADIO_SERVER", "")
+        args.user = args.user or values.get("MUSIC_RADIO_USER", "")
+        args.password_file = args.password_file or values.get("MUSIC_RADIO_PASSWORD_FILE", "")
+        if not args.password_file and os.path.isfile(layout.password_file):
+            args.password_file = layout.password_file
+        break
+
+
+def existing_managed_ytdlp() -> str | None:
+    """The managed copy that is actually here, whichever layout installed it."""
+    for path in managed_ytdlp_paths():
+        if os.path.isfile(path):
+            return path
+
+    return None
+
+
+def https_enough(server: str) -> bool:
+    # The app password travels on every request. Over plain HTTP it travels in the clear,
+    # which is not a trade-off worth offering silently — but a development instance on this
+    # machine is not the internet.
+    return server.startswith("https://") or "localhost" in server or "ddev.site" in server
+
+
+def die(message: str) -> None:
+    log(f"error: {message}")
+    sys.exit(1)
+
+
+def read_password(args) -> str:
+    if args.password_file:
+        try:
+            with open(args.password_file, encoding="utf-8") as file:
+                return file.read().strip()
+        except OSError as error:
+            die(f"could not read {args.password_file}: {error}")
+    if args.password:
+        return args.password
+    die("no app password given. Use --password-file, or set MUSIC_RADIO_PASSWORD.")
+    raise AssertionError("unreachable")
+
+
+def parse_args(argv: list[str]):
+    parser = argparse.ArgumentParser(
+        prog="music-radio-worker",
+        description="Fetch queued Music Radio imports for a Nextcloud server.",
+        epilog="With no command, collects jobs until stopped.",
+    )
+    # A positional verb rather than a flag per action, and optional so that the bare
+    # invocation the systemd unit uses keeps working untouched.
+    parser.add_argument("command", nargs="?", default="run",
+                        choices=("run", "check", "install", "update"),
+                        help="run (default), check, install, or update")
+
+    parser.add_argument("--server", default=os.environ.get("MUSIC_RADIO_SERVER", ""),
+                        help="Nextcloud base URL, e.g. https://cloud.example.com")
+    parser.add_argument("--user", default=os.environ.get("MUSIC_RADIO_USER", ""),
+                        help="the Nextcloud account this worker signs in as")
+    parser.add_argument("--password", default=os.environ.get("MUSIC_RADIO_PASSWORD", ""),
+                        help="its app password (prefer --password-file)")
+    parser.add_argument("--password-file", default=os.environ.get("MUSIC_RADIO_PASSWORD_FILE", ""),
+                        help="a file containing the app password")
+    parser.add_argument("--name", default=os.environ.get("MUSIC_RADIO_WORKER_NAME", socket.gethostname()),
+                        help="what this worker calls itself in the queue")
+    parser.add_argument("--yt-dlp", default=os.environ.get("MUSIC_RADIO_YTDLP", ""),
+                        help="path to yt-dlp (default: the managed copy, else PATH)")
+    parser.add_argument("--ffmpeg", default=os.environ.get("MUSIC_RADIO_FFMPEG", ""),
+                        help="path to ffmpeg (default: found on PATH)")
+    parser.add_argument("--js-runtime", default=os.environ.get("MUSIC_RADIO_JS_RUNTIME", ""),
+                        help="path to deno, node, quickjs or bun (default: found on PATH)")
+    parser.add_argument("--poll-interval", type=float,
+                        default=float(os.environ.get("MUSIC_RADIO_POLL_INTERVAL", "5")),
+                        help="seconds to wait when the queue is empty (default: 5)")
+    parser.add_argument("--work-dir", default=os.environ.get("MUSIC_RADIO_WORK_DIR", ""),
+                        help="where to download (default: the system temporary directory)")
+    parser.add_argument("--cache-dir", default=os.environ.get("MUSIC_RADIO_CACHE_DIR", ""),
+                        help=f"where to keep finished audio (default: {default_cache_dir()})")
+    parser.add_argument("--cache-max-mb", type=int,
+                        default=int(os.environ.get("MUSIC_RADIO_CACHE_MAX_MB", "2048")),
+                        help="how much audio to keep, in megabytes; 0 keeps none (default: 2048)")
+    parser.add_argument("--once", action="store_true", help="do one job, then exit")
+    parser.add_argument("--check", action="store_true",
+                        help="the same as the check command, kept for older scripts")
+    parser.add_argument("--verbose", action="store_true", help="say what is happening")
+
+    setup = parser.add_argument_group("install and update")
+    setup.add_argument("--dry-run", action="store_true",
+                       help="say what would be done, write nothing")
+    setup.add_argument("--force", action="store_true",
+                       help="replace files install would otherwise leave alone, including "
+                            "the stored password")
+    setup.add_argument("--no-systemd", action="store_true",
+                       help="do not install or touch any service units")
+    setup.add_argument("--no-start", action="store_true",
+                       help="install the units but do not enable or start them")
+    setup.add_argument("--no-timer", action="store_true",
+                       help="do not install the quarter-hourly update timer")
+    setup.add_argument("--no-script", dest="script", action="store_false",
+                       default=os.environ.get("MUSIC_RADIO_SELF_UPDATE", "1") != "0",
+                       help="do not let update replace this script with the server's copy")
+    setup.add_argument("--quiet", action="store_true",
+                       help="update prints only what changed (what the timer uses)")
+    setup.add_argument("--print-unit", action="store_true",
+                       help="print the systemd units install would write, and exit")
+    setup.add_argument("--print-env", action="store_true",
+                       help="print the environment file install would write, and exit")
+
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str]) -> int:
+    global _verbose
+
+    args = parse_args(argv)
+    _verbose = args.verbose
+    command = "check" if args.check else args.command
+
+    # Answered before anything else, and without credentials: this is how somebody reads a
+    # unit file before letting it near their machine.
+    if args.print_unit or args.print_env:
+        return print_templates(args)
+
+    # These two set the machine up, so they cannot ask it to be set up first — but they can
+    # read what a previous install wrote, which is how the update timer knows anything at
+    # all and how a re-run of install stops asking questions it already has answers to.
+    if command in ("install", "update"):
+        load_installed_config(args)
+
+        return install(args) if command == "install" else update(args)
+
+    if not args.server:
+        die("no server given. Use --server, or set MUSIC_RADIO_SERVER.")
+    if not https_enough(args.server):
+        die("the server URL must be https:// — the app password is sent with every request.")
+    if not args.user:
+        die("no account given. Use --user, or set MUSIC_RADIO_USER.")
+
+    api = Api(args.server, args.user, read_password(args))
+    tools = discover_tools(args)
+    cache = build_cache(args)
+
+    if command == "check":
+        return check(api, tools, cache, args)
+
+    for name in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(name, lambda *_: _stopping.set())
+
+    return Worker(api, tools, cache, args.name, args).run_forever()
+
+
+def build_cache(args) -> Cache:
+    return Cache(args.cache_dir or default_cache_dir(), max(0, args.cache_max_mb) * 1024 * 1024)
+
+
+def print_templates(args) -> int:
+    """The units and the env file, exactly as install would write them."""
+    layout = Layout(root=os.geteuid() == 0)
+
+    if args.print_unit:
+        account = ""
+        if layout.service_user:
+            account = f"User={layout.service_user}\nGroup={layout.service_user}\n"
+        print(WORKER_UNIT
+              .replace("@ACCOUNT@", account)
+              .replace("@ENV_FILE@", layout.env_file)
+              .replace("@SCRIPT@", layout.script)
+              .replace("@WANTEDBY@", layout.wanted_by))
+        print(UPDATE_UNIT.replace("@SCRIPT@", layout.script))
+        print(UPDATE_TIMER)
+
+    if args.print_env:
+        print(ENV_TEMPLATE
+              .replace("@SERVER@", args.server or "https://cloud.example.com")
+              .replace("@USER@", args.user or "radio-worker")
+              .replace("@PASSWORD_FILE@", layout.password_file)
+              .replace("@NAME@", socket.gethostname())
+              .replace("@YTDLP@", layout.yt_dlp))
+
+    return 0
+
+
+def check(api: Api, tools: Tools, cache: Cache, args) -> int:
+    """Everything somebody setting this up needs to see, in one place."""
+    log(f"yt-dlp:     {tools.yt_dlp} ({tools.version()})")
+    log(f"ffmpeg:     {tools.ffmpeg_dir}")
+    log(f"javascript: {tools.js_spec or 'none — YouTube will refuse some downloads'}")
+    log(f"cache:      {cache.summary()}")
+
+    try:
+        status = api.call("GET", "")
+    except ApiError as error:
+        if error.status == 401:
+            log("credentials: refused. Check the account and the app password.")
+        elif error.status == 403:
+            log(f"credentials: accepted, but '{args.user}' is not on the worker allow-list. "
+                f"Add it in Settings → Administration → Music Radio.")
+        else:
+            log(f"server: {error}")
+        return 1
+    except Exception as error:  # noqa: BLE001
+        log(f"server: could not be reached ({error})")
+        return 1
+
+    log(f"account:    {status.get('account')} (accepted)")
+    log(f"mode:       {status.get('mode')}")
+    log(f"imports:    {'available' if status.get('available') else 'unavailable — ' + str(status.get('reason'))}")
+    log(f"queue:      {status.get('queue', {}).get('queued', 0)} waiting, "
+        f"{status.get('queue', {}).get('running', 0)} running")
+    log(f"cookies:    {'forwarded to workers' if status.get('cookieForwarding') else 'not forwarded'}")
+
+    if status.get("protocol") != PROTOCOL:
+        log(f"warning: the server speaks protocol {status.get('protocol')}, this worker "
+            f"speaks {PROTOCOL}. Update one of them.")
+        return 1
+
+    if status.get("mode") != "remote":
+        log("warning: this server is in local mode, so nothing will be handed out.")
+        return 1
+
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except Stop:
+        sys.exit(0)
+    except KeyboardInterrupt:
+        sys.exit(130)

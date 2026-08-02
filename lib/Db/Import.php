@@ -34,6 +34,12 @@ use OCP\DB\Types;
  * @method void setTrackId(?int $trackId)
  * @method bool getApproved()
  * @method void setApproved(bool $approved)
+ * @method bool getRemote()
+ * @method void setRemote(bool $remote)
+ * @method string|null getLeaseToken()
+ * @method void setLeaseToken(?string $leaseToken)
+ * @method string|null getWorkerId()
+ * @method void setWorkerId(?string $workerId)
  * @method string|null getErrorCode()
  * @method void setErrorCode(?string $errorCode)
  * @method string|null getErrorDetail()
@@ -85,6 +91,9 @@ class Import extends Entity implements \JsonSerializable {
 	protected $errorCode;
 	protected $errorDetail;
 	protected $approved;
+	protected $remote;
+	protected $leaseToken;
+	protected $workerId;
 	protected $attempts;
 	protected $createdAt;
 	protected $startedAt;
@@ -108,6 +117,15 @@ class Import extends Entity implements \JsonSerializable {
 		// it out: it holds only this row, and a link's requester is `?link:<key>` rather
 		// than an account that could be resolved back to a share.
 		$this->addType('approved', Types::BOOLEAN);
+		// Which kind of worker this row was written for, decided when it is asked for
+		// rather than read from the setting at collection time: the mode can be changed
+		// while imports are in flight, and a row a local job is already holding must not
+		// also be collectable by a remote one.
+		$this->addType('remote', Types::BOOLEAN);
+		// Minted when a remote worker claims the row, and the only thing that lets that
+		// worker report on it afterwards. Never leaves the API.
+		$this->addType('leaseToken', Types::STRING);
+		$this->addType('workerId', Types::STRING);
 		$this->addType('attempts', Types::SMALLINT);
 		$this->addType('createdAt', Types::BIGINT);
 		$this->addType('startedAt', Types::BIGINT);
@@ -159,6 +177,28 @@ class Import extends Entity implements \JsonSerializable {
 	}
 
 	/**
+	 * The phase a remote worker says it has reached.
+	 *
+	 * The API speaks in names rather than numbers so that the worker script does not carry
+	 * a copy of the constants above — the two would drift, and a worker one release behind
+	 * would report the wrong phase rather than an unknown one.
+	 *
+	 * @return int|null null for anything not recognised, which the caller ignores rather
+	 *                  than storing: a phase is a display detail and no reason to refuse
+	 *                  an otherwise valid heartbeat
+	 */
+	public static function phaseFromName(string $name): ?int {
+		return match ($name) {
+			'resolving' => self::PHASE_RESOLVING,
+			'downloading' => self::PHASE_DOWNLOADING,
+			'converting' => self::PHASE_CONVERTING,
+			'saving' => self::PHASE_SAVING,
+			'pending' => self::PHASE_PENDING,
+			default => null,
+		};
+	}
+
+	/**
 	 * Whether a percentage is worth showing.
 	 *
 	 * Only the download reports progress. ffmpeg says nothing while it transcodes, and a
@@ -172,6 +212,9 @@ class Import extends Entity implements \JsonSerializable {
 	/**
 	 * Note what is absent: no error *message*. The code is translated when someone asks
 	 * for it, in a request that knows their language, which a background job does not.
+	 *
+	 * Also absent, and deliberately: `lease_token`. It is the credential a remote worker
+	 * reports with, and this array is rendered into a browser.
 	 */
 	public function jsonSerialize(): array {
 		return [

@@ -14,6 +14,7 @@ use OCP\Files\Folder;
 use OCP\Files\IRootFolder;
 use OCP\IAppConfig;
 use OCP\IL10N;
+use OCP\IUserManager;
 use Psr\Log\LoggerInterface;
 
 /**
@@ -43,8 +44,11 @@ class SettingsStore {
 		private IAppConfig $appConfig,
 		private IUserConfig $userConfig,
 		private YtDlpLocator $locator,
+		private RemoteImportSettings $remote,
+		private IUserManager $userManager,
 		private CookieJar $cookieJar,
 		private IRootFolder $rootFolder,
+		private Clock $clock,
 		private IL10N $l10n,
 		private LoggerInterface $logger,
 	) {
@@ -66,6 +70,12 @@ class SettingsStore {
 				Application::APP_ID,
 				YtDlpLocator::CONFIG_YTDLP_PATH,
 			),
+			// Where the fetching happens. The rest of the yt-dlp fields on this page
+			// describe this server's own tools and stop meaning anything in remote mode,
+			// which is why the form hides them rather than leaving them to mislead.
+			RemoteImportSettings::CONFIG_MODE => $this->remote->mode(),
+			RemoteImportSettings::CONFIG_WORKERS => implode(', ', $this->remote->workerAccounts()),
+			RemoteImportSettings::CONFIG_FORWARD_COOKIES => $this->remote->forwardsCookies(),
 			// Stored in seconds and bytes, shown in minutes and megabytes: the units people
 			// think in are not the units the rest of the code works in.
 			YoutubeImportService::CONFIG_MAX_DURATION => (int)round($this->appConfig->getValueInt(
@@ -99,6 +109,30 @@ class SettingsStore {
 			// plainly beside the button that updates it. Null when nothing was found, or
 			// when what was found would not say what it is.
 			'ytDlpVersion' => $this->locator->version(),
+			'remote' => $this->describeWorkers(),
+		];
+	}
+
+	/**
+	 * Whether anything is out there collecting imports.
+	 *
+	 * The one thing an administrator setting this up needs to see, and the one thing they
+	 * cannot find out any other way: the workers are on machines they may not be sitting
+	 * at, and "is it connected" is otherwise answered only by trying an import.
+	 *
+	 * @return array{online: bool, name: string, seenAt: int, secondsAgo: int|null,
+	 *               jsRuntime: string|null}
+	 */
+	private function describeWorkers(): array {
+		$seenAt = $this->remote->seenAt();
+
+		return [
+			'online' => $this->remote->isOnline(),
+			'name' => $this->remote->seenName(),
+			'seenAt' => $seenAt,
+			// Worked out here rather than in the browser, whose clock is not this server's.
+			'secondsAgo' => $seenAt === 0 ? null : max(0, $this->clock->nowSeconds() - $seenAt),
+			'jsRuntime' => $this->remote->seenJsRuntime(),
 		];
 	}
 
@@ -129,6 +163,8 @@ class SettingsStore {
 			}
 		}
 
+		$errors += $this->saveRemote($values);
+
 		foreach ([
 			YoutubeImportService::CONFIG_MAX_DURATION => 60,
 			YoutubeImportService::CONFIG_MAX_SOURCE_BYTES => 1024 * 1024,
@@ -145,6 +181,76 @@ class SettingsStore {
 
 			$this->appConfig->setValueInt(Application::APP_ID, $key, $given * $multiplier);
 		}
+
+		return $errors;
+	}
+
+	/**
+	 * The three settings that decide where imports happen and who may do them.
+	 *
+	 * The allow-list is checked rather than taken as typed, and that is not fussiness. An
+	 * account named here can collect any queued import and upload audio that lands in
+	 * another user's storage; a typo would leave the feature silently not working, and a
+	 * *misdirected* entry would be a capability handed to somebody who never asked for it.
+	 * So every name has to be an account that exists.
+	 *
+	 * @param array<string, mixed> $values
+	 * @return array<string, string>
+	 */
+	private function saveRemote(array $values): array {
+		$errors = [];
+
+		if (array_key_exists(RemoteImportSettings::CONFIG_MODE, $values)) {
+			$mode = $values[RemoteImportSettings::CONFIG_MODE] === RemoteImportSettings::MODE_REMOTE
+				? RemoteImportSettings::MODE_REMOTE
+				: RemoteImportSettings::MODE_LOCAL;
+			$this->appConfig->setValueString(Application::APP_ID, RemoteImportSettings::CONFIG_MODE, $mode);
+		}
+
+		if (array_key_exists(RemoteImportSettings::CONFIG_FORWARD_COOKIES, $values)) {
+			$this->appConfig->setValueBool(
+				Application::APP_ID,
+				RemoteImportSettings::CONFIG_FORWARD_COOKIES,
+				(bool)$values[RemoteImportSettings::CONFIG_FORWARD_COOKIES],
+			);
+		}
+
+		if (!array_key_exists(RemoteImportSettings::CONFIG_WORKERS, $values)) {
+			return $errors;
+		}
+
+		$given = is_string($values[RemoteImportSettings::CONFIG_WORKERS])
+			? $values[RemoteImportSettings::CONFIG_WORKERS]
+			: '';
+
+		$accounts = [];
+		$unknown = [];
+		foreach (explode(',', $given) as $candidate) {
+			$candidate = trim($candidate);
+			if ($candidate === '') {
+				continue;
+			}
+			if (!$this->userManager->userExists($candidate)) {
+				$unknown[] = $candidate;
+				continue;
+			}
+			$accounts[] = $candidate;
+		}
+
+		if ($unknown !== []) {
+			$errors[RemoteImportSettings::CONFIG_WORKERS] = $this->l10n->t(
+				'There is no account called "%1$s".',
+				[implode('", "', $unknown)],
+			);
+
+			return $errors;
+		}
+
+		$this->appConfig->setValueString(
+			Application::APP_ID,
+			RemoteImportSettings::CONFIG_WORKERS,
+			implode(',', array_unique($accounts)),
+		);
 
 		return $errors;
 	}
@@ -198,7 +304,13 @@ class SettingsStore {
 			// is held back, because authenticating moves yt-dlp onto clients that need one
 			// — see YoutubeImportService::cookiesAreUsable(). A setting that is being
 			// ignored has to say so on the page that offers it.
-			'cookiesUsable' => $this->locator->jsRuntime() !== null,
+			//
+			// In remote mode the question is about the *worker's* runtime, and about
+			// whether this server lends cookies out at all — which it does not unless an
+			// administrator said so.
+			'cookiesUsable' => $this->remote->isRemote()
+				? ($this->remote->forwardsCookies() && $this->remote->seenJsRuntime() !== null)
+				: $this->locator->jsRuntime() !== null,
 			// Whether offering the field is worth anything at all. With importing switched
 			// off server-side, cookies would be a form that changes nothing.
 			'importEnabled' => $this->appConfig->getValueBool(
@@ -311,6 +423,10 @@ class SettingsStore {
 	// ------------------------------------------------------ what is true now
 
 	private function summary(): string {
+		if ($this->remote->isRemote()) {
+			return $this->remoteSummary();
+		}
+
 		$status = $this->locator->status();
 
 		if ($status->available) {
@@ -329,6 +445,30 @@ class SettingsStore {
 			// Same reasoning as the outdated message above: the button that does this is
 			// on this page.
 			default => $this->l10n->t('Not usable: yt-dlp was not found. Install it with "Update yt-dlp" below, or give its path.'),
+		};
+	}
+
+	/**
+	 * The same question answered for a server that does not do the work itself.
+	 *
+	 * Every state names the next thing to do, because each of them is one step in the same
+	 * setup: switch it on, name an account, start the worker.
+	 */
+	private function remoteSummary(): string {
+		$status = $this->remote->status();
+
+		if ($status->available) {
+			$name = $this->remote->seenName();
+
+			return $name === ''
+				? $this->l10n->t('Working. Imports are fetched by a separate machine.')
+				: $this->l10n->t('Working. Imports are fetched by "%1$s".', [$name]);
+		}
+
+		return match ($status->reason) {
+			ImportError::DISABLED => $this->l10n->t('Switched off below.'),
+			ImportError::REMOTE_NOT_CONFIGURED => $this->l10n->t('Not usable: no account may collect imports yet. Name one below, and give it an app password with "occ user:add-app-password".'),
+			default => $this->l10n->t('Not usable: no worker has checked in. Start one on the machine that is to do the fetching — see the app\'s documentation.'),
 		};
 	}
 

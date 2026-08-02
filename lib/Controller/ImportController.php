@@ -77,9 +77,20 @@ class ImportController extends Controller {
 			return new DataResponse(['error' => $this->explain($e)], $e->getStatus());
 		}
 
+		$capabilities = $this->importService->availability();
+
 		return new DataResponse([
 			'imports' => array_map(fn (Import $import): array => $this->present($import), $imports),
-			'capabilities' => $this->importService->availability(),
+			// The status plus the one thing it cannot carry: a sentence. ToolStatus has no
+			// translator and a background job has no language, so the reason travels as a
+			// code and is turned into words here — which is what lets the dialog say "no
+			// worker has checked in" rather than greying out its button and explaining
+			// nothing.
+			'capabilities' => array_merge($capabilities->jsonSerialize(), [
+				'reasonText' => $capabilities->reason === null
+					? null
+					: ImportError::describe($capabilities->reason, $this->l10n),
+			]),
 		]);
 	}
 
