@@ -2103,28 +2103,46 @@ def install_self(layout: Layout, dry_run: bool) -> None:
     log(f"→ installed this script at {layout.script}")
 
 
-def install_units(layout: Layout, systemd: Systemd, args) -> bool:
-    """The worker service, and the timer that keeps it current."""
+def unit_files(layout: Layout) -> list[tuple[str, str]]:
+    """
+    The units `install` writes, each with the name it is written under.
+
+    One place that fills in the placeholders, because `install` and `--print-unit` have to
+    agree about what they are — a preview that differs from what is installed is worse than
+    no preview.
+    """
     account = ""
     if layout.service_user:
         account = (f"# A user of its own, with no login and nothing else to do. The worker needs "
                    f"only to\n# run yt-dlp and reach the network.\n"
                    f"User={layout.service_user}\nGroup={layout.service_user}\n")
 
-    worker_unit = os.path.join(layout.unit_dir, "music-radio-worker.service")
-    if os.path.isfile(worker_unit) and not args.force:
-        log(f"service:    {worker_unit} — left alone (--force to replace)")
-    else:
-        systemd.write("music-radio-worker.service", WORKER_UNIT
-                      .replace("@ACCOUNT@", account)
-                      .replace("@ENV_FILE@", layout.env_file)
-                      .replace("@SCRIPT@", layout.script)
-                      .replace("@WANTEDBY@", layout.wanted_by))
+    return [
+        ("music-radio-worker.service", WORKER_UNIT
+         .replace("@ACCOUNT@", account)
+         .replace("@ENV_FILE@", layout.env_file)
+         .replace("@SCRIPT@", layout.script)
+         .replace("@WANTEDBY@", layout.wanted_by)),
+        ("music-radio-worker-update.service", UPDATE_UNIT.replace("@SCRIPT@", layout.script)),
+        ("music-radio-worker-update.timer", UPDATE_TIMER),
+    ]
 
-    if not args.no_timer:
-        systemd.write("music-radio-worker-update.service",
-                      UPDATE_UNIT.replace("@SCRIPT@", layout.script))
-        systemd.write("music-radio-worker-update.timer", UPDATE_TIMER)
+
+def install_units(layout: Layout, systemd: Systemd, args) -> bool:
+    """The worker service, and the timer that keeps it current."""
+    for name, body in unit_files(layout):
+        if args.no_timer and "update" in name:
+            continue
+
+        path = os.path.join(layout.unit_dir, name)
+        # The same rule the env file gets, and for the same reason: somebody who has edited
+        # a unit — a different interval, an added dependency, a proxy variable — should not
+        # lose it to a re-run.
+        if os.path.isfile(path) and not args.force:
+            log(f"unit:       {path} — left alone (--force to replace)")
+            continue
+
+        systemd.write(name, body)
 
     systemd.run("daemon-reload")
 
@@ -2512,22 +2530,26 @@ def build_cache(args) -> Cache:
 
 
 def print_templates(args) -> int:
-    """The units and the env file, exactly as install would write them."""
+    """
+    The units and the env file, exactly as install would write them.
+
+    Each is preceded by the path it belongs at, written as a comment — which both says where
+    to put it and gives somebody splitting the output by hand an obvious place to cut. A
+    comment rather than a bare line because `#` is a comment in unit files and in env files
+    alike, so a chunk pasted along with its header is still a valid file.
+    """
     layout = Layout(root=os.geteuid() == 0)
 
+    def announce(path: str) -> None:
+        print(f"# ==== {path} " + "=" * max(4, 78 - len(path)))
+
     if args.print_unit:
-        account = ""
-        if layout.service_user:
-            account = f"User={layout.service_user}\nGroup={layout.service_user}\n"
-        print(WORKER_UNIT
-              .replace("@ACCOUNT@", account)
-              .replace("@ENV_FILE@", layout.env_file)
-              .replace("@SCRIPT@", layout.script)
-              .replace("@WANTEDBY@", layout.wanted_by))
-        print(UPDATE_UNIT.replace("@SCRIPT@", layout.script))
-        print(UPDATE_TIMER)
+        for name, body in unit_files(layout):
+            announce(os.path.join(layout.unit_dir, name))
+            print(body)
 
     if args.print_env:
+        announce(layout.env_file)
         print(ENV_TEMPLATE
               .replace("@SERVER@", args.server or "https://cloud.example.com")
               .replace("@USER@", args.user or "radio-worker")

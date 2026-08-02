@@ -153,12 +153,42 @@ to run.
 
 ### 5. Or set it up by hand
 
-Nothing above is magic, and `--print-unit` / `--print-env` will show you exactly what it
-writes. The pieces are: this script somewhere on `PATH`, an env file naming the server and
-the account, a file holding the app password, and something that keeps the process running.
+Nothing above is magic. The pieces are: this script somewhere on `PATH`, an env file naming
+the server and the account, a file holding the app password, and something that keeps the
+process running.
 
-The password goes in a file rather than the environment on purpose: anything in the
-environment is readable through `systemctl show` and `/proc`.
+`--print-unit` and `--print-env` print exactly what `install` would write — the same
+function produces both, so the preview cannot drift from the real thing. Each file is
+preceded by the path it belongs at:
+
+```
+# ==== /etc/systemd/system/music-radio-worker.service ==========================
+[Unit]
+Description=Music Radio import worker
+...
+# ==== /etc/systemd/system/music-radio-worker-update.service ===================
+...
+# ==== /etc/systemd/system/music-radio-worker-update.timer =====================
+...
+```
+
+The headers are comments, valid in both unit and env files, so a chunk pasted along with
+its header still works. Split at the `# ====` lines, or let `csplit` do it:
+
+```bash
+sudo music-radio-worker --print-unit > /tmp/units
+cd /etc/systemd/system
+sudo csplit -sz /tmp/units '/^# ==== /' '{*}' \
+  -f music-radio- -b '%d.tmp'   # then rename each to the path in its first line
+sudo systemctl daemon-reload
+sudo systemctl enable --now music-radio-worker music-radio-worker-update.timer
+```
+
+Two things worth keeping if you write your own units. The password goes in a *file* rather
+than the environment, because anything in the environment is readable through
+`systemctl show` and `/proc`. And the directory holding it has to be group-owned by the
+account the service runs as — a 0600 file in a `root:root 0750` directory cannot be read by
+anybody else, however it is owned itself.
 
 ### 6. Check it from the server
 
@@ -363,20 +393,20 @@ in flight is lost either way, but do not switch back and forth while imports are
 
 ## When something is wrong
 
-| What you see                                                                        | What it means                                                                                                                                        |
-|-------------------------------------------------------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `--check` says **refused**                                                          | Wrong account or wrong app password. Mint a new one with `occ user:add-app-password`.                                                                |
-| `--check` says **not on the worker allow-list**                                     | The credentials are fine; add the account to *Accounts that may collect imports*.                                                                    |
-| **"The machine that fetches audio for this server is not answering"**               | No worker has checked in for five minutes. Look at `journalctl -u music-radio-worker`.                                                               |
-| **"This server hands imports to a separate machine, and none has been set up yet"** | The mode is `remote` but the allow-list is empty.                                                                                                    |
-| Imports sit at *Waiting to start…* then fail                                        | Same as above — nothing is collecting. `occ music_radio:remote:status` says which.                                                                   |
-| `not_remote` in the worker's log                                                    | The server has been switched back to fetching its own imports.                                                                                       |
-| Downloads fail with format errors on every video                                    | The worker has no JavaScript runtime. Install `deno` or `node` **on the worker**, not on the server.                                                 |
-| The worker refuses a job with *"the command carries a forbidden option"*            | The server asked for something the worker will not run. This should never happen; check that the Nextcloud is what you think it is, then file a bug. |
+| What you see                                                                                  | What it means                                                                                                                                                                                                                                                                                                                      |
+|-----------------------------------------------------------------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `--check` says **refused**                                                                    | Wrong account or wrong app password. Mint a new one with `occ user:add-app-password`.                                                                                                                                                                                                                                              |
+| `--check` says **not on the worker allow-list**                                               | The credentials are fine; add the account to *Accounts that may collect imports*.                                                                                                                                                                                                                                                  |
+| **"The machine that fetches audio for this server is not answering"**                         | No worker has checked in for five minutes. Look at `journalctl -u music-radio-worker`.                                                                                                                                                                                                                                             |
+| **"This server hands imports to a separate machine, and none has been set up yet"**           | The mode is `remote` but the allow-list is empty.                                                                                                                                                                                                                                                                                  |
+| Imports sit at *Waiting to start…* then fail                                                  | Same as above — nothing is collecting. `occ music_radio:remote:status` says which.                                                                                                                                                                                                                                                 |
+| `not_remote` in the worker's log                                                              | The server has been switched back to fetching its own imports.                                                                                                                                                                                                                                                                     |
+| Downloads fail with format errors on every video                                              | The worker has no JavaScript runtime. Install `deno` or `node` **on the worker**, not on the server.                                                                                                                                                                                                                               |
+| The worker refuses a job with *"the command carries a forbidden option"*                      | The server asked for something the worker will not run. This should never happen; check that the Nextcloud is what you think it is, then file a bug.                                                                                                                                                                               |
 | The service will not start: *could not read /etc/music-radio/app-password: Permission denied* | The config directory is not group-owned by the service account, so it cannot be traversed — a 0600 file inside it is unreadable however the file itself is owned. Fix with `sudo chown root:music-radio /etc/music-radio && sudo chmod 750 /etc/music-radio`, or re-run `install`, which sets this and warns if it is still wrong. |
-| `install` says a file was *left alone*                                              | It will not overwrite the password, the env file or an edited unit. Pass `--force` when you mean to replace them.                                     |
-| `update` says *the worker script the server sent will not compile*                  | The copy on the server is damaged; the running one is kept. Check `occ integrity:check-app music_radio`.                                              |
-| Imports fail right after an update                                                  | The previous script is beside the new one as `music-radio-worker.bak`. Move it back, and set `MUSIC_RADIO_SELF_UPDATE=0` while you work out why.      |
+| `install` says a file was *left alone*                                                        | It will not overwrite the password, the env file or an edited unit. Pass `--force` when you mean to replace them.                                                                                                                                                                                                                  |
+| `update` says *the worker script the server sent will not compile*                            | The copy on the server is damaged; the running one is kept. Check `occ integrity:check-app music_radio`.                                                                                                                                                                                                                           |
+| Imports fail right after an update                                                            | The previous script is beside the new one as `music-radio-worker.bak`. Move it back, and set `MUSIC_RADIO_SELF_UPDATE=0` while you work out why.                                                                                                                                                                                   |
 
 Run the worker with `--verbose` to see the exact command lines it is given, and `--once` to
 do a single job and exit.
