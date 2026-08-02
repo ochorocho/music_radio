@@ -51,6 +51,38 @@ final class YtDlpFailure {
 		'403: forbidden',
 		'nsig extraction failed',
 		'signature extraction failed',
+		// An empty format list is the *other* shape of this, and the one cookies produce:
+		// authenticating moves yt-dlp onto clients that need the JS player, so a server
+		// without one is left with nothing it can download rather than with a refusal.
+		'requested format is not available',
+		'no video formats found',
+	];
+
+	/**
+	 * YouTube asking who is behind the request.
+	 *
+	 * Its own constant because two different questions are asked of it: which code an
+	 * anonymous run gets, and whether a run that *did* present cookies was turned away
+	 * anyway. Both must match on exactly the same wording or a jar could be blamed for a
+	 * failure it was never shown, and vice versa.
+	 *
+	 * Narrower than it looks. The age gate and the private-video message also say "Sign
+	 * in", which is why this matches on the part about bots and nothing else.
+	 */
+	private const SIGN_IN_DEMANDED = ['not a bot', 'confirm you.re not a bot'];
+
+	/**
+	 * yt-dlp refusing the jar itself, before it ever gets as far as YouTube.
+	 *
+	 * Should be unreachable — {@see CookieJar} parses a paste before storing it and holds a
+	 * rotated jar to the same standard before writing it back. Kept because "should be
+	 * unreachable" is not "is", and the alternative reading of these lines is `unknown`.
+	 */
+	private const COOKIE_FILE_REFUSED = [
+		'netscape format',
+		'cookies file',
+		'parse cookies',
+		'malformed cookie',
 	];
 
 	/**
@@ -60,12 +92,15 @@ final class YtDlpFailure {
 	 *                                 yt-dlp. Defaults to the equipped case, so that every
 	 *                                 other caller and test reads as being about stderr and
 	 *                                 nothing else.
+	 * @param bool $cookiesUsed whether the run presented a cookie jar. Changes what a
+	 *                          sign-in demand means — see {@see self::SIGN_IN_DEMANDED}.
 	 * @return string|null null when the run succeeded and there is nothing to explain
 	 */
 	public static function classify(
 		ProcessResult $result,
 		bool $producedFile,
 		bool $jsRuntimeAvailable = true,
+		bool $cookiesUsed = false,
 	): ?string {
 		if ($producedFile && $result->succeeded()) {
 			return null;
@@ -95,6 +130,25 @@ final class YtDlpFailure {
 			return ImportError::JS_RUNTIME_MISSING;
 		}
 
+		if ($cookiesUsed) {
+			if (self::matches($errors, self::COOKIE_FILE_REFUSED)) {
+				return ImportError::COOKIES_INVALID;
+			}
+
+			// The one case where presenting cookies changes the verdict rather than the
+			// outcome. Asked to sign in *while signed in* means the jar is no longer being
+			// accepted — expired, or the account it came from was logged out elsewhere —
+			// and the generic "try again later" would be advice that never comes good.
+			//
+			// Only the sign-in demand, deliberately. A 403 on the media URLs is also a bot
+			// check of sorts, but it is about how the URL was signed rather than about who
+			// asked, and blaming a jar for it would send somebody re-exporting cookies that
+			// were never the problem.
+			if (self::matches($errors, self::SIGN_IN_DEMANDED)) {
+				return ImportError::COOKIES_REJECTED;
+			}
+		}
+
 		$code = self::fromErrorText($errors);
 		if ($code !== null) {
 			return $code;
@@ -113,19 +167,23 @@ final class YtDlpFailure {
 	 * Also used on the probe pass, where there is no file to look for and the metadata
 	 * checks happen separately.
 	 */
-	public static function classifyProbe(ProcessResult $result, bool $jsRuntimeAvailable = true): ?string {
+	public static function classifyProbe(
+		ProcessResult $result,
+		bool $jsRuntimeAvailable = true,
+		bool $cookiesUsed = false,
+	): ?string {
 		if ($result->succeeded()) {
 			return null;
 		}
 
-		return self::classify($result, false, $jsRuntimeAvailable);
+		return self::classify($result, false, $jsRuntimeAvailable, $cookiesUsed);
 	}
 
 	private static function fromErrorText(string $text): ?string {
 		return match (true) {
 			// Bot checks and age gates both talk about signing in, so they are separated
 			// on the part that differs.
-			self::matches($text, ['not a bot', 'confirm you.re not a bot']) => ImportError::BOT_CHECK,
+			self::matches($text, self::SIGN_IN_DEMANDED) => ImportError::BOT_CHECK,
 			self::matches($text, ['confirm your age', 'age-restricted', 'inappropriate for some users']) => ImportError::AGE_RESTRICTED,
 			self::matches($text, ['members-only', 'available to this channel.s members', 'join this channel']) => ImportError::MEMBERS_ONLY,
 			self::matches($text, ['private video', 'sign in if you.ve been granted access']) => ImportError::VIDEO_PRIVATE,
@@ -141,6 +199,15 @@ final class YtDlpFailure {
 			]) => ImportError::GEO_BLOCKED,
 			self::matches($text, ['live event will begin', 'is live', 'premieres in']) => ImportError::LIVE_STREAM,
 			self::matches($text, ['larger than max-filesize', 'file is larger than']) => ImportError::TOO_LARGE,
+
+			// Reached with a runtime present, so it is not the missing-engine case handled
+			// above: YouTube offered this server nothing it could take. Its own code rather
+			// than `unknown`, whose sentence ("The import failed.") leaves the reader with
+			// yt-dlp's talk of --list-formats and nothing to do about it.
+			self::matches($text, [
+				'requested format is not available',
+				'no video formats found',
+			]) => ImportError::NO_FORMATS,
 
 			// The most likely failure in ordinary operation: YouTube changes something and
 			// the installed yt-dlp has not caught up. It is the only code whose message

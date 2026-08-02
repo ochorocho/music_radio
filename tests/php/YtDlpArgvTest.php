@@ -206,6 +206,41 @@ class YtDlpArgvTest extends TestCase {
 		self::assertNotContains('--js-runtimes', self::download());
 	}
 
+	// ----------------------------------------------------------------- cookies
+
+	public function testTheCookieFileIsNamedOnBothPasses(): void {
+		$jar = self::TMP . '/cookies.txt';
+		$probe = YtDlpArgv::probe(self::YTDLP, self::URL, null, null, $jar);
+		$download = YtDlpArgv::download(
+			self::YTDLP,
+			self::URL,
+			self::TMP,
+			self::FFMPEG_DIR,
+			maxDurationSeconds: 5400,
+			maxFilesizeBytes: 314572800,
+			proxy: null,
+			jsRuntime: null,
+			cookieFile: $jar,
+		);
+
+		self::assertSame($jar, $probe[array_search('--cookies', $probe, true) + 1]);
+		self::assertSame($jar, $download[array_search('--cookies', $download, true) + 1]);
+	}
+
+	public function testNoCookieFlagWhenTheOwnerStoredNone(): void {
+		self::assertNotContains('--cookies', YtDlpArgv::probe(self::YTDLP, self::URL));
+		self::assertNotContains('--cookies', self::download());
+	}
+
+	/**
+	 * Reads a browser profile off local disk, chosen by a config value. There is no browser
+	 * on a server, and no reason to let a setting point a file read at one.
+	 */
+	public function testTheBrowserProfileReaderIsNeverUsed(): void {
+		self::assertNotContains('--cookies-from-browser', YtDlpArgv::probe(self::YTDLP, self::URL));
+		self::assertNotContains('--cookies-from-browser', self::download());
+	}
+
 	// --------------------------------------------------------------- progress
 
 	/**

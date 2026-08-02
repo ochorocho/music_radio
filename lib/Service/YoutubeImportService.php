@@ -88,8 +88,56 @@ class YoutubeImportService {
 		private IAppConfig $appConfig,
 		private IConfig $config,
 		private Clock $clock,
+		private CookieJar $cookieJar,
 		private LoggerInterface $logger,
 	) {
+	}
+
+	/**
+	 * Who owns the channel this import is for, if it is still there.
+	 *
+	 * Only ever used to find whose cookies to borrow, so a channel that has gone missing is
+	 * not an error here — the import proceeds anonymously and fails, if it fails, on its own
+	 * merits. {@see store()} is where a deleted channel actually matters.
+	 */
+	/**
+	 * Whether presenting cookies would help or ruin this run.
+	 *
+	 * Cookies are withheld on a server with no JavaScript runtime, and this is not caution
+	 * — it is the difference between an import that usually works and one that cannot.
+	 *
+	 * yt-dlp picks which YouTube client to be by asking, in this order: premium, then
+	 * *authenticated*, then "no JS engine here", then the default. Authentication is tested
+	 * before the JS-less case, so cookies take the choice away: an anonymous run on such a
+	 * server gets `android_vr`, whose URLs need no player and therefore no engine, while an
+	 * authenticated one gets `tv_downgraded` and `web_safari`, which both require the
+	 * player. With no engine to run it in, neither yields a usable format and yt-dlp ends
+	 * with "Requested format is not available" — on every video, not occasionally.
+	 *
+	 * So the jar is held back and the import is made anonymously, which is what it was
+	 * doing before anybody stored one. Said out loud rather than done quietly: the settings
+	 * page reports it, and this writes it to the log.
+	 */
+	private function cookiesAreUsable(ToolStatus $status): bool {
+		if ($status->jsRuntime !== null) {
+			return true;
+		}
+
+		$this->logger->warning(
+			'Stored YouTube cookies were not used: this server has no JavaScript runtime, and '
+			. 'authenticating without one leaves yt-dlp with no downloadable formats at all',
+			['app' => Application::APP_ID],
+		);
+
+		return false;
+	}
+
+	private function ownerOf(int $channelId): ?string {
+		try {
+			return $this->channelMapper->find($channelId)->getUserId();
+		} catch (\Throwable) {
+			return null;
+		}
 	}
 
 	public function availability(): ToolStatus {
@@ -254,9 +302,18 @@ class YoutubeImportService {
 		$proxy = $this->config->getSystemValueString('proxy', '') ?: null;
 		$jsRuntime = $status->jsRuntime?->spec();
 
+		// The channel's owner, not whoever pasted the link: their cookies, for the same
+		// reason the audio lands in their storage. A separate read from the one store()
+		// does, and deliberately so — that one happens after the download and has to see a
+		// channel deleted in the meantime, which this cannot.
+		$ownerId = $this->ownerOf($import->getChannelId());
+		$cookieFile = $ownerId === null || !$this->cookiesAreUsable($status)
+			? null
+			: $this->cookieJar->writeTo($ownerId, $temporaryDirectory);
+
 		// --- what is this? ----------------------------------------------------
 		$probe = $this->runner->run(
-			YtDlpArgv::probe($status->ytDlpPath, $url, $proxy, $jsRuntime),
+			YtDlpArgv::probe($status->ytDlpPath, $url, $proxy, $jsRuntime, $cookieFile),
 			$temporaryDirectory,
 			$environment,
 			self::PROBE_TIMEOUT_SECONDS,
@@ -264,7 +321,14 @@ class YoutubeImportService {
 			fn (): bool => $this->wasCancelled($import),
 		);
 
-		$failure = YtDlpFailure::classifyProbe($probe, $jsRuntime !== null);
+		// Taken back after every run that used one, failed included. YouTube rotates these,
+		// and a jar refreshed only on success would go stale precisely on the channels whose
+		// imports are struggling — which are the ones that need it.
+		if ($ownerId !== null && $cookieFile !== null) {
+			$this->cookieJar->refreshFrom($ownerId, $cookieFile);
+		}
+
+		$failure = YtDlpFailure::classifyProbe($probe, $jsRuntime !== null, $cookieFile !== null);
 		if ($failure !== null) {
 			$this->logFailure($import, $failure, $probe->stderr);
 			$this->fail($import, $failure, YtDlpFailure::detail($probe));
@@ -304,6 +368,7 @@ class YoutubeImportService {
 				$this->maxSourceBytes(),
 				$proxy,
 				$jsRuntime,
+				$cookieFile,
 			),
 			$temporaryDirectory,
 			$environment,
@@ -316,7 +381,13 @@ class YoutubeImportService {
 
 		$produced = $this->producedFile($temporaryDirectory);
 
-		$failure = YtDlpFailure::classify($result, $produced !== null, $jsRuntime !== null);
+		// Again after the download: it is the longer of the two runs and the one that
+		// rotation is most likely to have happened during.
+		if ($ownerId !== null && $cookieFile !== null) {
+			$this->cookieJar->refreshFrom($ownerId, $cookieFile);
+		}
+
+		$failure = YtDlpFailure::classify($result, $produced !== null, $jsRuntime !== null, $cookieFile !== null);
 		if ($failure !== null) {
 			$this->logFailure($import, $failure, $result->stderr);
 			$this->fail($import, $failure, YtDlpFailure::detail($result));

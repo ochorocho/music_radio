@@ -311,7 +311,16 @@ export default {
 				// A failure stays here, where the file and the button still are. It is the
 				// one outcome that needs somewhere to go next.
 				this.failed = true
-				this.message = errorMessage(error, t('music_radio', 'That file could not be added'))
+				this.message = errorMessage(
+					error,
+					t('music_radio', 'That file could not be added'),
+					{
+						// Ten an hour per address, and the response says nothing about the
+						// period. Worth being specific: a visitor told to "wait a little"
+						// will try again in a minute and be refused again.
+						429: t('music_radio', 'This link has taken as many files as it allows in an hour. Try again later.'),
+					},
+				)
 				return false
 			} finally {
 				this.uploading = false

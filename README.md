@@ -165,6 +165,26 @@ The admin **Overview** page reports a missing or stale yt-dlp without anyone hav
 check, and **Settings → Administration → Music Radio** has the switch, the path override
 and the limits.
 
+A server also needs a **JavaScript runtime** — Deno, Node, QuickJS or Bun — because YouTube
+signs its audio links with JavaScript that yt-dlp has to execute. Without one it falls back
+to a route yt-dlp has deprecated and YouTube refuses at random, which looks like a stale
+downloader or a flaky network and is neither. The Overview page says so when none is found.
+
+### Bot checks, and cookies
+
+Some servers get *"YouTube asked this server to prove it is not a bot"* — a judgement about
+the address the request came from, not about the video. It often clears on its own. When it
+does not, a channel owner can store YouTube cookies in **Settings → Personal → Music Radio**,
+and imports into their channels are made as that signed-in account.
+
+The cookies are encrypted at rest, never sent back to a browser, written per import to a
+file that dies with the import, and refreshed automatically as YouTube rotates them. It
+carries a real risk to whatever account they come from, so use a throwaway one.
+
+**[docs/youtube-cookies.md](docs/youtube-cookies.md)** has the export procedure — two of the
+steps are easy to get wrong and produce a file that stores fine and does nothing — and what
+the server does with the file.
+
 ### Importing through a public link
 
 A visitor with no account can be allowed to import, but only deliberately, and it is off

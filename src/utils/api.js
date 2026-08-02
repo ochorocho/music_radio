@@ -6,6 +6,7 @@
  */
 import axios from '@nextcloud/axios'
 import { generateUrl } from '@nextcloud/router'
+import { translate as t } from '@nextcloud/l10n'
 
 const url = (path) => generateUrl('/apps/music_radio/api/v1' + path)
 
@@ -312,12 +313,81 @@ export async function deleteShare(channelId, shareId) {
 }
 
 /**
- * Pull a human-readable message out of a failed request, falling back to the raw error.
+ * What this server says when it refuses without saying anything.
+ *
+ * Every refusal the app itself writes comes back as `{"error": "…"}` and is shown verbatim.
+ * These are the ones raised above the app — by middleware, by PHP, by the web server —
+ * which arrive with an empty body and nothing to show. A rate limit is literally
+ * `new DataResponse([], 429)` in Nextcloud core.
+ *
+ * Deliberately nothing for 500. A caller's fallback names the thing that was being
+ * attempted ("Could not save the channel"), which is more use than "Internal Server Error".
+ *
+ * @param {number} status
+ * @return {string|null} null when the caller's fallback would say more
+ */
+function describeStatus(status) {
+	switch (status) {
+	case 401:
+		return t('music_radio', 'Your session has expired. Reload the page and sign in again.')
+	case 403:
+		return t('music_radio', 'You are not allowed to do that.')
+	case 404:
+		return t('music_radio', 'That is no longer there. Reload the page.')
+	case 413:
+		return t('music_radio', 'That is larger than this server accepts.')
+	case 429:
+		return t('music_radio', 'That is more often than this server allows. Wait a little and try again.')
+	case 502:
+	case 503:
+	case 504:
+		return t('music_radio', 'The server is not available right now. Try again shortly.')
+	default:
+		return null
+	}
+}
+
+/**
+ * Pull a human-readable message out of a failed request.
+ *
+ * The order is the whole point, and getting it wrong is what this function was written to
+ * fix. `error.message` used to come second, ahead of the caller's fallback — but for *any*
+ * HTTP error response axios sets that to "Request failed with status code 429", which is
+ * both truthy and useless. So the fallback every call site carefully writes was unreachable
+ * on exactly the failures it was written for, and the one refusal a person actually meets
+ * in normal use — the hourly import limit — was the worst-worded message in the app.
+ *
+ * So: the server's own sentence, then something true about the status, then the caller's
+ * fallback. `error.message` is consulted only when there was no response at all, where it
+ * is a real thrown Error rather than a description of an HTTP code.
  *
  * @param {Error} error
- * @param {string} fallback
+ * @param {string} fallback names the operation, for when nothing more specific is known
+ * @param {Object<number, string>} [statusMessages] per-status overrides, for a caller that
+ *   knows more than this does — the import dialog knows its limit is hourly, which nothing
+ *   in the response says
  * @return {string}
  */
-export function errorMessage(error, fallback) {
-	return error?.response?.data?.error || error?.message || fallback
+export function errorMessage(error, fallback, statusMessages = {}) {
+	const fromServer = error?.response?.data?.error
+	if (typeof fromServer === 'string' && fromServer !== '') {
+		return fromServer
+	}
+
+	const status = error?.response?.status
+	if (status) {
+		return statusMessages[status] || describeStatus(status) || fallback
+	}
+
+	// No response: the request never completed. axios describes these in its own words too,
+	// and "Network Error" is not worth showing anybody.
+	if (error?.code === 'ERR_NETWORK') {
+		return t('music_radio', 'Could not reach the server. Check your connection.')
+	}
+	if (error?.code === 'ECONNABORTED' || error?.code === 'ETIMEDOUT') {
+		return t('music_radio', 'The server took too long to answer.')
+	}
+
+	// Anything genuinely thrown, whose message was written by us rather than by a library.
+	return error?.message || fallback
 }

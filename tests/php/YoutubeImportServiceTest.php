@@ -16,6 +16,7 @@ use OCA\MusicRadio\Db\ImportMapper;
 use OCA\MusicRadio\Db\Track;
 use OCA\MusicRadio\Exception\MusicRadioException;
 use OCA\MusicRadio\Service\Clock;
+use OCA\MusicRadio\Service\CookieJar;
 use OCA\MusicRadio\Service\ImportError;
 use OCA\MusicRadio\Service\JsRuntime;
 use OCA\MusicRadio\Service\MusicLibrary;
@@ -59,6 +60,7 @@ class YoutubeImportServiceTest extends TestCase {
 	private MusicLibrary&MockObject $library;
 	private IJobList&MockObject $jobList;
 	private IAppConfig&MockObject $appConfig;
+	private CookieJar&MockObject $cookieJar;
 	private FakeProcessRunner $runner;
 	private YoutubeImportService $service;
 	private string $temporaryDirectory;
@@ -74,6 +76,9 @@ class YoutubeImportServiceTest extends TestCase {
 		$this->library = $this->createMock(MusicLibrary::class);
 		$this->jobList = $this->createMock(IJobList::class);
 		$this->appConfig = $this->createMock(IAppConfig::class);
+		// No stored jar unless a test says otherwise: writeTo() returning null is what an
+		// owner who has never pasted cookies looks like.
+		$this->cookieJar = $this->createMock(CookieJar::class);
 		$this->runner = new FakeProcessRunner();
 
 		// A real directory, so the service's own file discovery and cleanup are exercised
@@ -115,6 +120,7 @@ class YoutubeImportServiceTest extends TestCase {
 			$this->appConfig,
 			$config,
 			$clock,
+			$this->cookieJar,
 			new NullLogger(),
 		);
 	}
@@ -467,6 +473,114 @@ class YoutubeImportServiceTest extends TestCase {
 		self::assertSame(ImportError::DOWNLOADER_OUTDATED, $this->lastSaved()->getErrorCode());
 	}
 
+	// ------------------------------------------------------------- cookies
+
+	/**
+	 * The owner's jar, not the importer's.
+	 *
+	 * This is the whole security property of the feature: a contributor — or a stranger
+	 * holding a public link — can cause an import, and it must be the channel owner's
+	 * session that is spent on it and nobody else's.
+	 */
+	public function testTheJarBelongsToTheChannelOwnerNotThePersonImporting(): void {
+		$this->channelMapper->method('find')->willReturn(self::channel());
+
+		$this->cookieJar->expects(self::atLeastOnce())
+			->method('writeTo')
+			->with(self::OWNER, $this->temporaryDirectory)
+			->willReturn($this->temporaryDirectory . '/cookies.txt');
+
+		$this->allowClaim();
+		$this->runner->queueSuccess(self::metadata());
+		$this->runner->queueSuccess();
+		$this->runner->producesFile = 'audio.mp3';
+		$this->captureUpdates();
+
+		// The import was requested by IMPORTER, who is not OWNER.
+		$this->service->perform(self::import());
+
+		foreach ($this->runner->calls as $argv) {
+			self::assertContains('--cookies', $argv);
+		}
+	}
+
+	public function testNoCookieFlagWhenTheOwnerStoredNothing(): void {
+		$this->channelMapper->method('find')->willReturn(self::channel());
+		$this->cookieJar->method('writeTo')->willReturn(null);
+
+		$this->allowClaim();
+		$this->runner->queueSuccess(self::metadata());
+		$this->runner->queueSuccess();
+		$this->runner->producesFile = 'audio.mp3';
+		$this->captureUpdates();
+
+		$this->service->perform(self::import());
+
+		self::assertNotContains('--cookies', $this->runner->calls[0]);
+	}
+
+	/**
+	 * YouTube rotates these, and yt-dlp writes the rotated jar back. Taking it back on a
+	 * *failed* run matters most: those are the channels whose cookies are in trouble.
+	 */
+	public function testTheRotatedJarIsTakenBackEvenWhenTheImportFails(): void {
+		$this->channelMapper->method('find')->willReturn(self::channel());
+		$this->cookieJar->method('writeTo')->willReturn($this->temporaryDirectory . '/cookies.txt');
+
+		$this->cookieJar->expects(self::atLeastOnce())
+			->method('refreshFrom')
+			->with(self::OWNER, $this->temporaryDirectory . '/cookies.txt');
+
+		$this->allowClaim();
+		$this->runner->queueSuccess(self::metadata());
+		$this->runner->queueFailure(
+			'ERROR: [youtube] abc: Sign in to confirm you\'re not a bot. Use --cookies-from-browser or --cookies.',
+		);
+		$this->captureUpdates();
+
+		$this->service->perform(self::import());
+
+		// And the verdict knows a jar was presented, so it says "replace them" rather than
+		// the plain bot check's "try again later".
+		self::assertSame(ImportError::COOKIES_REJECTED, $this->lastSaved()->getErrorCode());
+	}
+
+	/**
+	 * The combination that broke a real server: cookies stored, no JavaScript runtime.
+	 *
+	 * Authenticating moves yt-dlp off the one client whose URLs need no player, onto two
+	 * that require it — so on a server with no engine, sending the jar turns "usually
+	 * works" into "no downloadable formats, every video". The jar is held back instead.
+	 */
+	public function testCookiesAreWithheldWhenTheServerHasNoJavascriptRuntime(): void {
+		$locator = $this->createMock(YtDlpLocator::class);
+		$locator->method('status')->willReturn(new ToolStatus(
+			available: true,
+			reason: null,
+			ytDlpPath: '/usr/local/bin/yt-dlp',
+			ytDlpVersion: '2026.07.04',
+			ffmpegDir: '/usr/bin',
+			jsRuntime: null,
+		));
+
+		$this->channelMapper->method('find')->willReturn(self::channel());
+		// Never even read: withholding happens before the jar is written to disk, so a
+		// signed-in session is not put on the filesystem for a run that cannot use it.
+		$this->cookieJar->expects(self::never())->method('writeTo');
+
+		$this->allowClaim();
+		$this->runner->queueSuccess(self::metadata());
+		$this->runner->queueSuccess();
+		$this->runner->producesFile = 'audio.mp3';
+		$this->captureUpdates();
+
+		$this->serviceWith($locator)->perform(self::import());
+
+		foreach ($this->runner->calls as $argv) {
+			self::assertNotContains('--cookies', $argv);
+		}
+	}
+
 	// ------------------------------------------------- the JavaScript runtime
 
 	public function testTheRuntimeIsLentToBothPasses(): void {
@@ -689,6 +803,7 @@ class YoutubeImportServiceTest extends TestCase {
 			$this->appConfig,
 			$config,
 			$clock,
+			$this->cookieJar,
 			new NullLogger(),
 		);
 	}

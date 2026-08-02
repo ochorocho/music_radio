@@ -99,11 +99,13 @@ final class YtDlpArgv {
 		string $canonicalUrl,
 		?string $proxy = null,
 		?string $jsRuntime = null,
+		?string $cookieFile = null,
 	): array {
 		return [
 			...self::safetyFlags($ytDlp),
 			...self::networkFlags($proxy),
 			...self::javascriptFlags($jsRuntime),
+			...self::cookieFlags($cookieFile),
 
 			// Ask, do not fetch.
 			'--simulate',
@@ -125,6 +127,7 @@ final class YtDlpArgv {
 	 *                              land either side of this
 	 * @param string|null $jsRuntime a {@see JsRuntime::spec()}; without one it is this pass
 	 *                               that gets refused, the probe above having succeeded
+	 * @param string|null $cookieFile a Netscape cookie file written by {@see CookieJar}
 	 * @return list<string>
 	 */
 	public static function download(
@@ -136,11 +139,13 @@ final class YtDlpArgv {
 		int $maxFilesizeBytes,
 		?string $proxy = null,
 		?string $jsRuntime = null,
+		?string $cookieFile = null,
 	): array {
 		return [
 			...self::safetyFlags($ytDlp),
 			...self::networkFlags($proxy),
 			...self::javascriptFlags($jsRuntime),
+			...self::cookieFlags($cookieFile),
 
 			// --- limits, applied before and during the download -----------------
 			// Checked against the metadata, so an over-long video costs nothing.
@@ -253,6 +258,31 @@ final class YtDlpArgv {
 		}
 
 		return ['--js-runtimes', $jsRuntime];
+	}
+
+	/**
+	 * Ask as somebody signed in, when the channel's owner has said how.
+	 *
+	 * On both passes, because a bot check answers the metadata request as readily as the
+	 * download and there is nothing to be gained by being anonymous for one of them.
+	 *
+	 * The file is written per import by {@see CookieJar} and dies with the import's
+	 * directory. yt-dlp also *writes* to it — YouTube rotates these — which is why the
+	 * caller reads it back afterwards rather than treating it as input only.
+	 *
+	 * Note what is deliberately not here: `--cookies-from-browser`. It reads a browser
+	 * profile off the local disk, which on a server means whatever profile the web user
+	 * happens to be able to read, chosen by a setting. There is no browser on a server and
+	 * no reason to let a config value point a file read at one.
+	 *
+	 * @return list<string>
+	 */
+	private static function cookieFlags(?string $cookieFile): array {
+		if ($cookieFile === null || $cookieFile === '') {
+			return [];
+		}
+
+		return ['--cookies', $cookieFile];
 	}
 
 	/**

@@ -131,6 +131,17 @@ class YtDlpFailureTest extends TestCase {
 				'ERROR: Unable to download webpage: <urlopen error [Errno 111] Connection refused>',
 				ImportError::NETWORK,
 			],
+			// What a real server produced once cookies were stored on it. Its own code,
+			// because "The import failed." leaves the reader holding yt-dlp's advice to run
+			// --list-formats and nothing they can act on.
+			'nothing downloadable was offered' => [
+				'ERROR: [youtube] abc: Requested format is not available. Use --list-formats for a list of available formats',
+				ImportError::NO_FORMATS,
+			],
+			'no formats at all' => [
+				'ERROR: [youtube] abc: No video formats found!; please report this issue on https://github.com/yt-dlp/yt-dlp/issues',
+				ImportError::NO_FORMATS,
+			],
 			'something nobody anticipated' => [
 				'ERROR: [youtube] abc: Something entirely new went wrong',
 				ImportError::UNKNOWN,
@@ -193,6 +204,11 @@ class YtDlpFailureTest extends TestCase {
 			'the signature step gives up' => [
 				'ERROR: [youtube] abc: nsig extraction failed: Some formats may be missing',
 			],
+			// Not a refusal but an absence, and the same cause: the clients that need a
+			// player offered nothing this server could take.
+			'nothing downloadable is offered' => [
+				'ERROR: [youtube] abc: Requested format is not available. Use --list-formats for a list of available formats',
+			],
 		];
 	}
 
@@ -251,6 +267,61 @@ class YtDlpFailureTest extends TestCase {
 				jsRuntimeAvailable: false,
 			),
 		);
+	}
+
+	// ------------------------------------------------------------- cookies
+
+	private const SIGN_IN = 'ERROR: [youtube] abc: Sign in to confirm you\'re not a bot. Use --cookies-from-browser or --cookies.';
+
+	/**
+	 * Being asked to sign in *while signed in* is a different problem from being asked
+	 * while anonymous: the stored jar has stopped being accepted, and "try again later" —
+	 * which is what a plain bot check says — is advice that never comes good.
+	 */
+	public function testASignInDemandDespiteCookiesMeansTheCookiesAreStale(): void {
+		self::assertSame(
+			ImportError::COOKIES_REJECTED,
+			YtDlpFailure::classify(self::failed(self::SIGN_IN), false, cookiesUsed: true),
+		);
+	}
+
+	public function testTheSameDemandWithoutCookiesIsAnOrdinaryBotCheck(): void {
+		self::assertSame(ImportError::BOT_CHECK, YtDlpFailure::classify(self::failed(self::SIGN_IN), false));
+	}
+
+	/**
+	 * A 403 is a bot check of sorts, but it is about how the URL was signed rather than
+	 * about who asked — so it must not send somebody re-exporting cookies that were never
+	 * the problem.
+	 */
+	public function testARefusedUrlIsNotBlamedOnTheCookies(): void {
+		self::assertSame(
+			ImportError::BOT_CHECK,
+			YtDlpFailure::classify(self::failed(self::REFUSED), false, cookiesUsed: true),
+		);
+	}
+
+	public function testAJarYtDlpWillNotReadIsNamedAsSuch(): void {
+		$stderr = 'ERROR: cookies file must be Netscape formatted, not JSON. See  https://github.com/yt-dlp/yt-dlp/wiki';
+
+		self::assertSame(
+			ImportError::COOKIES_INVALID,
+			YtDlpFailure::classify(self::failed($stderr), false, cookiesUsed: true),
+		);
+	}
+
+	/**
+	 * Nothing above may fire on a run that presented no jar. There is no stored jar to
+	 * blame, and every one of these messages would tell somebody to go and re-export
+	 * cookies they never had.
+	 */
+	public function testNoneOfTheCookieVerdictsReachARunWithoutAJar(): void {
+		foreach ([self::SIGN_IN, self::REFUSED, 'ERROR: cookies file must be Netscape formatted'] as $stderr) {
+			$code = YtDlpFailure::classify(self::failed($stderr), false);
+
+			self::assertNotSame(ImportError::COOKIES_REJECTED, $code);
+			self::assertNotSame(ImportError::COOKIES_INVALID, $code);
+		}
 	}
 
 	// ------------------------------------------------------------- the probe

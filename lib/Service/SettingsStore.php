@@ -31,10 +31,19 @@ use Psr\Log\LoggerInterface;
  */
 class SettingsStore {
 
+	/**
+	 * The one field on the personal page that is not a value.
+	 *
+	 * Removing a secret cannot be expressed as saving an empty one — see saveCookies() — so
+	 * it travels as its own flag rather than as a sentinel value.
+	 */
+	public const FIELD_COOKIES_CLEAR = 'youtube_cookies_clear';
+
 	public function __construct(
 		private IAppConfig $appConfig,
 		private IUserConfig $userConfig,
 		private YtDlpLocator $locator,
+		private CookieJar $cookieJar,
 		private IRootFolder $rootFolder,
 		private IL10N $l10n,
 		private LoggerInterface $logger,
@@ -180,6 +189,23 @@ class SettingsStore {
 				),
 			],
 			'defaultFolder' => MusicLibrary::DEFAULT_FOLDER,
+			// Note what is not here: the cookies. This is the payload the page renders from,
+			// so anything in it is readable by whatever is looking at the page — which for a
+			// stored secret is the one thing that must never be true. What comes back is a
+			// description of the jar, never the jar. See CookieJar::describe().
+			'cookies' => $this->cookieJar->describe($userId),
+			// Whether a stored jar would actually be sent. Without a JavaScript runtime it
+			// is held back, because authenticating moves yt-dlp onto clients that need one
+			// — see YoutubeImportService::cookiesAreUsable(). A setting that is being
+			// ignored has to say so on the page that offers it.
+			'cookiesUsable' => $this->locator->jsRuntime() !== null,
+			// Whether offering the field is worth anything at all. With importing switched
+			// off server-side, cookies would be a form that changes nothing.
+			'importEnabled' => $this->appConfig->getValueBool(
+				Application::APP_ID,
+				YtDlpLocator::CONFIG_ENABLED,
+				YtDlpLocator::DEFAULT_ENABLED,
+			),
 		];
 	}
 
@@ -188,8 +214,10 @@ class SettingsStore {
 	 * @return array<string, string> field id => why it was refused
 	 */
 	public function savePersonal(string $userId, array $values): array {
+		$errors = $this->saveCookies($userId, $values);
+
 		if (!array_key_exists(MusicLibrary::CONFIG_FOLDER, $values)) {
-			return [];
+			return $errors;
 		}
 
 		$wanted = is_string($values[MusicLibrary::CONFIG_FOLDER]) ? $values[MusicLibrary::CONFIG_FOLDER] : '';
@@ -199,11 +227,11 @@ class SettingsStore {
 		// afterwards would be confusing; being told why is not. The one exception is an
 		// empty value, which plainly means "back to the default".
 		if (trim($wanted) !== '' && $safe !== trim(str_replace('\\', '/', $wanted), " \t\n\r\0\x0B/")) {
-			return [
-				MusicLibrary::CONFIG_FOLDER => $this->l10n->t(
-					'That folder cannot be used. Choose a folder inside your files.',
-				),
-			];
+			$errors[MusicLibrary::CONFIG_FOLDER] = $this->l10n->t(
+				'That folder cannot be used. Choose a folder inside your files.',
+			);
+
+			return $errors;
 		}
 
 		// The folder has to be there already.
@@ -213,14 +241,49 @@ class SettingsStore {
 		// it is the server that has to hold it. An empty value is exempt: it means "back to
 		// the default", which is created on first use like it always was.
 		if (trim($wanted) !== '' && !$this->folderExists($userId, $safe)) {
-			return [
-				MusicLibrary::CONFIG_FOLDER => $this->l10n->t('There is no folder called "%1$s" in your files.', [$safe]),
-			];
+			$errors[MusicLibrary::CONFIG_FOLDER] = $this->l10n->t('There is no folder called "%1$s" in your files.', [$safe]);
+
+			return $errors;
 		}
 
 		$this->userConfig->setValueString($userId, Application::APP_ID, MusicLibrary::CONFIG_FOLDER, $safe);
 
-		return [];
+		return $errors;
+	}
+
+	/**
+	 * Store, replace or remove this person's YouTube cookies.
+	 *
+	 * Three states out of two fields, because "leave it alone" has to be the default: a page
+	 * that saves a folder must not clear a jar it never showed. So an absent key means no
+	 * change, `youtube_cookies_clear` means remove, and a non-empty paste replaces.
+	 *
+	 * An empty paste is *not* a removal. The field renders empty whenever something is
+	 * stored — there is nothing to prefill it with — so treating empty as "delete" would
+	 * make saving an unrelated setting silently throw the cookies away.
+	 *
+	 * @param array<string, mixed> $values
+	 * @return array<string, string>
+	 */
+	private function saveCookies(string $userId, array $values): array {
+		if (($values[self::FIELD_COOKIES_CLEAR] ?? false) === true) {
+			$this->cookieJar->clear($userId);
+
+			return [];
+		}
+
+		if (!array_key_exists(CookieJar::CONFIG_COOKIES, $values)) {
+			return [];
+		}
+
+		$pasted = is_string($values[CookieJar::CONFIG_COOKIES]) ? $values[CookieJar::CONFIG_COOKIES] : '';
+		if (trim($pasted) === '') {
+			return [];
+		}
+
+		$problem = $this->cookieJar->store($userId, $pasted);
+
+		return $problem === null ? [] : [CookieJar::CONFIG_COOKIES => $problem];
 	}
 
 	/**

@@ -52,10 +52,13 @@ final class ImportError {
 
 	// The download.
 	public const BOT_CHECK = 'bot_check';
+	public const COOKIES_REJECTED = 'cookies_rejected';
+	public const COOKIES_INVALID = 'cookies_invalid';
 	public const DOWNLOADER_OUTDATED = 'downloader_outdated';
 	public const NETWORK = 'network';
 	public const TIMED_OUT = 'timed_out';
 	public const NO_AUDIO = 'no_audio';
+	public const NO_FORMATS = 'no_formats';
 
 	// After the download, on the way into someone's files.
 	public const QUOTA_EXCEEDED = 'quota_exceeded';
@@ -102,11 +105,17 @@ final class ImportError {
 			// Named as the server's problem, not the listener's, because it is. "Later" is
 			// not a platitude here: this depends on what YouTube currently thinks of the
 			// address the server asks from, and it does pass.
-			self::BOT_CHECK => $l->t('YouTube asked this server to prove it is not a bot, so the video could not be fetched. Trying again later often works.'),
+			self::BOT_CHECK => $l->t('YouTube asked this server to prove it is not a bot, so the video could not be fetched. Trying again later often works; the channel owner can also store YouTube cookies in their personal settings.'),
+			// Separated from the plain bot check because the answer is the opposite one:
+			// there is nothing to add, and waiting will not help — what is stored has stopped
+			// being accepted and has to be replaced.
+			self::COOKIES_REJECTED => $l->t('YouTube did not accept the stored cookies. The channel owner needs to export them again.'),
+			self::COOKIES_INVALID => $l->t('The stored YouTube cookies could not be read. The channel owner needs to export them again.'),
 			self::DOWNLOADER_OUTDATED => $l->t('YouTube changed something the downloader on this server cannot handle yet. Ask an administrator to update yt-dlp.'),
 			self::NETWORK => $l->t('This server could not reach YouTube.'),
 			self::TIMED_OUT => $l->t('That download took too long and was stopped.'),
 			self::NO_AUDIO => $l->t('No audio could be taken from that video.'),
+			self::NO_FORMATS => $l->t('YouTube offered this server no audio it could download for that video.'),
 
 			self::QUOTA_EXCEEDED => $l->t('There is not enough space left on this channel.'),
 			self::CHANNEL_FULL => $l->t('This channel has reached its track limit.'),

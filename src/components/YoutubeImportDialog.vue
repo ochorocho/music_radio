@@ -166,7 +166,17 @@ export default {
 			} catch (error) {
 				// Shown in the field, not as a toast: every refusal here is about the link
 				// that is still sitting in it, and this way it can be corrected in place.
-				this.error = errorMessage(error, t('music_radio', 'That link could not be added'))
+				this.error = errorMessage(
+					error,
+					t('music_radio', 'That link could not be added'),
+					{
+						// Named here because only this call site knows the period. The limit
+						// is ten an hour — each import spends somebody's storage and a
+						// transcode — and the 429 carries no Retry-After to read it from, so
+						// the generic "wait a little" would understate it by an hour.
+						429: t('music_radio', 'You have imported as much as this server allows in an hour. Try again later.'),
+					},
+				)
 				return false
 			} finally {
 				this.submitting = false

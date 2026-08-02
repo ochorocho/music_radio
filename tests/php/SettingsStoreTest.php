@@ -8,6 +8,7 @@ declare(strict_types=1);
 
 namespace OCA\MusicRadio\Tests;
 
+use OCA\MusicRadio\Service\CookieJar;
 use OCA\MusicRadio\Service\MusicLibrary;
 use OCA\MusicRadio\Service\SettingsStore;
 use OCA\MusicRadio\Service\ToolStatus;
@@ -48,6 +49,7 @@ class SettingsStoreTest extends TestCase {
 	private array $missingFolders = [];
 
 	private IAppConfig&MockObject $appConfig;
+	private CookieJar&MockObject $cookieJar;
 	private SettingsStore $store;
 
 	protected function setUp(): void {
@@ -111,10 +113,13 @@ class SettingsStoreTest extends TestCase {
 			static fn (string $text, array $params = []): string => vsprintf($text, $params),
 		);
 
+		$this->cookieJar = $this->createMock(CookieJar::class);
+
 		$this->store = new SettingsStore(
 			$this->appConfig,
 			$userConfig,
 			$locator,
+			$this->cookieJar,
 			$rootFolder,
 			$l10n,
 			new NullLogger(),
