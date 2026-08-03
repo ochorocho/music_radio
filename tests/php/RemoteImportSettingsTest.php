@@ -163,6 +163,37 @@ class RemoteImportSettingsTest extends TestCase {
 		$this->assertSame(ImportError::REMOTE_WORKER_OFFLINE, $status->reason);
 	}
 
+	public function testAnAbsentWorkerIsStillAServerThatDoesImports(): void {
+		// The distinction the sharing panel reads. A worker that is switched off, rebooting
+		// or between polls cannot take a job — but every decision an administrator had to
+		// make has been made, and the per-share "Can add tracks from YouTube" permission is
+		// still in force. Gating that switch on `available` hid a setting that was doing
+		// something, and made it impossible to prepare shares before starting a worker for
+		// the first time.
+		$this->values[YtDlpLocator::CONFIG_ENABLED] = true;
+		$this->values[RemoteImportSettings::CONFIG_WORKERS] = 'radio-worker';
+
+		$status = $this->settings->status();
+
+		$this->assertFalse($status->available);
+		$this->assertTrue($status->configured);
+	}
+
+	public function testAServerWithNoWorkerAccountIsNotConfigured(): void {
+		// The other side of it: nobody may collect, so there is nothing to offer an owner
+		// and the switch should stay away.
+		$this->values[YtDlpLocator::CONFIG_ENABLED] = true;
+
+		$this->assertFalse($this->settings->status()->configured);
+	}
+
+	public function testImportingSwitchedOffIsNotConfigured(): void {
+		$this->values[RemoteImportSettings::CONFIG_WORKERS] = 'radio-worker';
+		$this->settings->markSeen('nas', null);
+
+		$this->assertFalse($this->settings->status()->configured);
+	}
+
 	public function testAListeningWorkerMakesImportingAvailable(): void {
 		$this->values[YtDlpLocator::CONFIG_ENABLED] = true;
 		$this->values[RemoteImportSettings::CONFIG_WORKERS] = 'radio-worker';
@@ -171,6 +202,7 @@ class RemoteImportSettingsTest extends TestCase {
 		$status = $this->settings->status();
 
 		$this->assertTrue($status->available);
+		$this->assertTrue($status->configured);
 		$this->assertNull($status->reason);
 		// The worker's runtime, carried through so that everything which asks "can cookies
 		// be used" gets an answer about the machine that will actually run yt-dlp.

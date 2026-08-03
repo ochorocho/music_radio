@@ -43,6 +43,12 @@ use OCP\DB\Exception as DbException;
  * `advanceLocally()` crosses the boundary using that cached value before asking the server
  * anything. Reorder inside that window and listeners audibly play the wrong track for a
  * moment and then hard-seek. Outside it, reordering behind the playhead is invisible.
+ *
+ * What the recompute produces is the channel's **base order** — its author's arrangement,
+ * or its shuffle — with the voted tracks lifted out and put back immediately behind
+ * whatever is playing. Derived from the base every time, never from its own last answer:
+ * see {@see orderFor} for the three bugs that came of doing it the other way, and
+ * {@see Ordering::promoteVoted} for the ordering itself.
  */
 class VoteService {
 
@@ -62,6 +68,9 @@ class VoteService {
 	 * is every listener hearing the wrong track and then jumping.
 	 */
 	public const BOUNDARY_GUARD_MS = 20_000;
+
+	/** Gaps between positions, so the column reads like the other two orderings. */
+	private const ORDER_STEP = 1000;
 
 	public function __construct(
 		private VoteMapper $voteMapper,
@@ -199,11 +208,16 @@ class VoteService {
 	 *
 	 * Returns whether it did, which is only of interest to tests and the periodic job —
 	 * callers on the request path do not care and must not wait on it.
+	 *
+	 * Runs on shuffled channels too. It used to refuse, on the reasoning that shuffle is
+	 * an instruction to randomise and a request for a particular track next contradicts
+	 * it. They do not contradict: the shuffle decides the order of everything nobody has
+	 * asked for, and it is still doing that job while a request jumps the queue. The
+	 * refusal meant every vote cast on a shuffled channel was accepted, counted, shown on
+	 * screen and then silently ignored.
 	 */
 	public function recomputeIfDue(Channel $channel, bool $force = false): bool {
-		if (!$channel->getAllowVoting() || $channel->getShuffle()) {
-			// Shuffle is a deliberate instruction to randomise; honouring both at once is
-			// not a coherent thing to do. See TrackMapper::findAllForChannelInPlayOrder.
+		if (!$channel->getAllowVoting()) {
 			return false;
 		}
 
@@ -212,10 +226,11 @@ class VoteService {
 			return false;
 		}
 
-		$counts = $this->voteMapper->countsForChannel($channel->getId());
+		$tally = $this->voteMapper->tallyForChannel($channel->getId());
 		$spent = false;
 
-		$playable = TimelineService::playable($this->trackMapper->findAllForChannelInPlayOrder($channel));
+		$inForce = $this->trackMapper->findAllForChannelInPlayOrder($channel);
+		$playable = TimelineService::playable($inForce);
 		$durations = TimelineService::durations($playable);
 		$located = $durations === []
 			? null
@@ -225,15 +240,15 @@ class VoteService {
 
 		// The reward is spent when the track reaches the front. There is no boundary event
 		// to do this on, and this is the one place that reliably knows what is playing.
-		if ($current !== null && ($counts[$current->getId()] ?? 0) > 0) {
+		if ($current !== null && ($tally[$current->getId()]['votes'] ?? 0) > 0) {
 			$this->voteMapper->clearForTrack($current->getId());
-			unset($counts[$current->getId()]);
+			unset($tally[$current->getId()]);
 			// Those counts were on everybody's screen a moment ago; say that they are gone.
 			$this->bumpVoteVersion($channel);
 			$spent = true;
 		}
 
-		$order = $this->orderFor($channel, $this->pinned($playable, $located), $counts);
+		$order = $this->orderFor($channel, $inForce, $current, $this->pinnedNext($playable, $located), $tally);
 		if ($order === null) {
 			// Nothing moved, but votes may still have been spent above — that is a real
 			// change and the caller should hear about it.
@@ -241,19 +256,18 @@ class VoteService {
 
 			return $spent;
 		}
-		$this->apply($channel, $order, $current, $located['offsetMs'] ?? 0, $now);
+		$this->apply($channel, $order, $now);
 
 		return true;
 	}
 
 	/**
-	 * The tracks a rewrite must not move.
+	 * The track behind the playing one that a rewrite must not move, if there is one.
 	 *
-	 * Always what is playing. And, when the boundary is close enough that clients have
-	 * already loaded the next track into their idle audio element, that one too:
-	 * `advanceLocally()` crosses the boundary using that cached value before asking the
-	 * server anything, so moving it makes every listener briefly play the wrong thing and
-	 * then hard-seek.
+	 * When the boundary is close enough that clients have already loaded the next track
+	 * into their idle audio element, that track is spoken for: `advanceLocally()` crosses
+	 * the boundary using the cached value before asking the server anything, so moving it
+	 * makes every listener briefly play the wrong thing and then hard-seek.
 	 *
 	 * Pinning rather than refusing, which is what this did first and was wrong. The guard
 	 * is twenty seconds and a track can easily be shorter than that — a channel of
@@ -264,128 +278,105 @@ class VoteService {
 	 *
 	 * @param list<Track> $playable
 	 * @param array{index: int, offsetMs: int}|null $located
-	 * @return list<Track>
 	 */
-	private function pinned(array $playable, ?array $located): array {
+	private function pinnedNext(array $playable, ?array $located): ?Track {
 		if ($located === null) {
-			return [];
+			return null;
 		}
 
 		$current = $playable[$located['index']];
-		$pinned = [$current];
 
-		$remaining = (int)$current->getDurationMs() - $located['offsetMs'];
-		if ($remaining > self::BOUNDARY_GUARD_MS) {
+		if ((int)$current->getDurationMs() - $located['offsetMs'] > self::BOUNDARY_GUARD_MS) {
 			// Nobody has preloaded anything yet; the whole tail is free to move.
-			return $pinned;
+			return null;
 		}
 
 		// Wrapping to the top when the current track is the last one: on a looping channel
 		// that really is what plays next, and on one that is ending there is nothing after
 		// this to protect anyway.
 		$next = $playable[$located['index'] + 1] ?? ($playable[0] ?? null);
-		if ($next !== null && $next->getId() !== $current->getId()) {
-			$pinned[] = $next;
-		}
 
-		return $pinned;
+		return $next === null || $next->getId() === $current->getId() ? null : $next;
 	}
 
 	/**
 	 * The order votes are asking for, or null if it is the order already in force.
 	 *
-	 * Most-voted first, behind whatever is pinned — see {@see pinned()}. Ties keep their
-	 * existing relative order, which is what stops an unvoted channel from churning: with
-	 * no votes at all this is exactly the current order, and returns null.
+	 * Built from the channel's **base** order — the author's arrangement, or the shuffle —
+	 * and not from the running order this last produced. That is the difference between a
+	 * running order and a drifting one, and three separate faults came out of getting it
+	 * the other way round:
 	 *
-	 * @param list<Track> $pinnedTracks in the order they must keep
-	 * @param array<int, int> $counts
+	 *  - Every track boundary rewrote the whole order even on a channel with no votes at
+	 *    all, because the playing track was rotated to index 0 each time. That bumped
+	 *    `playlist_version` and sent every listener back for the track list, for nothing.
+	 *  - The author's arrangement was unrecoverable: after a few votes `vote_order` bore
+	 *    no relation to it, and it could only be got back by turning voting off.
+	 *  - `vote_order` had to be maintained by every path that touched a playlist, and it
+	 *    was not — it defaulted to zero, so switching voting on dropped the whole playlist
+	 *    into row-id order, and a newly added track went straight to the front of the
+	 *    queue ahead of tracks people had actually voted for.
+	 *
+	 * Recomputing from the base makes all three impossible rather than fixed: with no
+	 * votes the answer *is* the base order, so a channel nobody votes on writes nothing.
+	 *
+	 * @param list<Track> $inForce the order currently being broadcast
+	 * @param array<int, array{votes: int, firstAt: int}> $tally
 	 * @return list<Track>|null
 	 */
-	private function orderFor(Channel $channel, array $pinnedTracks, array $counts): ?array {
-		$all = $this->trackMapper->findAllForChannelInPlayOrder($channel);
+	private function orderFor(
+		Channel $channel,
+		array $inForce,
+		?Track $current,
+		?Track $pinnedNext,
+		array $tally,
+	): ?array {
+		$order = Ordering::promoteVoted(
+			$this->trackMapper->findAllForChannelInBaseOrder($channel),
+			$current === null ? null : (int)$current->getId(),
+			$pinnedNext === null ? null : (int)$pinnedNext->getId(),
+			$tally,
+		);
 
-		$pinnedIds = [];
-		foreach ($pinnedTracks as $track) {
-			$pinnedIds[$track->getId()] = true;
-		}
+		$ids = static fn (array $tracks): array => array_map(static fn (Track $t): int => (int)$t->getId(), $tracks);
 
-		$pinned = [];
-		$rest = [];
-		foreach ($all as $track) {
-			if (isset($pinnedIds[$track->getId()])) {
-				$pinned[] = $track;
-			} else {
-				$rest[] = $track;
-			}
-		}
-
-		// Pinned rows keep the order pinned() asked for, not the order they happen to sit
-		// in: "current, then next" is the whole point, and on a wrapped playlist the next
-		// track is the one at the top.
-		usort($pinned, static function (Track $a, Track $b) use ($pinnedTracks): int {
-			$rank = static function (Track $track) use ($pinnedTracks): int {
-				foreach ($pinnedTracks as $index => $candidate) {
-					if ($candidate->getId() === $track->getId()) {
-						return $index;
-					}
-				}
-
-				return PHP_INT_MAX;
-			};
-
-			return $rank($a) <=> $rank($b);
-		});
-
-		// usort is not stable across every PHP configuration this may run on, so the
-		// existing index is carried into the comparison as the tiebreak. Without it,
-		// tracks with equal votes could swap places on every recompute — which would
-		// re-anchor the timeline forever on a channel nobody is voting on.
-		$indexed = [];
-		foreach ($rest as $index => $track) {
-			$indexed[] = ['track' => $track, 'index' => $index];
-		}
-
-		usort($indexed, static function (array $a, array $b) use ($counts): int {
-			$byVotes = ($counts[$b['track']->getId()] ?? 0) <=> ($counts[$a['track']->getId()] ?? 0);
-
-			return $byVotes !== 0 ? $byVotes : $a['index'] <=> $b['index'];
-		});
-
-		$order = [...$pinned, ...array_map(static fn (array $row): Track => $row['track'], $indexed)];
-
-		$before = array_map(static fn (Track $t): int => $t->getId(), $all);
-		$after = array_map(static fn (Track $t): int => $t->getId(), $order);
-
-		return $before === $after ? null : $order;
+		// Compared against what is actually being broadcast, not against the base it was
+		// derived from. Otherwise the first recompute after voting is switched on decides it
+		// has nothing to do, and the channel goes on playing whatever `vote_order` happened
+		// to hold — which, before it had ever been written, was row-id order.
+		return $ids($inForce) === $ids($order) ? null : $order;
 	}
 
 	/**
-	 * Write the new order and put the listener back where they were.
+	 * Write the new running order.
 	 *
-	 * Follows materialiseShuffle exactly, which is the app's existing template for a
-	 * wholesale reorder that preserves position: the current track becomes index 0 and
-	 * the anchor is set to its offset within itself, so the programme is rewritten
-	 * underneath the playhead without the playhead moving.
+	 * Through the timeline guard rather than round it. The bespoke version this replaces
+	 * rotated the playing track to index 0 and set the anchor to its offset within itself,
+	 * which does preserve the position but also rewrites the order on every boundary
+	 * whether or not anybody voted. withPreservedPosition() makes the weaker and correct
+	 * promise — the same track, at the same offset, wherever it now sits — so a track can
+	 * be pulled forward from behind the playhead without the order having to be rotated to
+	 * accommodate it.
 	 *
 	 * @param list<Track> $order
 	 */
-	private function apply(Channel $channel, array $order, ?Track $current, int $offsetInTrack, int $now): void {
-		$position = 0;
-		foreach ($order as $track) {
-			$position += 1000;
-			$track->setVoteOrder($position);
-			$this->trackMapper->update($track);
-		}
+	private function apply(Channel $channel, array $order, int $now): void {
+		$updated = $this->timelineService->withPreservedPosition($channel, function () use ($channel, $order): void {
+			$position = 0;
+			foreach ($order as $track) {
+				$position += self::ORDER_STEP;
+				$this->trackMapper->updateOrder(
+					(int)$track->getId(),
+					$channel->getId(),
+					TrackMapper::ORDER_VOTE,
+					$position,
+				);
+			}
+		});
 
-		$channel->setEpochOffsetMs($current === null ? 0 : $offsetInTrack);
-		$channel->setStartedAtMs($this->clock->nowMillis());
-		$channel->setPlaylistVersion($channel->getPlaylistVersion() + 1);
-		$channel->setStateVersion($channel->getStateVersion() + 1);
-		$channel->setVoteOrderedAt($now);
-		$channel->setUpdatedAt($now);
-
-		$this->channelMapper->update($channel);
+		$updated->setVoteOrderedAt($now);
+		$updated->setUpdatedAt($now);
+		$this->channelMapper->update($updated);
 	}
 
 	private function stampOrderedAt(Channel $channel, int $now): void {

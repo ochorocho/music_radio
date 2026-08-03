@@ -116,6 +116,7 @@ class YtDlpLocator {
 		return new ToolStatus(
 			available: true,
 			reason: null,
+			configured: true,
 			ytDlpPath: $ytDlp,
 			ytDlpVersion: $version,
 			ffmpegDir: $ffmpegDir,

@@ -16,6 +16,7 @@ use OCA\MusicRadio\Permission;
 use OCA\MusicRadio\Service\Clock;
 use OCA\MusicRadio\Service\PlaybackService;
 use OCA\MusicRadio\Service\TimelineService;
+use OCA\MusicRadio\Service\VoteService;
 use OCP\Security\ISecureRandom;
 use PHPUnit\Framework\MockObject\MockObject;
 use PHPUnit\Framework\TestCase;
@@ -34,6 +35,7 @@ class PlaybackServiceTest extends TestCase {
 	private TrackMapper&MockObject $trackMapper;
 	private PlaybackService $service;
 	private TimelineService $timeline;
+	private VoteService&MockObject $voteService;
 
 	protected function setUp(): void {
 		parent::setUp();
@@ -47,10 +49,12 @@ class PlaybackServiceTest extends TestCase {
 		$clock->method('nowSeconds')->willReturn((int)(self::NOW_MS / 1000));
 
 		$this->timeline = new TimelineService($this->channelMapper, $this->trackMapper, $clock);
+		$this->voteService = $this->createMock(VoteService::class);
 		$this->service = new PlaybackService(
 			$this->channelMapper,
 			$this->trackMapper,
 			$this->timeline,
+			$this->voteService,
 			$clock,
 			$this->createMock(ISecureRandom::class),
 		);

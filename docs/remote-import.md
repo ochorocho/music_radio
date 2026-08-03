@@ -368,11 +368,62 @@ Things worth knowing about it:
     this service has no CacheDirectory=; re-run 'music-radio-worker install' to rewrite the unit
   ```
 
-  `ProtectHome=true` seals off home directories and the service account has none anyway, so
-  a unit missing that line leaves the worker nowhere to keep anything. `update` replaces the
-  script but never the units, so a worker installed before the line existed keeps the old
-  unit until `install` is run again. Nothing else reports this: imports still succeed, just
-  at full download cost every time.
+  `ProtectHome=` seals off home directories — `true` under root, where the service account
+  has none anyway, and `read-only` for a user install, whose own files live there — so a
+  unit missing `CacheDirectory=` leaves the worker nowhere to keep anything. `update`
+  replaces the script but never the units, so a worker installed before the line existed
+  keeps the old unit until `install` is run again. Nothing else reports this: imports still
+  succeed, just at full download cost every time.
+- **`install` judges yt-dlp by whether the *service* can run it**, not by whether the
+  person running `install` can. Those are different questions, and answering the easy one
+  produced the worst failure this script has had: install reported
+
+  ```
+  yt-dlp:     /root/.local/bin/yt-dlp (2026.07.04) — already installed
+  ```
+
+  and the unit then crash-looped every ten seconds on `yt-dlp was not found`, while every
+  check run by hand afterwards agreed with install. Three ways a working copy disappears
+  between the two:
+
+  | Where it is | Why the service cannot use it |
+  |---|---|
+  | `~/.local/bin`, `/root/…` | `ProtectHome=` empties every home directory |
+  | `/snap/bin`, `/opt/…` | not on the PATH a service gets, which is nothing like a shell's |
+  | anywhere, mode `0700` | the service account is not the account that installed it |
+
+  Any of those and `install` now says so and downloads a managed copy to
+  `/var/lib/music-radio-worker/bin/yt-dlp` instead, which is outside every home, needs no
+  PATH, and is readable by the account that runs it. A copy on the service's own PATH is
+  still left alone.
+
+  If a worker is already crash-looping this way, `sudo music-radio-worker install --force`
+  is the fix — it keeps the credentials already on the machine, so nothing has to be
+  entered again, though it does rewrite the unit files.
+- **A worker that starts without yt-dlp fetches it.** Nothing about that needed a person:
+  the script knows which asset it wants, verifies it against the published checksum, runs
+  it before trusting it, and has somewhere to put it. It is what stops the absence of one
+  file turning a worker into a service that restarts every ten seconds indefinitely,
+  logging a line telling somebody to go and run a command.
+
+  ```
+  yt-dlp is not installed; fetching it
+  installed yt-dlp 2026.07.04 (yt-dlp) at /var/lib/music-radio-worker/bin/yt-dlp
+  ```
+
+  Supplying a missing tool only — a yt-dlp that is present is left exactly as it is,
+  however old, because replacing a working one under a running service is a different
+  decision. That is what the quarter-hourly `update` timer is for.
+
+  It needs somewhere to write, which is why the unit carries
+  `ReadWritePaths=-/var/lib/music-radio-worker` and `install` gives that directory to the
+  service account. A worker installed before those existed keeps its old unit until
+  `install` is run again, and until then says so rather than failing silently. A failed
+  download is not retried for five minutes, so a machine that cannot reach GitHub does not
+  ask it for three megabytes six times a minute for as long as nobody is looking.
+
+  `--no-auto-install`, or `MUSIC_RADIO_AUTO_INSTALL=0` in the env file, turns it off for a
+  machine where downloading a binary at start-up is somebody else's decision to make.
 
 ## Cookies
 

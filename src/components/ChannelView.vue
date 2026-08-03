@@ -283,6 +283,10 @@ export default {
 		 * which the payload does not carry, is added on top.
 		 */
 		canImport() {
+			// `available`, deliberately, where the sharing panel uses `configured`. This is
+			// a button that starts an import, and an import started while the remote worker
+			// is off would be refused; the switch beside a share is a stored permission,
+			// which is still worth showing to whoever set it. See SharingPanel.
 			return this.mayImport && this.importCapabilities.available !== false
 		},
 

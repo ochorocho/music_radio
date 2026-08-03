@@ -229,8 +229,13 @@ class RemoteImportSettings {
 		// Refusing here rather than accepting an import nothing will collect. The row would
 		// sit at "queued" until the reaper gave up on it, which is a worse way to learn the
 		// same thing an hour later.
+		// `offline`, not `unavailable`: everything an administrator had to decide has been
+		// decided, and a machine that is switched off — or merely between polls after a
+		// reboot — is not a reason to take the per-share permission away from owners. The
+		// import itself is still refused below; only the question "does this server do
+		// this at all" is answered yes.
 		if (!$this->isOnline()) {
-			return ToolStatus::unavailable(ImportError::REMOTE_WORKER_OFFLINE);
+			return ToolStatus::offline(ImportError::REMOTE_WORKER_OFFLINE);
 		}
 
 		return new ToolStatus(
@@ -240,6 +245,7 @@ class RemoteImportSettings {
 			// does not have and cannot inspect. The worker's own yt-dlp is its operator's
 			// business, and `outdated` stays false rather than guessing.
 			jsRuntime: JsRuntime::fromSpec($this->seenJsRuntime() ?? ''),
+			configured: true,
 		);
 	}
 }

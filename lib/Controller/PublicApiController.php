@@ -100,10 +100,9 @@ class PublicApiController extends PublicShareController {
 		$listeners = $this->listenerPresence->record($channel->getId(), $clientId, $listening);
 
 		// See the signed-in endpoint: a channel whose listeners are all anonymous still has
-		// to spend the votes of tracks that have played.
-		if ($channel->getAllowVoting()) {
-			$this->voteService->recomputeIfDue($channel);
-		}
+		// to spend the votes of tracks that have played, and still has to come round to a
+		// new shuffle.
+		$channel = $this->playbackService->maintainRunningOrder($channel);
 
 		return new DataResponse($this->playbackService->buildState(
 			$channel,

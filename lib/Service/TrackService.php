@@ -123,7 +123,22 @@ class TrackService {
 		$alreadyPresent = array_flip($this->trackMapper->findExistingFileIds($channel->getId(), $fileIds));
 
 		$userFolder = $this->rootFolder->getUserFolder($userId);
-		$nextSort = ($this->trackMapper->maxSortOrder($channel->getId()) ?? 0) + self::SORT_STEP;
+		// One cursor per ordering column, each read from its own maximum.
+		//
+		// This used to be a single cursor taken from the highest `sort_order` and written
+		// into `shuffle_order` as well, on the assumption that the two stay in step. They
+		// do not: a shuffle renumbers one and a drag renumbers the other, and deleting the
+		// most recently added track leaves `sort_order` behind `shuffle_order`. Once that
+		// had happened the next track added was handed a `shuffle_order` already in use —
+		// two rows in the live database still share one — and instead of arriving at the
+		// end of the running order it appeared beside whichever unrelated track held the
+		// same number. `vote_order` was not written at all, so a new track sat at zero and
+		// went straight to the front of a voting channel's queue.
+		$next = [
+			TrackMapper::ORDER_SORT => $this->nextPosition($channel, TrackMapper::ORDER_SORT),
+			TrackMapper::ORDER_SHUFFLE => $this->nextPosition($channel, TrackMapper::ORDER_SHUFFLE),
+			TrackMapper::ORDER_VOTE => $this->nextPosition($channel, TrackMapper::ORDER_VOTE),
+		];
 
 		$added = [];
 		$skipped = [];
@@ -166,7 +181,7 @@ class TrackService {
 		/** @var list<int> $queueForBroadcast ids to prepare once the rows are committed */
 		$queueForBroadcast = [];
 
-		$this->timelineService->withPreservedPosition($channel, function () use ($prepared, $channel, $addedBy, $approved, $now, &$nextSort, &$added, &$queueForBroadcast): void {
+		$this->timelineService->withPreservedPosition($channel, function () use ($prepared, $channel, $addedBy, $approved, $now, &$next, &$added, &$queueForBroadcast): void {
 			foreach ($prepared as $item) {
 				/** @var File $file */
 				$file = $item['file'];
@@ -176,8 +191,9 @@ class TrackService {
 				$track->setChannelId($channel->getId());
 				$track->setFileId($file->getId());
 				$track->setAddedBy($addedBy);
-				$track->setSortOrder($nextSort);
-				$track->setShuffleOrder($nextSort);
+				$track->setSortOrder($next[TrackMapper::ORDER_SORT]);
+				$track->setShuffleOrder($next[TrackMapper::ORDER_SHUFFLE]);
+				$track->setVoteOrder($next[TrackMapper::ORDER_VOTE]);
 				$track->setTitle($probe['title'] ?? $this->titleFromFilename($file->getName()));
 				$track->setArtist($probe['artist']);
 				$track->setAlbum($probe['album']);
@@ -192,7 +208,9 @@ class TrackService {
 				$stored = $this->trackMapper->insert($track);
 				$added[] = $stored;
 				$queueForBroadcast[] = (int)$stored->getId();
-				$nextSort += self::SORT_STEP;
+				foreach ($next as $column => $position) {
+					$next[$column] = $position + self::SORT_STEP;
+				}
 			}
 		});
 
@@ -238,6 +256,16 @@ class TrackService {
 	}
 
 	/**
+	 * The position an appended track takes in one ordering column.
+	 *
+	 * @param TrackMapper::ORDER_* $column
+	 * @throws Exception
+	 */
+	private function nextPosition(Channel $channel, string $column): int {
+		return ($this->trackMapper->maxOrder($channel->getId(), $column) ?? 0) + self::SORT_STEP;
+	}
+
+	/**
 	 * Apply a new playlist order.
 	 *
 	 * The submitted list must be a permutation of the channel's current tracks. That is
@@ -269,9 +297,20 @@ class TrackService {
 		$this->timelineService->withPreservedPosition($channel, function () use ($submitted, $channel): void {
 			$this->db->beginTransaction();
 			try {
+				// The running order follows the drag unless the channel is shuffled, in which
+				// case the shuffle owns it and `sort_order` is only being kept up to date for
+				// whenever shuffle is switched off again. Without this, dragging a row on a
+				// channel that takes votes wrote a column nothing was playing from — the row
+				// moved, the sound did not, and it moved back on the next refresh.
+				$columns = $channel->getShuffle()
+					? [TrackMapper::ORDER_SORT]
+					: [TrackMapper::ORDER_SORT, TrackMapper::ORDER_VOTE];
+
 				$order = self::SORT_STEP;
 				foreach ($submitted as $trackId) {
-					$this->trackMapper->updateSortOrder($trackId, $channel->getId(), $order);
+					foreach ($columns as $column) {
+						$this->trackMapper->updateOrder($trackId, $channel->getId(), $column, $order);
+					}
 					$order += self::SORT_STEP;
 				}
 				$this->db->commit();

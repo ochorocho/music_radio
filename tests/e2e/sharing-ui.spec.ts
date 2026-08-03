@@ -710,10 +710,17 @@ test('the sharing panel offers the YouTube switch only where the server can impo
 		// because the row has not finished rendering.
 		await expect(row.getByTestId('perm-add-tracks')).toBeVisible()
 
-		const available = await page.getByTestId('add-youtube').count() > 0
-		await expect(row.getByTestId('share-allow-import')).toHaveCount(available ? 1 : 0)
+		// Read from the capabilities the panel itself reads, not from whether the channel's
+		// YouTube button is showing. Those are two different questions now — the button
+		// asks whether an import could start this second, the switch whether this server
+		// does imports at all — and they part company the moment a remote worker stops
+		// answering. See "a remote worker that is not answering" below.
+		const capabilities = (await api(page, 'GET', `${API}/channels/${id}/imports`)).body.capabilities
+		const configured = capabilities.configured !== false
 
-		if (!available) {
+		await expect(row.getByTestId('share-allow-import')).toHaveCount(configured ? 1 : 0)
+
+		if (!configured) {
 			test.skip(true, 'importing is switched off on this server')
 		}
 
@@ -735,6 +742,59 @@ test('the sharing panel offers the YouTube switch only where the server can impo
 		await row.getByTestId('perm-add-tracks').locator('input').dispatchEvent('click')
 		await expect(row.getByTestId('share-allow-import')).toHaveCount(0, { timeout: 20_000 })
 	} finally {
+		await api(page, 'DELETE', `${API}/channels/${id}`)
+	}
+})
+
+/**
+ * The switch is a permission, not a prediction.
+ *
+ * In remote mode the fetching is done by a machine somewhere else, which is switched off,
+ * rebooting, or simply between polls a good deal of the time. That used to take the
+ * per-share YouTube switch away with it: `available` answered both "can an import start
+ * now" and "does this server do imports", and the sharing panel read the wrong one. An
+ * owner could then neither see nor change a permission that was still in force, and could
+ * not prepare shares before starting a worker for the first time.
+ *
+ * The button that *starts* an import still goes away, because that one would be refused.
+ */
+test('a remote worker that is not answering hides the YouTube button but not the share switch', async ({ page }) => {
+	const title = uniqueTitle('Offline Worker Switch')
+	const created = await api(page, 'POST', `${API}/channels`, { title })
+	const id = created.body.id as number
+
+	const settings = async (values: Record<string, unknown>) =>
+		await api(page, 'POST', '/index.php/apps/music_radio/settings/admin', { values })
+
+	try {
+		await api(page, 'POST', `${API}/channels/${id}/shares`, {
+			shareType: SHARE_TYPE_LINK, permissions: 3,
+		})
+
+		// Remote mode with an allow-listed account and no worker that has ever checked in:
+		// configured by every decision an administrator makes, and unable to take a job.
+		await settings({ import_mode: 'remote', remote_worker_users: 'admin' })
+
+		const capabilities = (await api(page, 'GET', `${API}/channels/${id}/imports`)).body.capabilities
+		expect(capabilities.available, 'no worker, so no import could start').toBe(false)
+		expect(capabilities.configured, 'but the server is set up to import').toBe(true)
+
+		await openSharing(page, title)
+		await expect(page.getByTestId('link-share-row')).toBeVisible({ timeout: 20_000 })
+		await page.getByTestId('link-expand').click()
+
+		const row = page.getByTestId('link-share-row')
+		// Asserted after a switch that is always there, so this cannot pass merely because
+		// the row has not finished rendering.
+		await expect(row.getByTestId('perm-add-tracks')).toBeVisible()
+		await expect(row.getByTestId('share-allow-import')).toHaveCount(1)
+
+		// …while the thing that would actually be refused is not offered.
+		await expect(page.getByTestId('add-youtube')).toHaveCount(0)
+	} finally {
+		// Back to how the rest of the suite expects this instance to be. The harness runs
+		// a local import worker and every other import spec assumes local mode.
+		await settings({ import_mode: 'local', remote_worker_users: '' })
 		await api(page, 'DELETE', `${API}/channels/${id}`)
 	}
 })

@@ -175,11 +175,24 @@ export default {
 
 	computed: {
 		/**
-		 * Whether this server can import at all — the administrator's switch plus a working
-		 * yt-dlp. Distinct from the channel's own preference, which is what the switch sets.
+		 * Whether this server does YouTube imports at all — the administrator's switch plus
+		 * the setup behind it. Distinct from the channel's own preference, which is what the
+		 * switch sets, and deliberately *not* the same question as whether an import could
+		 * start this second.
+		 *
+		 * `configured` rather than `available`, because what this decides is whether to show
+		 * a stored permission. A remote worker that is switched off, rebooting, or simply
+		 * between polls makes `available` false — and gating on that took the switch away
+		 * from owners while it was still in force, so it could be neither seen nor changed,
+		 * and shares could not be set up before a worker was started for the first time.
+		 * Falls back to `available` for a server too old to send `configured`.
 		 */
 		importAvailable() {
-			return this.importCapabilities.available !== false
+			const capabilities = this.importCapabilities
+
+			return capabilities.configured !== undefined
+				? capabilities.configured !== false
+				: capabilities.available !== false
 		},
 
 		/** Everything except public links, which the picker must not offer again. */

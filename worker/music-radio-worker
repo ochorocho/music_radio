@@ -664,6 +664,69 @@ def managed_ytdlp_paths() -> list[str]:
     return [Layout(root=True).yt_dlp, Layout(root=False).yt_dlp]
 
 
+#: What a systemd service gets as PATH when the unit does not set one. Written down rather
+#: than read from the environment because that is the entire point: the service does not
+#: inherit the PATH of whoever ran `install`.
+SERVICE_PATH = ("/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin", "/bin")
+
+#: What ProtectHome= empties.
+HOME_DIRECTORIES = ("/home", "/root", "/run/user")
+
+
+def unreachable_by_service(path: str, layout: Layout) -> str:
+    """
+    Why the worker service could not run this yt-dlp — or "" if it could.
+
+    `install` runs as whoever invoked it: usually root, with a login shell's PATH and a home
+    directory. The service runs as a different account, with systemd's own PATH, and with
+    ProtectHome hiding every home on the machine. So "can *I* run it?" is not the question
+    install has to answer, and answering that one instead is how a machine ends up
+    crash-looping on `yt-dlp was not found` while `music-radio-worker check`, run by hand,
+    reports the tool installed and working. That pair of symptoms is contradictory enough to
+    send somebody looking in entirely the wrong place.
+
+    Three ways a perfectly good copy vanishes between the two:
+
+     - **It is in a home directory.** ProtectHome empties /home, /root and /run/user. A pip
+       or `curl` install into ~/.local/bin is the usual way to arrive here. Only under the
+       root layout: a user unit relaxes ProtectHome to read-only precisely because its own
+       files live there.
+     - **It is not on systemd's PATH.** The worker resolves a bare `yt-dlp` against PATH,
+       and a service's default is nothing like a login shell's — /snap/bin and /opt/… are
+       the two that catch people out.
+     - **The service account cannot execute it.** Root can read anything, so nothing else
+       here would notice.
+
+    The managed copy is exempt from the PATH rule: the worker looks for it by absolute path,
+    which is why it is installed somewhere no PATH has to mention.
+    """
+    resolved = os.path.realpath(path)
+
+    if layout.root and any(resolved.startswith(home + os.sep) for home in HOME_DIRECTORIES):
+        return (f"{resolved} is inside a home directory, which the service cannot see "
+                f"(ProtectHome=)")
+
+    managed = [os.path.realpath(candidate) for candidate in managed_ytdlp_paths()]
+    if resolved not in managed and os.path.dirname(resolved) not in SERVICE_PATH:
+        return (f"{resolved} is not on the PATH a systemd service gets "
+                f"({':'.join(SERVICE_PATH)})")
+
+    if layout.service_user:
+        try:
+            import pwd
+
+            account = pwd.getpwnam(layout.service_user)
+        except (KeyError, ImportError):
+            return ""
+
+        # 5 is read and execute: running a program needs both, and every directory above it
+        # has to be traversable too.
+        if not readable_by(resolved, account.pw_uid, account.pw_gid, need=5):
+            return f"{layout.service_user} is not allowed to run {resolved}"
+
+    return ""
+
+
 class Packages:
     """
     What to tell somebody to install, in the words their system uses.
@@ -993,7 +1056,20 @@ TimeoutStopSec=60
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
-ProtectHome=true
+
+# The one place the worker may write outside its runtime and cache directories: where its
+# yt-dlp lives. A worker that starts without one fetches it rather than restarting every
+# ten seconds waiting for a person, and ProtectSystem=strict would otherwise make that
+# impossible. Leading `-` so a unit whose directory has not been created yet still starts,
+# and says what is wrong instead of failing to mount.
+ReadWritePaths=-@STATE_DIR@
+
+# `true` under root, which empties /home, /root and /run/user for the service: the account
+# it runs as has no home and nothing it needs is in anybody else's. A user install is the
+# opposite case — its yt-dlp, its config and its password all live under the home of the
+# person who owns the unit — so there it is relaxed to read-only. It cannot be dropped in
+# either case: this downloads from the internet and runs a parser over whatever arrives.
+ProtectHome=@PROTECT_HOME@
 PrivateDevices=true
 ProtectKernelTunables=true
 ProtectKernelModules=true
@@ -1837,11 +1913,23 @@ def install(args) -> int:
     packages.advise(need_ffmpeg=tools.ffmpeg_dir is None, need_js=tools.js_runtime is None)
 
     # --- yt-dlp --------------------------------------------------------------
-    if tools.yt_dlp and not args.force:
+    #
+    # Judged by whether the *service* could run it, not by whether this process can — see
+    # unreachable_by_service(). A copy install approves and the service cannot see is worse
+    # than no copy at all: install reports success, the unit crash-loops on "yt-dlp was not
+    # found", and every check run by hand afterwards agrees with install.
+    out_of_reach = unreachable_by_service(tools.yt_dlp, layout) if tools.yt_dlp else ""
+
+    if tools.yt_dlp and not args.force and not out_of_reach:
         log(f"yt-dlp:     {tools.yt_dlp} ({tools.version()}) — already installed")
     elif args.dry_run:
+        if out_of_reach:
+            log(f"yt-dlp:     {out_of_reach}")
         log(f"  would install yt-dlp ({YtDlp.asset_here()}) at {layout.yt_dlp}")
     else:
+        if out_of_reach:
+            log(f"yt-dlp:     {out_of_reach}")
+            log("            installing a copy the service can reach instead")
         log(f"→ downloading yt-dlp ({YtDlp.asset_here()})")
         installed = YtDlp.install(layout.yt_dlp)
         if installed is None:
@@ -1852,6 +1940,8 @@ def install(args) -> int:
     # --- the account ---------------------------------------------------------
     if layout.root:
         create_service_account(layout, args.dry_run)
+
+    prepare_state_dir(layout, args.dry_run)
 
     # --- credentials ---------------------------------------------------------
     server, user, password = collect_credentials(args, layout)
@@ -1881,6 +1971,41 @@ def install(args) -> int:
     log("")
     api = Api(server, user, password)
     return check(api, discover_tools(args, required=False), build_cache(args), args)
+
+
+def prepare_state_dir(layout: Layout, dry_run: bool) -> None:
+    """
+    Where yt-dlp lives, owned by whoever the service runs as.
+
+    Created here rather than by the download, because the account that installs is not the
+    account that runs and the directory has to belong to the second one: a worker that
+    starts without yt-dlp fetches it itself, and it can only do that somewhere it may
+    write. Made unconditionally, including when a system yt-dlp meant nothing was
+    downloaded — the copy that turns out to be needed later is the one nobody planned for.
+    """
+    directory = os.path.dirname(layout.yt_dlp)
+
+    if dry_run:
+        log(f"state:      would create {directory}"
+            + (f", owned by {layout.service_user}" if layout.service_user else ""))
+        return
+
+    try:
+        os.makedirs(directory, mode=0o755, exist_ok=True)
+    except OSError as error:
+        log(f"  could not create {directory}: {error}")
+        return
+
+    if layout.service_user is None:
+        return
+
+    try:
+        # The parent too: owning `bin` is no use without permission to traverse into it.
+        for path in (layout.state_dir, directory):
+            shutil.chown(path, layout.service_user, layout.service_user)
+    except (LookupError, PermissionError, OSError) as error:
+        log(f"  could not give {directory} to {layout.service_user}: {error}. "
+            f"The worker will not be able to install yt-dlp for itself.")
 
 
 def create_service_account(layout: Layout, dry_run: bool) -> None:
@@ -2035,7 +2160,7 @@ def prepare_config_dir(layout: Layout) -> None:
         log(f"  could not set ownership on {layout.config_dir}: {error}")
 
 
-def readable_by(path: str, uid: int, gid: int) -> bool:
+def readable_by(path: str, uid: int, gid: int, need: int = 4) -> bool:
     """
     Whether this account could actually open that file.
 
@@ -2043,6 +2168,9 @@ def readable_by(path: str, uid: int, gid: int) -> bool:
     directory above it — the part that had to be learned the hard way. Groups beyond the
     account's primary one are consulted too, so an administrator who has arranged access
     some other way is not told they have not.
+
+    @param need what is wanted on the file itself: 4 to read it, 5 to run it. The
+                directories above always need 1, whichever it is.
     """
     def allowed(target: str, need: int) -> bool:
         try:
@@ -2059,8 +2187,8 @@ def readable_by(path: str, uid: int, gid: int) -> bool:
 
         return bool(info.st_mode & need)
 
-    # 4 is read, 1 is execute — which on a directory means "may be traversed".
-    if not allowed(path, 4):
+    # 1 is execute — which on a directory means "may be traversed".
+    if not allowed(path, need):
         return False
 
     directory = os.path.dirname(os.path.abspath(path))
@@ -2107,6 +2235,14 @@ def check_service_can_read(layout: Layout) -> None:
         if os.path.isfile(path) and not readable_by(path, account.pw_uid, account.pw_gid):
             log(f"warning: {layout.service_user} cannot read {path}, so the service will not "
                 f"start. Check the ownership of {os.path.dirname(path)}.")
+
+    # And the one tool the worker cannot do without. Checked here as well as before the
+    # download, because the download is not the only way a copy arrives — an existing one
+    # may have been left in place, or the state directory may have been locked down since.
+    if os.path.isfile(layout.yt_dlp) and not readable_by(layout.yt_dlp, account.pw_uid, account.pw_gid, need=5):
+        log(f"warning: {layout.service_user} cannot run {layout.yt_dlp}, so every import "
+            f"will fail with 'yt-dlp was not found'. Check the ownership and mode of "
+            f"{os.path.dirname(layout.yt_dlp)}.")
 
 
 def write_private(path: str, body: str, mode: int, owner: str | None, group_only: bool = False) -> None:
@@ -2167,6 +2303,8 @@ def unit_files(layout: Layout) -> list[tuple[str, str]]:
         ("music-radio-worker.service", WORKER_UNIT
          .replace("@ACCOUNT@", account)
          .replace("@ENV_FILE@", layout.env_file)
+         .replace("@PROTECT_HOME@", "true" if layout.root else "read-only")
+         .replace("@STATE_DIR@", layout.state_dir)
          .replace("@SCRIPT@", layout.script)
          .replace("@WANTEDBY@", layout.wanted_by)),
         ("music-radio-worker-update.service", UPDATE_UNIT.replace("@SCRIPT@", layout.script)),
@@ -2429,6 +2567,115 @@ def load_installed_config(args) -> None:
         break
 
 
+#: How long to wait before trying a failed download again. The worker is restarted every
+#: ten seconds by systemd, and a machine that cannot reach GitHub would otherwise ask it
+#: for three megabytes six times a minute for as long as nobody was looking.
+AUTO_INSTALL_RETRY_SECONDS = 300
+
+
+def auto_install_target() -> str | None:
+    """
+    Which managed path this process could actually install yt-dlp to, or None.
+
+    Chosen by what is writable, never by who is running — the mistake this function exists
+    to avoid making. The worker runs as the service account, which is not root and has no
+    home, so picking the layout from the effective uid sends it to
+    `/home/music-radio/.local/share/…`: a directory it cannot create, inside a home
+    directory the unit hides from it anyway, while the copy root prepared for it sits ready
+    in /var/lib. Same trap as managed_ytdlp_paths() was written for.
+
+    Root's location is tried first for that reason: on a machine with a service account it
+    is the one that has been prepared, and it is outside every home.
+    """
+    for candidate in managed_ytdlp_paths():
+        directory = os.path.dirname(candidate)
+        if os.path.isdir(directory) and os.access(directory, os.W_OK):
+            return candidate
+
+    # Nothing prepared yet — somebody running the worker by hand, before any install. Make
+    # whichever of them this account is allowed to make.
+    for candidate in managed_ytdlp_paths():
+        try:
+            os.makedirs(os.path.dirname(candidate), mode=0o755, exist_ok=True)
+        except OSError:
+            continue
+
+        return candidate
+
+    return None
+
+
+def ensure_ytdlp(args) -> None:
+    """
+    Fetch yt-dlp if the worker has started without it.
+
+    The one tool that cannot be done without, the one nobody's package manager has a current
+    version of, and — before this — the one whose absence turned a worker into a service
+    that restarted every ten seconds for ever, logging a line telling somebody to go and run
+    a command. Nothing about that needed a person: the script knows which asset it wants,
+    can verify it, and has somewhere to put it.
+
+    Deliberately *not* an update. A yt-dlp that is present is left exactly as it is, however
+    old, because replacing a working tool under a running service is a different decision
+    from supplying a missing one — that is what the quarter-hourly `update` timer is for.
+
+    Three things make this safe to do unattended:
+
+     - **Writability is checked before anything is downloaded.** A service that cannot write
+       where the binary goes gets one clear line naming the directory, not three megabytes
+       into a closed door.
+     - **Failures back off.** See AUTO_INSTALL_RETRY_SECONDS.
+     - **`--no-auto-install` turns it off**, for a machine where downloading a binary at
+       start-up is somebody else's decision to make.
+
+    Everything else is YtDlp.install's: published checksum, run it before trusting it,
+    staged under another name and moved into place.
+    """
+    if discover_tools(args, required=False).yt_dlp:
+        return
+
+    if not args.auto_install:
+        die("yt-dlp was not found, and --no-auto-install was given. Install it with "
+            "`music-radio-worker install`, or give --yt-dlp /path/to/yt-dlp.")
+
+    target = auto_install_target()
+    if target is None:
+        die("yt-dlp is not installed, and there is nowhere this account may put it "
+            f"({', '.join(os.path.dirname(path) for path in managed_ytdlp_paths())}). "
+            f"Run `music-radio-worker install` as root, which prepares one.")
+
+    stamp = os.path.join(os.path.dirname(target), ".yt-dlp-attempt")
+    try:
+        waited = time.time() - os.path.getmtime(stamp)
+    except OSError:
+        waited = AUTO_INSTALL_RETRY_SECONDS
+
+    if waited < AUTO_INSTALL_RETRY_SECONDS:
+        die(f"yt-dlp is not installed, and fetching it failed "
+            f"{int(waited)}s ago — waiting until {AUTO_INSTALL_RETRY_SECONDS}s have passed "
+            f"before trying again.")
+
+    log("yt-dlp is not installed; fetching it")
+    installed = YtDlp.install(target)
+
+    if installed is None:
+        try:
+            with open(stamp, "w", encoding="utf-8") as file:
+                file.write(str(int(time.time())))
+        except OSError:
+            pass
+        die("yt-dlp could not be installed. The reason is above; `music-radio-worker "
+            "install` does the same thing with more to say about it.")
+
+    version, asset = installed
+    log(f"installed yt-dlp {version} ({asset}) at {target}")
+
+    try:
+        os.unlink(stamp)
+    except OSError:
+        pass
+
+
 def existing_managed_ytdlp() -> str | None:
     """The managed copy that is actually here, whichever layout installed it."""
     for path in managed_ytdlp_paths():
@@ -2507,6 +2754,9 @@ def parse_args(argv: list[str]):
     parser.add_argument("--check", action="store_true",
                         help="the same as the check command, kept for older scripts")
     parser.add_argument("--verbose", action="store_true", help="say what is happening")
+    parser.add_argument("--no-auto-install", dest="auto_install", action="store_false",
+                        default=os.environ.get("MUSIC_RADIO_AUTO_INSTALL", "1") != "0",
+                        help="do not fetch yt-dlp at start-up when it is missing; fail instead")
 
     setup = parser.add_argument_group("install and update")
     setup.add_argument("--dry-run", action="store_true",
@@ -2561,6 +2811,14 @@ def main(argv: list[str]) -> int:
         die("no account given. Use --user, or set MUSIC_RADIO_USER.")
 
     api = Api(args.server, args.user, read_password(args))
+
+    # Before the tools are demanded, not after: a worker whose yt-dlp is missing supplies
+    # it rather than exiting for somebody to come and do it by hand. `check` is left to
+    # report the absence — its whole job is to say what is wrong, and installing something
+    # while answering that question would be a strange thing for it to do.
+    if command == "run":
+        ensure_ytdlp(args)
+
     tools = discover_tools(args)
     cache = build_cache(args)
 

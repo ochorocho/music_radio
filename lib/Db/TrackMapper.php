@@ -61,21 +61,28 @@ class TrackMapper extends QBMapper {
 		return $this->findEntities($qb);
 	}
 
+	/** The ordering columns, and the only values any caller here may name. */
+	public const ORDER_SORT = 'sort_order';
+	public const ORDER_SHUFFLE = 'shuffle_order';
+	public const ORDER_VOTE = 'vote_order';
+
 	/**
 	 * The channel's tracks in broadcast order.
 	 *
-	 * Three orderings, each in its own column so that switching between them is lossless:
-	 * `sort_order` is the order the playlist was arranged in and is never overwritten by
-	 * the other two, `shuffle_order` holds a materialised shuffle, and `vote_order` holds
-	 * the running order votes have asked for. Turning shuffle or voting off therefore
-	 * restores the author's order exactly.
+	 * Three ordering columns, but not three alternatives. `sort_order` is the arrangement
+	 * somebody dragged into place and is written by nothing else; `shuffle_order` holds a
+	 * materialised random arrangement. Whichever of those two is in force is the channel's
+	 * **base order** — see {@see findAllForChannelInBaseOrder}. `vote_order` is the
+	 * **running order**: that base order with the tracks people have voted for pulled up
+	 * behind whatever is playing.
 	 *
-	 * Shuffle wins over voting when both are on: shuffling is a deliberate instruction to
-	 * randomise, and a vote asking for a particular track next is not a coherent thing to
-	 * honour at the same time.
+	 * So voting is checked first, and it composes with shuffle rather than replacing it: a
+	 * shuffled channel that takes votes plays its shuffle, with requests jumping the queue.
+	 * These used to be alternatives, with shuffle winning, which meant every vote cast on a
+	 * shuffled channel was silently discarded.
 	 *
 	 * `id` breaks ties so the order is total and stable — two rows can share a sort_order
-	 * after a concurrent append, and every vote_order is 0 until the first recompute.
+	 * after a concurrent append.
 	 *
 	 * Taking the Channel rather than its flags on purpose: this choice is made in exactly
 	 * one place, so no caller can pick a different ordering from the one the timeline is
@@ -85,16 +92,42 @@ class TrackMapper extends QBMapper {
 	 * @throws Exception
 	 */
 	public function findAllForChannelInPlayOrder(Channel $channel): array {
-		$column = match (true) {
-			$channel->getShuffle() => 'shuffle_order',
-			$channel->getAllowVoting() => 'vote_order',
-			default => 'sort_order',
-		};
+		return $this->findAllOrderedBy(
+			$channel->getId(),
+			$channel->getAllowVoting() ? self::ORDER_VOTE : self::baseOrderColumn($channel),
+		);
+	}
 
+	/**
+	 * The channel's tracks in its base order — what it would play if nobody had voted.
+	 *
+	 * The running order is recomputed from this rather than from itself, which is what
+	 * makes "no votes, so the ordinary order" true by construction instead of by
+	 * maintenance. Reading the previous running order back and adjusting it would leave
+	 * the author's arrangement irrecoverable after a few votes, and left `vote_order`
+	 * needing to be kept in step by every path that adds, removes or reorders a track.
+	 *
+	 * @return Track[]
+	 * @throws Exception
+	 */
+	public function findAllForChannelInBaseOrder(Channel $channel): array {
+		return $this->findAllOrderedBy($channel->getId(), self::baseOrderColumn($channel));
+	}
+
+	private static function baseOrderColumn(Channel $channel): string {
+		return $channel->getShuffle() ? self::ORDER_SHUFFLE : self::ORDER_SORT;
+	}
+
+	/**
+	 * @param self::ORDER_* $column
+	 * @return Track[]
+	 * @throws Exception
+	 */
+	private function findAllOrderedBy(int $channelId, string $column): array {
 		$qb = $this->db->getQueryBuilder();
 		$qb->select('*')
 			->from($this->getTableName())
-			->where($qb->expr()->eq('channel_id', $qb->createNamedParameter($channel->getId(), IQueryBuilder::PARAM_INT)))
+			->where($qb->expr()->eq('channel_id', $qb->createNamedParameter($channelId, IQueryBuilder::PARAM_INT)))
 			->orderBy($column, 'ASC')
 			->addOrderBy('id', 'ASC');
 
@@ -102,14 +135,22 @@ class TrackMapper extends QBMapper {
 	}
 
 	/**
-	 * Highest sort_order in the channel, or null when it has no tracks. Used to append
-	 * without renumbering.
+	 * Highest value of one ordering column in the channel, or null when it has no tracks.
+	 * Used to append without renumbering.
 	 *
+	 * Each column has to be asked separately, and that is the point of this taking one.
+	 * Appending used to read the highest `sort_order` and write it into `shuffle_order`
+	 * as well, on the assumption that the two stay in step — they do not, because a
+	 * shuffle renumbers one of them and a drag renumbers the other. Once they had drifted,
+	 * a newly added track could be handed a `shuffle_order` already in use, and it landed
+	 * beside an unrelated track in the middle of the running order instead of at the end.
+	 *
+	 * @param self::ORDER_* $column
 	 * @throws Exception
 	 */
-	public function maxSortOrder(int $channelId): ?int {
+	public function maxOrder(int $channelId, string $column): ?int {
 		$qb = $this->db->getQueryBuilder();
-		$qb->select($qb->func()->max('sort_order'))
+		$qb->select($qb->func()->max($column))
 			->from($this->getTableName())
 			->where($qb->expr()->eq('channel_id', $qb->createNamedParameter($channelId, IQueryBuilder::PARAM_INT)));
 
@@ -179,15 +220,16 @@ class TrackMapper extends QBMapper {
 	}
 
 	/**
-	 * Assign a new sort_order to one row without loading it. Used by the transactional
-	 * renumber in TrackService::reorder().
+	 * Assign a new position in one ordering column without loading the row. Used by the
+	 * transactional renumbers in TrackService::reorder() and VoteService.
 	 *
+	 * @param self::ORDER_* $column
 	 * @throws Exception
 	 */
-	public function updateSortOrder(int $trackId, int $channelId, int $sortOrder): void {
+	public function updateOrder(int $trackId, int $channelId, string $column, int $position): void {
 		$qb = $this->db->getQueryBuilder();
 		$qb->update($this->getTableName())
-			->set('sort_order', $qb->createNamedParameter($sortOrder, IQueryBuilder::PARAM_INT))
+			->set($column, $qb->createNamedParameter($position, IQueryBuilder::PARAM_INT))
 			->where($qb->expr()->eq('id', $qb->createNamedParameter($trackId, IQueryBuilder::PARAM_INT)))
 			->andWhere($qb->expr()->eq('channel_id', $qb->createNamedParameter($channelId, IQueryBuilder::PARAM_INT)));
 		$qb->executeStatement();

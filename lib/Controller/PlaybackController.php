@@ -15,7 +15,6 @@ use OCA\MusicRadio\Service\Clock;
 use OCA\MusicRadio\Service\ListenerPresence;
 use OCA\MusicRadio\Service\PermissionService;
 use OCA\MusicRadio\Service\PlaybackService;
-use OCA\MusicRadio\Service\VoteService;
 use OCP\AppFramework\Controller;
 use OCP\AppFramework\Http;
 use OCP\AppFramework\Http\Attribute\AnonRateLimit;
@@ -34,7 +33,6 @@ class PlaybackController extends Controller {
 		private PlaybackService $playbackService,
 		private PermissionService $permissionService,
 		private ListenerPresence $listenerPresence,
-		private VoteService $voteService,
 		private Clock $clock,
 		private ?string $userId,
 	) {
@@ -81,7 +79,8 @@ class PlaybackController extends Controller {
 		// read for good reasons, and this is the only place that knows who is asking.
 		$listeners = $this->listenerPresence->record($id, $clientId, $listening);
 
-		// Spend the votes of whatever has since played, and honour any that arrived.
+		// Spend the votes of whatever has since played, honour any that arrived, and draw a
+		// fresh shuffle if the channel has come round to the top.
 		//
 		// This has to be driven by something, and there is no track-boundary event to hang
 		// it on — a channel is one continuous programme. It used to run only when somebody
@@ -89,12 +88,11 @@ class PlaybackController extends Controller {
 		// votes for ever, and the next recompute treated them as current. The poll is the
 		// one thing that happens reliably while a channel is playing.
 		//
-		// Cheap: it is debounced to once every VoteService::RECOMPUTE_EVERY_SECONDS per
-		// channel, and the check is a comparison against a column already loaded, so the
-		// common case costs nothing regardless of how many people are listening.
-		if ($channel->getAllowVoting()) {
-			$this->voteService->recomputeIfDue($channel);
-		}
+		// Cheap: the vote half is debounced to once every VoteService::RECOMPUTE_EVERY_SECONDS
+		// per channel and the shuffle half only fires on a wrap, and both checks are
+		// comparisons against columns already loaded — so the common case costs nothing
+		// regardless of how many people are listening.
+		$channel = $this->playbackService->maintainRunningOrder($channel);
 
 		return new DataResponse($this->playbackService->buildState(
 			$channel,

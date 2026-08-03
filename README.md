@@ -93,9 +93,30 @@ and never moves the track playing or the one listeners' browsers have already lo
 voted track arrives at the first free position after those, which means it may take a
 track or two to come round on short songs. That is the price of nobody hearing a stutter.
 
-Voting is ignored while a channel is shuffling — shuffle is a deliberate instruction to
-randomise, and the two are not coherent at once. The author's playlist order is never
+Voting and shuffling compose. The shuffle decides the order of everything nobody has asked
+for — which is all of it, until somebody does — and a request jumps that queue like any
+other. Among the voted, most votes first; on a tie, whoever asked first, so that a tie
+falls back to the queue rather than to playlist position. The arrangement itself is never
 overwritten by either, so turning both off restores it exactly.
+
+### Shuffle
+
+Drawn once and written down, not applied per listener: everyone hears one broadcast, so
+the randomness has to be a fact about the channel rather than about a browser.
+
+A looping channel draws again each time it comes round, so the second time through is not
+a repeat of the first. Whatever is playing at that moment keeps playing and heads the new
+cycle, so the redraw is inaudible.
+
+A fair draw is not what anybody means by shuffle — across twenty tracks it will happily
+deal four by the same band in a row — so the drawn order is relaxed until neighbours
+differ, moving as little as possible. A track whose artist tag did not read clashes with
+nothing; an unread tag is missing information, not a claim that two files are by the same
+person. Where no arrangement can avoid a repeat — six tracks by one band out of nine — it
+places what it can rather than pretending.
+
+A track added while shuffle is on goes to the end of the current cycle, and is mixed in
+properly at the next draw.
 
 ## YouTube import
 

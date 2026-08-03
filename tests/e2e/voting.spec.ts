@@ -98,6 +98,22 @@ async function clearDebounce(db: any, channelId: number) {
 	await db.query('update oc_music_radio_channels set vote_ordered_at = 0 where id = ?', [channelId])
 }
 
+/**
+ * Park the playhead at the top of the programme, as of now.
+ *
+ * Both fields, not just the offset: on a playing channel the position is
+ * `epochOffsetMs + (now - startedAtMs)`, so setting the offset alone leaves the clock
+ * still running from the old anchor. Which track is playing decides which two are pinned,
+ * so a test that cares where a voted track lands has to say where the playhead is rather
+ * than hope the fixtures are still short enough that it has not moved.
+ */
+async function startOfProgramme(db: any, channelId: number) {
+	await db.query(
+		'update oc_music_radio_channels set epoch_offset_ms = 0, started_at_ms = ? where id = ?',
+		[Date.now(), channelId],
+	)
+}
+
 async function anonymous(browser: Browser) {
 	const context = await browser.newContext({ ignoreHTTPSErrors: true, storageState: undefined })
 	return { context, page: await context.newPage() }
@@ -413,6 +429,186 @@ test('votes are spent when the track plays, with nobody voting', async ({ page, 
 			.poll(async () => (await db.query('select id from oc_music_radio_votes where track_id = ?', [voted])).length,
 				{ timeout: 30_000, intervals: [1000] })
 			.toBe(0)
+	} finally {
+		await api(page, 'DELETE', `${API}/channels/${channelId}`)
+	}
+})
+
+/**
+ * Shuffle used to switch voting off in all but name.
+ *
+ * The recompute refused to run on a shuffled channel, and the play order came from the
+ * shuffle column regardless — so a vote cast there was accepted, counted, shown on screen
+ * and then silently discarded. They do not conflict: the shuffle decides the order of
+ * everything nobody has asked for, which is all of it until somebody does.
+ */
+test('votes are honoured while the channel is shuffling', async ({ page, db }) => {
+	const title = `Voting Shuffled ${Math.random().toString(36).slice(2, 8)}`
+	const channelId = await setUpChannel(page, db, title)
+
+	try {
+		await api(page, 'PUT', `${API}/channels/${channelId}/playback-settings`, { shuffle: true })
+		await openChannel(page, title)
+		await startOfProgramme(db, channelId)
+
+		const before = await playOrder(db, channelId)
+		expect(before).toHaveLength(4)
+
+		const voted = before[3]
+		const result = await api(page, 'POST', `${API}/channels/${channelId}/tracks/${voted}/vote`)
+		expect(result.status).toBe(200)
+
+		const after = await playOrder(db, channelId)
+		// Current and next are pinned; the request takes the first free place.
+		expect(after.slice(0, 2)).toEqual(before.slice(0, 2))
+		expect(after[2]).toBe(voted)
+	} finally {
+		await api(page, 'DELETE', `${API}/channels/${channelId}`)
+	}
+})
+
+/**
+ * Equal votes are separated by which track was asked for first.
+ *
+ * The tie used to be settled by position in the playlist — precisely the thing a vote
+ * exists to override, so the lower of two tied tracks could never get ahead however early
+ * its supporters had voted.
+ */
+test('a tie goes to whichever track was voted for first', async ({ page, db }) => {
+	const title = `Voting Tie ${Math.random().toString(36).slice(2, 8)}`
+	const channelId = await setUpChannel(page, db, title)
+
+	try {
+		await openChannel(page, title)
+		const before = await playOrder(db, channelId)
+
+		// One vote each, so the counts tie and only the timestamps can separate them.
+		await api(page, 'POST', `${API}/channels/${channelId}/tracks/${before[2]}/vote`)
+		await api(page, 'POST', `${API}/channels/${channelId}/tracks/${before[3]}/vote`)
+
+		// The later of the two rows in the playlist asked first. Backdated rather than
+		// waited out, and by a minute, so a same-second tie cannot decide it.
+		await db.query(
+			'update oc_music_radio_votes set created_at = created_at - 60 where track_id = ?', [before[3]],
+		)
+
+		await startOfProgramme(db, channelId)
+		await clearDebounce(db, channelId)
+		await api(page, 'GET', `${API}/channels/${channelId}/state`)
+
+		const after = await playOrder(db, channelId)
+		expect(after.slice(0, 2)).toEqual(before.slice(0, 2))
+		expect(after[2]).toBe(before[3])
+		expect(after[3]).toBe(before[2])
+	} finally {
+		await api(page, 'DELETE', `${API}/channels/${channelId}`)
+	}
+})
+
+/**
+ * The churn the rewrite exists to stop.
+ *
+ * The running order used to be derived from itself, with the playing track rotated to the
+ * front — so every track boundary produced "a different order", rewrote every row, bumped
+ * `playlistVersion` and sent every listener back for the track list. On a channel nobody
+ * had voted on. Deriving from the arrangement instead makes an unvoted recompute a
+ * comparison that finds nothing, wherever the playhead happens to be.
+ */
+test('a channel nobody is voting on never reorders itself as it plays', async ({ page, db }) => {
+	const title = `Voting Quiet ${Math.random().toString(36).slice(2, 8)}`
+	const channelId = await setUpChannel(page, db, title)
+
+	try {
+		await openChannel(page, title)
+		const before = await playOrder(db, channelId)
+
+		const versionOf = async () => {
+			const rows = await db.query<Array<{ playlist_version: number }>>(
+				'select playlist_version from oc_music_radio_channels where id = ?', [channelId],
+			)
+			return Number(rows[0].playlist_version)
+		}
+
+		const total = (await db.query<Array<{ total: number }>>(
+			'select coalesce(sum(duration_ms), 0) as total from oc_music_radio_tracks where channel_id = ?',
+			[channelId],
+		))[0].total
+
+		await startOfProgramme(db, channelId)
+		await clearDebounce(db, channelId)
+		await api(page, 'GET', `${API}/channels/${channelId}/state`)
+		const settled = await versionOf()
+
+		// Walk the playhead across every track boundary in the programme, recomputing at
+		// each one. Not a single one of them is allowed to rewrite anything.
+		for (let at = 0; at < Number(total); at += Math.max(1, Math.floor(Number(total) / 8))) {
+			await db.query(
+				'update oc_music_radio_channels set epoch_offset_ms = ?, started_at_ms = ?, vote_ordered_at = 0 where id = ?',
+				[at, Date.now(), channelId],
+			)
+			await api(page, 'GET', `${API}/channels/${channelId}/state`)
+		}
+
+		expect(await versionOf()).toBe(settled)
+		expect(await playOrder(db, channelId)).toEqual(before)
+	} finally {
+		await api(page, 'DELETE', `${API}/channels/${channelId}`)
+	}
+})
+
+/**
+ * Turning voting on used to drop a playlist into the order its rows had been inserted in.
+ *
+ * `vote_order` defaulted to zero and nothing wrote it until somebody voted, so every row
+ * held the same number and the ordering fell through to the `id` tiebreak — which is the
+ * arrangement only until the first time anybody drags a row.
+ */
+test('switching voting on leaves the arrangement alone', async ({ page, db }) => {
+	const title = `Voting Arrangement ${Math.random().toString(36).slice(2, 8)}`
+	const channelId = await setUpChannel(page, db, title)
+
+	try {
+		await setVoting(page, channelId, false)
+
+		// Rearranged so that the author's order and the row ids disagree, which is the only
+		// state in which the two can be told apart.
+		const ids = await playOrder(db, channelId)
+		const arranged = [...ids].reverse()
+		await api(page, 'PUT', `${API}/channels/${channelId}/tracks/order`, { trackIds: arranged })
+
+		await setVoting(page, channelId, true)
+		await startOfProgramme(db, channelId)
+		await clearDebounce(db, channelId)
+		await api(page, 'GET', `${API}/channels/${channelId}/state`)
+
+		expect(await playOrder(db, channelId)).toEqual(arranged)
+	} finally {
+		await api(page, 'DELETE', `${API}/channels/${channelId}`)
+	}
+})
+
+/**
+ * A newly added track used to be given no `vote_order` at all, so it sat at zero and went
+ * straight to the front of the queue — ahead of tracks people had actually voted for.
+ */
+test('a track added to a voting channel joins the back of the queue', async ({ page, db }) => {
+	const title = `Voting Append ${Math.random().toString(36).slice(2, 8)}`
+	const channelId = await setUpChannel(page, db, title)
+
+	try {
+		const before = await playOrder(db, channelId)
+		const removed = before[1]
+		const [{ file_id: file }] = await db.query<Array<{ file_id: number }>>(
+			'select file_id from oc_music_radio_tracks where id = ?', [removed],
+		)
+		await api(page, 'DELETE', `${API}/channels/${channelId}/tracks/${removed}`)
+
+		await api(page, 'POST', `${API}/channels/${channelId}/tracks`, { fileIds: [Number(file)] })
+
+		const after = await playOrder(db, channelId)
+		const added = after.filter((id) => !before.includes(id))
+		expect(added).toHaveLength(1)
+		expect(after[after.length - 1]).toBe(added[0])
 	} finally {
 		await api(page, 'DELETE', `${API}/channels/${channelId}`)
 	}

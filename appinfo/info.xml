@@ -20,7 +20,7 @@ hears the same track at the same moment — the channel owner is the DJ, listene
 - **Share it your way.** Users, groups, teams, or a public link with an optional password and
   expiry date.
 	]]></description>
-	<version>0.13.0</version>
+	<version>0.15.0</version>
 	<licence>agpl</licence>
 	<author>Jochen Roth</author>
 	<namespace>MusicRadio</namespace>

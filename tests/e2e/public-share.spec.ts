@@ -182,22 +182,25 @@ test.describe('public links', () => {
 		await expect(anonPage.getByTestId('public-channel-title')).toBeVisible({ timeout: 20_000 })
 		await anonPage.getByTestId('tune-in').click()
 
+		// One element playing, and its source, read together in a single evaluate.
+		//
+		// These were two steps — poll until something is playing, then go back and read its
+		// src — and the gap between them is a real one. An audio element that stalls while
+		// the server is still preparing the broadcast pauses itself, so `find(a => !a.paused)`
+		// came back undefined and the src read as the empty string. That fails as "'' does
+		// not contain the token URL", which reads like the player pointing at the wrong
+		// endpoint rather than like a stall, and it only happened under a loaded worker.
 		await expect
 			.poll(async () => await anonPage.evaluate(() =>
-				Array.from(document.querySelectorAll('audio')).filter((a) => !a.paused && !a.ended).length,
+				Array.from(document.querySelectorAll('audio'))
+					.filter((a) => !a.paused && !a.ended)
+					.map((a) => a.src),
 			), { timeout: 30_000, intervals: [500] })
-			.toBe(1)
-
-		// Playing the channel's own audio, through the token endpoint.
-		//
-		// The programme rather than a single track: a listener is given a stretch of the
-		// broadcast that carries its own track changes, which is what lets a phone with the
-		// screen locked play past the end of a song. The per-track URL this used to name is
-		// still served, but nothing plays it any more.
-		const src = await anonPage.evaluate(() =>
-			Array.from(document.querySelectorAll('audio')).find((a) => !a.paused)?.src ?? '',
-		)
-		expect(src).toContain(`/public/${token}/programme`)
+			// The programme rather than a single track: a listener is given a stretch of the
+			// broadcast that carries its own track changes, which is what lets a phone with
+			// the screen locked play past the end of a song. The per-track URL this used to
+			// name is still served, but nothing plays it any more.
+			.toEqual([expect.stringContaining(`/public/${token}/programme`)])
 
 		// And it is moving, rather than sitting at zero.
 		await expect

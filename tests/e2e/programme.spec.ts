@@ -87,7 +87,45 @@ test.beforeEach(async ({ page, db }) => {
 	await api(page, 'POST', `${API}/channels/${channelId}/tracks`, {
 		fileIds: fileRows.map((row) => row.fileid),
 	})
+
+	await settled(page)
 })
+
+/**
+ * Wait until the channel is ready to be measured.
+ *
+ * Two things happen after a track is added, both in the background, and every assertion in
+ * this file is about the length of a lap — so both have to have finished, or what gets
+ * measured is a channel part way through becoming itself:
+ *
+ *  - **The duration probe.** A track with no known duration is not on the timeline at all,
+ *    so until it lands the programme is one track long rather than two.
+ *  - **The broadcast copies.** A segment stops at the first track it cannot prepare, by
+ *    design — stepping over one would put the audio ahead of the timeline by that track's
+ *    whole length. Copies are built at most two per request, so asking is also what makes
+ *    it ready.
+ *
+ * This used to be left to chance, and mostly won: the failure needs the second track to
+ * become playable *between* two fetches in the same test, which takes a worker busy enough
+ * to be slow but not so slow that the first fetch waits. It showed up as one lap measuring
+ * 48,483 bytes and the next 177,214 — 3.0s against 11.1s, which is one track against two.
+ */
+async function settled(page: Page) {
+	await expect
+		.poll(async () => (await api(page, 'GET', `${API}/channels/${channelId}/state`)).body.playableCount,
+			{ timeout: 30_000, intervals: [500] })
+		.toBe(2)
+
+	// Asking for the programme is what builds the copies, so this warms as well as waits.
+	await expect
+		.poll(async () => {
+			const total = (await api(page, 'GET', `${API}/channels/${channelId}/state`)).body.totalDurationMs as number
+			const lap = await fetchProgramme(page, `${API}/channels/${channelId}/programme?from=0`)
+
+			return lap.byteLength > (total - 1000) * BYTES_PER_MS
+		}, { timeout: 60_000, intervals: [1000] })
+		.toBe(true)
+}
 
 test.afterEach(async ({ page }) => {
 	await api(page, 'DELETE', `${API}/channels/${channelId}`)

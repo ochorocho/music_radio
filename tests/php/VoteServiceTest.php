@@ -56,11 +56,11 @@ class VoteServiceTest extends TestCase {
 		$clock->method('nowSeconds')->willReturn(self::NOW_S);
 
 		$this->channelMapper->method('update')->willReturnArgument(0);
-		$this->trackMapper->method('update')->willReturnCallback(function (Track $track): Track {
-			$this->written[] = [$track->getId(), $track->getVoteOrder()];
-
-			return $track;
-		});
+		$this->trackMapper->method('updateOrder')
+			->willReturnCallback(function (int $trackId, int $channelId, string $column, int $position): void {
+				self::assertSame(TrackMapper::ORDER_VOTE, $column, 'votes may only write the running order');
+				$this->written[] = [$trackId, $position];
+			});
 
 		$this->service = new VoteService(
 			$this->voteMapper,
@@ -102,12 +102,24 @@ class VoteServiceTest extends TestCase {
 	}
 
 	/**
+	 * A channel whose base order and running order agree, which is the state every channel
+	 * is in until somebody votes.
+	 *
 	 * @param Track[] $tracks
-	 * @param array<int, int> $counts
+	 * @param array<int, int> $counts track id => votes
+	 * @param array<int, int> $firstVotedAt track id => when its first vote was cast, for
+	 *                                      the tie-break; equal by default so ties fall
+	 *                                      through to the id
 	 */
-	private function playlist(array $tracks, array $counts = []): void {
+	private function playlist(array $tracks, array $counts = [], array $firstVotedAt = []): void {
 		$this->trackMapper->method('findAllForChannelInPlayOrder')->willReturn($tracks);
-		$this->voteMapper->method('countsForChannel')->willReturn($counts);
+		$this->trackMapper->method('findAllForChannelInBaseOrder')->willReturn($tracks);
+
+		$tally = [];
+		foreach ($counts as $trackId => $votes) {
+			$tally[$trackId] = ['votes' => $votes, 'firstAt' => $firstVotedAt[$trackId] ?? 0];
+		}
+		$this->voteMapper->method('tallyForChannel')->willReturn($tally);
 	}
 
 	/** @return list<int> the new order, as track ids */
@@ -284,13 +296,69 @@ class VoteServiceTest extends TestCase {
 	 * Equal votes must not shuffle amongst themselves. If they did, every recompute would
 	 * find "a different order" and re-anchor the broadcast indefinitely.
 	 */
-	public function testTracksWithEqualVotesKeepTheirRelativeOrder(): void {
+	public function testTracksWithEqualVotesDoNotChurn(): void {
 		$this->playlist(
 			[self::track(1, 60_000), self::track(2, 60_000), self::track(3, 60_000), self::track(4, 60_000)],
 			[2 => 3, 3 => 3, 4 => 3],
 		);
 
 		self::assertFalse($this->service->recomputeIfDue(self::channel(10_000)));
+	}
+
+	/**
+	 * Equal votes are separated by which track was asked for first.
+	 *
+	 * The tie used to be settled by position in the playlist, which is precisely the thing
+	 * a vote exists to override: two tracks on two votes each were ordered by whichever
+	 * happened to sit higher, so the second half of a tie could never get ahead however
+	 * early its supporters had voted.
+	 */
+	public function testATieGoesToWhicheverWasVotedForFirst(): void {
+		$this->playlist(
+			[self::track(1, 60_000), self::track(2, 60_000), self::track(3, 60_000), self::track(4, 60_000)],
+			[3 => 2, 4 => 2],
+			[3 => self::NOW_S - 30, 4 => self::NOW_S - 90],
+		);
+
+		self::assertTrue($this->service->recomputeIfDue(self::channel(10_000)));
+		self::assertSame([1, 4, 3, 2], $this->writtenOrder());
+	}
+
+	/**
+	 * A track people have voted for comes next even when it has already been round this
+	 * cycle. On a looping channel the alternative is that it waits for the whole rest of
+	 * the programme, which is not what anybody pressing the button meant.
+	 */
+	public function testATrackBehindThePlayheadIsStillPulledForward(): void {
+		$this->playlist(
+			[self::track(1, 60_000), self::track(2, 60_000), self::track(3, 60_000), self::track(4, 60_000)],
+			[1 => 3],
+		);
+
+		// 130s in, so track 3 is playing and tracks 1 and 2 are behind it.
+		self::assertTrue($this->service->recomputeIfDue(self::channel(130_000)));
+		self::assertSame([2, 3, 1, 4], $this->writtenOrder());
+	}
+
+	/**
+	 * The churn this whole rewrite exists to stop.
+	 *
+	 * The running order used to be derived from itself, with the playing track rotated to
+	 * index 0 — so every track boundary produced "a different order", rewrote every row,
+	 * bumped `playlist_version` and sent every listener back for the track list. On a
+	 * channel nobody had voted on. Deriving from the base order instead makes an unvoted
+	 * recompute a comparison that finds nothing, wherever the playhead happens to be.
+	 */
+	public function testAnUnvotedChannelIsQuietWhereverThePlayheadIs(): void {
+		$this->playlist([self::track(1, 60_000), self::track(2, 60_000), self::track(3, 60_000)]);
+
+		foreach ([0, 30_000, 70_000, 150_000, 610_000] as $elapsed) {
+			self::assertFalse(
+				$this->service->recomputeIfDue(self::channel($elapsed)),
+				"reordered itself {$elapsed}ms in with nobody voting",
+			);
+		}
+		self::assertSame([], $this->written);
 	}
 
 	/**
@@ -308,13 +376,20 @@ class VoteServiceTest extends TestCase {
 		self::assertSame([], $this->written);
 	}
 
-	public function testVotingIsIgnoredWhileTheChannelIsShuffling(): void {
+	/**
+	 * Shuffle used to switch voting off in all but name: the recompute refused to run, so a
+	 * vote on a shuffled channel was accepted, counted, shown on screen and then silently
+	 * discarded. They do not conflict — the shuffle decides the order of everything nobody
+	 * has asked for, which is all of it until somebody does.
+	 */
+	public function testVotesAreHonouredWhileTheChannelIsShuffling(): void {
 		$this->playlist(
-			[self::track(1, 60_000), self::track(2, 60_000)],
-			[2 => 9],
+			[self::track(1, 60_000), self::track(2, 60_000), self::track(3, 60_000)],
+			[3 => 9],
 		);
 
-		self::assertFalse($this->service->recomputeIfDue(self::channel(10_000, shuffle: true)));
+		self::assertTrue($this->service->recomputeIfDue(self::channel(10_000, shuffle: true)));
+		self::assertSame([1, 3, 2], $this->writtenOrder());
 	}
 
 	public function testNothingHappensOnAChannelWithVotingOff(): void {

@@ -51,6 +51,44 @@ class VoteMapper extends QBMapper {
 	}
 
 	/**
+	 * How many votes each track has, and when the first of them was cast.
+	 *
+	 * The timestamp is the tie-break for the running order: two tracks on three votes each
+	 * are separated by which of them was asked for first, so that a tie falls back to the
+	 * queue rather than to playlist position — which is the one thing a vote is there to
+	 * override. See Ordering::promoteVoted.
+	 *
+	 * `MIN` rather than the row's own `created_at` because a track has one position in the
+	 * queue however many people have voted for it, and it joined that queue when the first
+	 * of them pressed the button. Taking the latest instead would send a track backwards
+	 * every time it gained support.
+	 *
+	 * @return array<int, array{votes: int, firstAt: int}> by track id, omitting tracks with none
+	 * @throws Exception
+	 */
+	public function tallyForChannel(int $channelId): array {
+		$qb = $this->db->getQueryBuilder();
+		$qb->select('track_id')
+			->selectAlias($qb->func()->count('*'), 'votes')
+			->selectAlias($qb->func()->min('created_at'), 'first_at')
+			->from($this->getTableName())
+			->where($qb->expr()->eq('channel_id', $qb->createNamedParameter($channelId, IQueryBuilder::PARAM_INT)))
+			->groupBy('track_id');
+
+		$result = $qb->executeQuery();
+		$tally = [];
+		while ($row = $result->fetch()) {
+			$tally[(int)$row['track_id']] = [
+				'votes' => (int)$row['votes'],
+				'firstAt' => (int)$row['first_at'],
+			];
+		}
+		$result->closeCursor();
+
+		return $tally;
+	}
+
+	/**
 	 * Which of this channel's tracks this particular person has voted for.
 	 *
 	 * @return list<int> track ids
