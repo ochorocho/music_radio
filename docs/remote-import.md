@@ -360,7 +360,19 @@ Things worth knowing about it:
   mid-copy cannot leave a truncated MP3 for a later job to upload as somebody's track.
 - **A cache that cannot be written is not an error.** The worker says so once at start-up
   and carries on downloading everything — which is what a hardened systemd unit without a
-  `CacheDirectory=` will do.
+  `CacheDirectory=` will do. The warning names that cause when it applies:
+
+  ```
+  warning: no cache at /home/music-radio/.cache/music-radio-worker
+    ([Errno 13] Permission denied: '/home/music-radio'); every import will be downloaded
+    this service has no CacheDirectory=; re-run 'music-radio-worker install' to rewrite the unit
+  ```
+
+  `ProtectHome=true` seals off home directories and the service account has none anyway, so
+  a unit missing that line leaves the worker nowhere to keep anything. `update` replaces the
+  script but never the units, so a worker installed before the line existed keeps the old
+  unit until `install` is run again. Nothing else reports this: imports still succeed, just
+  at full download cost every time.
 
 ## Cookies
 

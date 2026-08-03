@@ -362,9 +362,17 @@ class Cache:
             os.makedirs(self.directory, mode=0o700, exist_ok=True)
         except OSError as error:
             # Not fatal, and deliberately so: a worker that cannot write a cache is a worker
-            # that does slightly more work, not a broken one. Common enough to say plainly —
-            # a hardened systemd unit without a CacheDirectory= lands exactly here.
+            # that does slightly more work, not a broken one.
+            #
+            # It is worth naming the cause, though. This warning was seen in the wild and
+            # read as a permissions mistake on the machine, when what it meant was that the
+            # unit had no CacheDirectory= and the script had therefore fallen back to a home
+            # directory that ProtectHome= seals off. Nothing about the message said so, and
+            # the cost — every video downloaded twice — is invisible from anywhere else.
             log(f"warning: no cache at {self.directory} ({error}); every import will be downloaded")
+            if os.environ.get("INVOCATION_ID") and not os.environ.get("CACHE_DIRECTORY"):
+                log("  this service has no CacheDirectory=; re-run "
+                    "'music-radio-worker install' to rewrite the unit")
             self.directory = None
 
     @property
@@ -527,17 +535,54 @@ class Cache:
                 f"of {self.max_bytes / 1024 / 1024:.0f} MB")
 
 
+def systemd_directory(variable: str) -> str:
+    """
+    A directory systemd made for this service, if it made one.
+
+    `RuntimeDirectory=` and `CacheDirectory=` in the unit each create a directory owned by
+    the service account and name it in the environment — already including the unit's own
+    subdirectory, so nothing is appended to what comes back. The value is colon-separated
+    when a unit asks for several; ours ask for one apiece.
+
+    Reading these rather than writing the paths into worker.env is deliberate: the unit is
+    what decides where a hardened service may write, so the unit should be the one place
+    that says. It also means an existing installation is fixed by the new script alone,
+    with no need to re-run `install`.
+    """
+    value = os.environ.get(variable, "")
+
+    return value.split(":")[0] if value else ""
+
+
 def default_cache_dir() -> str:
     """
     Where a cache lives when nobody says otherwise.
 
-    The XDG location, which is what a person running this from a shell expects. The systemd
-    unit overrides it with a `CacheDirectory=`, because that unit forbids writing to a home
-    directory — and the worker's account has not got one anyway.
+    `CacheDirectory=` first, because under the system unit it is the only writable place
+    that outlives a job: `ProtectHome=true` seals off home directories, and the service
+    account has not got one anyway. Without this the cache silently fell back to
+    `~/.cache`, was refused, and every import downloaded again — which is a slow, expensive
+    failure that looks exactly like a working worker.
+
+    Otherwise the XDG location, which is what somebody running this from a shell expects.
     """
+    runtime = systemd_directory("CACHE_DIRECTORY")
+    if runtime:
+        return runtime
+
     base = os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
 
     return os.path.join(base, "music-radio-worker")
+
+
+def default_work_dir() -> str:
+    """
+    Where downloads land, when nobody says otherwise.
+
+    `RuntimeDirectory=` for the same reason, and empty when there is none — which leaves
+    {@see tempfile} to pick, as it did before.
+    """
+    return systemd_directory("RUNTIME_DIRECTORY")
 
 
 def audio_fingerprint(argv: list[str]) -> str:
@@ -580,8 +625,6 @@ class Layout:
             self.state_dir = "/var/lib/music-radio-worker"
             self.unit_dir = "/etc/systemd/system"
             self.service_user: str | None = self.SERVICE_USER
-            self.work_dir = "/run/music-radio-worker"
-            self.cache_dir = "/var/cache/music-radio-worker"
             self.wanted_by = "multi-user.target"
         else:
             home = os.path.expanduser("~")
@@ -595,8 +638,6 @@ class Layout:
             # A user unit runs as the person who owns it; naming an account would be an
             # error rather than a restriction.
             self.service_user = None
-            self.work_dir = ""
-            self.cache_dir = ""
             self.wanted_by = "default.target"
 
     @property
@@ -963,11 +1004,16 @@ LockPersonality=true
 
 # Downloads land here, and nowhere else is writable. Cleared when the service stops, so a
 # worker killed mid-job leaves nothing behind.
+#
+# Both of these are found by the script through the $RUNTIME_DIRECTORY and $CACHE_DIRECTORY
+# systemd sets from them — it does not have the paths written down anywhere. Renaming
+# either here is therefore enough; there is no second place to keep in step.
 RuntimeDirectory=music-radio-worker
 
 # Finished audio is kept between jobs, so the same video imported twice is downloaded once.
 # ProtectHome above means the default location under ~/.cache would not be writable, and
-# the service account has no home anyway.
+# the service account has no home anyway — so without CacheDirectory the worker would fall
+# back to a path it is refused, log one warning, and quietly download everything twice.
 # Empty it with: systemctl clean --what=cache music-radio-worker
 CacheDirectory=music-radio-worker
 
@@ -2448,8 +2494,10 @@ def parse_args(argv: list[str]):
     parser.add_argument("--poll-interval", type=float,
                         default=float(os.environ.get("MUSIC_RADIO_POLL_INTERVAL", "5")),
                         help="seconds to wait when the queue is empty (default: 5)")
-    parser.add_argument("--work-dir", default=os.environ.get("MUSIC_RADIO_WORK_DIR", ""),
-                        help="where to download (default: the system temporary directory)")
+    parser.add_argument("--work-dir",
+                        default=os.environ.get("MUSIC_RADIO_WORK_DIR", "") or default_work_dir(),
+                        help="where to download (default: the service's runtime directory, "
+                             "or the system temporary directory)")
     parser.add_argument("--cache-dir", default=os.environ.get("MUSIC_RADIO_CACHE_DIR", ""),
                         help=f"where to keep finished audio (default: {default_cache_dir()})")
     parser.add_argument("--cache-max-mb", type=int,
