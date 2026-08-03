@@ -551,3 +551,129 @@ test('a visitor sees only their own imports, and no user ids', async ({ page, br
 		await context.close()
 	}
 })
+
+// -------------------------------------------- still there when somebody presses play
+
+/*
+ * An imported track has to survive being played, and for a while it did not.
+ *
+ * `added_by` is a credit, not an address. What the server downloads goes into the *channel
+ * owner's* music folder against the owner's quota, whoever asked for it — but the row is
+ * credited to whoever pasted the link, which is a contributor's user id or a visitor key
+ * that is not an account at all. Every path that read the file back looked for it in
+ * `getUserFolder(added_by)` and found nothing, and nothing is how the streaming path is told
+ * a file has been deleted: the track was flagged unavailable and shown as "File missing",
+ * minutes after being added, with the file sitting in the owner's Files perfectly readable.
+ *
+ * Both of these therefore *play* the track rather than stopping at the playlist, because
+ * playing it is what used to break it — and then check the row, because the damage the fault
+ * did was permanent.
+ */
+
+const LISTENER_USER = process.env.MUSIC_RADIO_LISTENER_USER || 'listener'
+const LISTENER_PASS = process.env.MUSIC_RADIO_LISTENER_PASSWORD || 'Tr4ck-Sh4re-Dev!2026'
+
+/** LISTEN | ADD_TRACKS: may put music on, may not decide what plays. */
+const CONTRIBUTOR = 3
+
+/** The one track on this channel, once the import has filed it. */
+async function onlyTrack(page: Page) {
+	await expect.poll(async () => (await api(page, 'GET', `${API}/channels/${channelId}/tracks`)).body.tracks.length,
+		{ timeout: 45_000 }).toBe(1)
+
+	return (await api(page, 'GET', `${API}/channels/${channelId}/tracks`)).body.tracks[0]
+}
+
+/**
+ * Ask for the track's audio as the owner and report what the server said.
+ *
+ * Deliberately not the programme endpoint: that one skips a track it cannot read and still
+ * answers 200 with the rest, so it would go green on exactly the fault this is about.
+ */
+async function playStatus(page: Page, trackId: number): Promise<number> {
+	return await page.evaluate(async (url) => {
+		const response = await fetch(url)
+		// Drained rather than abandoned, so nothing is left holding a PHP worker.
+		await response.arrayBuffer()
+
+		return response.status
+	}, `${API}/channels/${channelId}/tracks/${trackId}/stream`)
+}
+
+test('a track a visitor imported through a link plays, and stays on the channel', async ({ page, browser, db }) => {
+	await page.goto(APP_PATH)
+	const token = await linkAllowing(page, { allowImport: true, requireApproval: false })
+
+	const { context, visitor } = await visitorOn(browser, token)
+	try {
+		expect((await importAs(visitor, token, 'stubOKLINK7')).status).toBe(202)
+		await waitForStatus(page, 'done')
+
+		const track = await onlyTrack(page)
+		expect(track.addedBy).toMatch(/^\?link:/)
+
+		expect(await playStatus(page, track.id), 'the owner can play what the link put on').toBe(200)
+		// And the row was not written off on the way: that flag is permanent until somebody
+		// clears it, so playing a track once was enough to lose it for good.
+		const rows = await db.query<Array<{ unavailable: number }>>(
+			'select unavailable from oc_music_radio_tracks where id = ?', [track.id],
+		)
+		expect(Number(rows[0].unavailable), 'not written off as missing').toBe(0)
+	} finally {
+		await visitor.close()
+		await context.close()
+	}
+})
+
+test('a track a contributor imported plays, and stays on the channel', async ({ page, browser, db }) => {
+	await page.goto(APP_PATH)
+
+	// Shared with a person, as a contributor: they may add music to somebody else's channel.
+	const share = await api(page, 'POST', `${API}/channels/${channelId}/shares`, {
+		shareType: 0,
+		receiver: LISTENER_USER,
+		permissions: CONTRIBUTOR,
+	})
+	expect(share.status).toBe(201)
+
+	// Importing is a switch of its own on top of being allowed to add at all — it spends the
+	// owner's storage and their server's time, so it is never on by default.
+	expect((await api(page, 'PUT', `${API}/channels/${channelId}/shares/${share.body.id}`, {
+		permissions: CONTRIBUTOR,
+		allowImport: true,
+		requireApproval: false,
+	})).status).toBe(200)
+
+	const context = await browser.newContext({ ignoreHTTPSErrors: true, storageState: undefined })
+	const contributor = await context.newPage()
+	try {
+		await contributor.goto('/index.php/login', { waitUntil: 'domcontentloaded' })
+		await contributor.locator('input[name="user"]').waitFor({ state: 'visible', timeout: 30_000 })
+		await contributor.fill('input[name="user"]', LISTENER_USER)
+		await contributor.fill('input[name="password"]', LISTENER_PASS)
+		await Promise.all([
+			contributor.waitForURL((url) => !url.pathname.replace(/\/index\.php/, '').startsWith('/login'), { timeout: 30_000 }),
+			contributor.locator('button[type="submit"], [data-login-form-submit]').first().click(),
+		])
+
+		expect((await api(contributor, 'POST', `${API}/channels/${channelId}/imports`, { url: link('stubOKUSER1') })).status)
+			.toBe(202)
+
+		await waitForStatus(page, 'done')
+
+		const track = await onlyTrack(page)
+		// Their name on it, the owner's folder holding it — which is the whole point.
+		expect(track.addedBy).toBe(LISTENER_USER)
+
+		expect(await playStatus(page, track.id), 'the owner can play what the contributor added').toBe(200)
+		// And the row was not written off on the way: that flag is permanent until somebody
+		// clears it, so playing a track once was enough to lose it for good.
+		const rows = await db.query<Array<{ unavailable: number }>>(
+			'select unavailable from oc_music_radio_tracks where id = ?', [track.id],
+		)
+		expect(Number(rows[0].unavailable), 'not written off as missing').toBe(0)
+	} finally {
+		await contributor.close()
+		await context.close()
+	}
+})

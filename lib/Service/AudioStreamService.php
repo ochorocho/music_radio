@@ -14,7 +14,6 @@ use OCA\MusicRadio\Exception\NotFoundException;
 use OCA\MusicRadio\Http\AudioStreamResponse;
 use OCA\MusicRadio\Http\ByteRange;
 use OCP\Files\File;
-use OCP\Files\IRootFolder;
 use OCP\IRequest;
 use OCP\ISession;
 use Psr\Log\LoggerInterface;
@@ -29,7 +28,7 @@ class AudioStreamService {
 
 	public function __construct(
 		private TrackService $trackService,
-		private IRootFolder $rootFolder,
+		private TrackFiles $files,
 		private ISession $session,
 		private LoggerInterface $logger,
 	) {
@@ -49,10 +48,10 @@ class AudioStreamService {
 	/**
 	 * Resolve the file behind a track.
 	 *
-	 * The file id comes from our own row, never from the request, and is looked up
-	 * inside the folder of the user who added the track — so this cannot be steered at
-	 * arbitrary files by tampering with a URL. The track id in the URL is validated
-	 * against the channel before we ever get here.
+	 * The file id comes from our own row, never from the request, and is looked up inside
+	 * the storages that row could legitimately name — see {@see TrackFiles} — so this cannot
+	 * be steered at arbitrary files by tampering with a URL. The track id in the URL is
+	 * validated against the channel before we ever get here.
 	 *
 	 * @throws NotFoundException
 	 */
@@ -61,24 +60,9 @@ class AudioStreamService {
 			throw new NotFoundException('This track is no longer available');
 		}
 
-		try {
-			$userFolder = $this->rootFolder->getUserFolder($track->getAddedBy());
-			$nodes = $userFolder->getById($track->getFileId());
-		} catch (\Throwable $e) {
-			// Anything at all here — the storage is unreachable, the owner's account is
-			// gone, the id no longer resolves — means the track cannot be played.
-			$this->logger->warning('Could not open the storage holding a track', [
-				'app' => 'music_radio',
-				'trackId' => $track->getId(),
-				'exception' => $e,
-			]);
-			$nodes = [];
-		}
-
-		foreach ($nodes as $node) {
-			if ($node instanceof File && $node->isReadable()) {
-				return $node;
-			}
+		$file = $this->files->resolve($channel, $track);
+		if ($file !== null) {
+			return $file;
 		}
 
 		// The file was deleted, moved out of reach, or the owner's account is gone.

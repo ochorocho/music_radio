@@ -9,12 +9,10 @@ declare(strict_types=1);
 namespace OCA\MusicRadio\Command;
 
 use OCA\MusicRadio\Db\ChannelMapper;
-use OCA\MusicRadio\Db\Track;
 use OCA\MusicRadio\Db\TrackMapper;
 use OCA\MusicRadio\Exception\MusicRadioException;
 use OCA\MusicRadio\Service\BroadcastLibrary;
-use OCP\Files\File;
-use OCP\Files\IRootFolder;
+use OCA\MusicRadio\Service\TrackFiles;
 use Symfony\Component\Console\Command\Command;
 use Symfony\Component\Console\Input\InputArgument;
 use Symfony\Component\Console\Input\InputInterface;
@@ -35,7 +33,7 @@ class BroadcastBuild extends Command {
 		private BroadcastLibrary $library,
 		private TrackMapper $trackMapper,
 		private ChannelMapper $channelMapper,
-		private IRootFolder $rootFolder,
+		private TrackFiles $files,
 	) {
 		parent::__construct();
 	}
@@ -87,7 +85,7 @@ class BroadcastBuild extends Command {
 					continue;
 				}
 
-				$source = $this->sourceOf($track);
+				$source = $this->files->resolve($channel, $track);
 				if ($source === null) {
 					$output->writeln('  <comment>no file: ' . $track->getTitle() . '</comment>');
 					$missing++;
@@ -124,26 +122,5 @@ class BroadcastBuild extends Command {
 		));
 
 		return $failed > 0 ? Command::FAILURE : Command::SUCCESS;
-	}
-
-	/**
-	 * The file behind a track, looked up in the folder of whoever added it — the same rule
-	 * {@see \OCA\MusicRadio\Service\AudioStreamService} resolves by, so this cannot reach a
-	 * file the broadcast could not.
-	 */
-	private function sourceOf(Track $track): ?File {
-		try {
-			$folder = $this->rootFolder->getUserFolder($track->getAddedBy());
-			foreach ($folder->getById($track->getFileId()) as $node) {
-				if ($node instanceof File && $node->isReadable()) {
-					return $node;
-				}
-			}
-		} catch (\Throwable) {
-			// An owner whose account has gone, or storage that is unreachable. Reported by
-			// the caller as "no file" either way.
-		}
-
-		return null;
 	}
 }

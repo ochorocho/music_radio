@@ -14,7 +14,6 @@ use OCA\MusicRadio\Db\TrackMapper;
 use OCA\MusicRadio\Http\ProgrammeSpan;
 use OCA\MusicRadio\Http\ProgrammeStreamResponse;
 use OCP\Files\File;
-use OCP\Files\IRootFolder;
 use OCP\ISession;
 use Psr\Log\LoggerInterface;
 
@@ -79,7 +78,7 @@ class ProgrammeStreamService {
 		// TimelineService is used only through its static helpers — locate(), durations(),
 		// wrap() — so there is nothing to inject.
 		private BroadcastLibrary $library,
-		private IRootFolder $rootFolder,
+		private TrackFiles $files,
 		private ISession $session,
 		private LoggerInterface $logger,
 	) {
@@ -281,7 +280,7 @@ class ProgrammeStreamService {
 	 * and far better than failing the whole request over one bad row.
 	 */
 	private function spanFor(Channel $channel, Track $track, int $offsetMs, int &$buildsLeft): ?ProgrammeSpan {
-		$source = $this->sourceOf($track);
+		$source = $this->sourceOf($channel, $track);
 		if ($source === null) {
 			// Its file has gone. Flagging it is what lets the *next* request past this
 			// point: the timeline stops counting it, so positions after it shift back by
@@ -408,26 +407,15 @@ class ProgrammeStreamService {
 	}
 
 	/**
-	 * The file behind a track, in the folder of whoever added it — the same resolution
+	 * The file behind a track — {@see TrackFiles}, the same resolution
 	 * {@see AudioStreamService} uses, so this can reach nothing the per-track stream could
 	 * not.
 	 */
-	private function sourceOf(Track $track): ?File {
+	private function sourceOf(Channel $channel, Track $track): ?File {
 		if ($track->getUnavailable()) {
 			return null;
 		}
 
-		try {
-			$folder = $this->rootFolder->getUserFolder($track->getAddedBy());
-			foreach ($folder->getById($track->getFileId()) as $node) {
-				if ($node instanceof File && $node->isReadable()) {
-					return $node;
-				}
-			}
-		} catch (\Throwable) {
-			// Storage unreachable, or the owner's account gone.
-		}
-
-		return null;
+		return $this->files->resolve($channel, $track);
 	}
 }

@@ -8,12 +8,12 @@ declare(strict_types=1);
 
 namespace OCA\MusicRadio\BackgroundJob;
 
+use OCA\MusicRadio\Db\ChannelMapper;
 use OCA\MusicRadio\Db\TrackMapper;
 use OCA\MusicRadio\Service\BroadcastLibrary;
+use OCA\MusicRadio\Service\TrackFiles;
 use OCP\AppFramework\Utility\ITimeFactory;
 use OCP\BackgroundJob\QueuedJob;
-use OCP\Files\File;
-use OCP\Files\IRootFolder;
 use Psr\Log\LoggerInterface;
 
 /**
@@ -42,8 +42,9 @@ class PrepareBroadcastJob extends QueuedJob {
 	public function __construct(
 		ITimeFactory $time,
 		private TrackMapper $trackMapper,
+		private ChannelMapper $channelMapper,
 		private BroadcastLibrary $library,
-		private IRootFolder $rootFolder,
+		private TrackFiles $files,
 		private LoggerInterface $logger,
 	) {
 		parent::__construct($time);
@@ -65,6 +66,9 @@ class PrepareBroadcastJob extends QueuedJob {
 		}
 
 		try {
+			// The channel as well as the track: where a track's file lives depends on whose
+			// channel it is on — see TrackFiles.
+			$channel = $this->channelMapper->find($channelId);
 			// Scoped to its channel, which is how the mapper reads a track anywhere else.
 			$track = $this->trackMapper->find($trackId, $channelId);
 		} catch (\Throwable) {
@@ -72,7 +76,7 @@ class PrepareBroadcastJob extends QueuedJob {
 			return;
 		}
 
-		$source = $this->sourceOf($track->getAddedBy(), $track->getFileId());
+		$source = $this->files->resolve($channel, $track);
 		if ($source === null) {
 			// Said out loud, quietly.
 			//
@@ -103,24 +107,5 @@ class PrepareBroadcastJob extends QueuedJob {
 				'exception' => $e,
 			]);
 		}
-	}
-
-	private function sourceOf(?string $userId, ?int $fileId): ?File {
-		if ($userId === null || $fileId === null) {
-			return null;
-		}
-
-		try {
-			$folder = $this->rootFolder->getUserFolder($userId);
-			foreach ($folder->getById($fileId) as $node) {
-				if ($node instanceof File && $node->isReadable()) {
-					return $node;
-				}
-			}
-		} catch (\Throwable) {
-			// Storage unreachable, or the account is gone.
-		}
-
-		return null;
 	}
 }

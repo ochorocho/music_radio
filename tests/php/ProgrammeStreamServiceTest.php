@@ -13,6 +13,7 @@ use OCA\MusicRadio\Db\Track;
 use OCA\MusicRadio\Db\TrackMapper;
 use OCA\MusicRadio\Service\BroadcastLibrary;
 use OCA\MusicRadio\Service\ProgrammeStreamService;
+use OCA\MusicRadio\Service\TrackFiles;
 use OCA\MusicRadio\Service\TrackService;
 use OCP\Files\File;
 use OCP\Files\Folder;
@@ -20,6 +21,7 @@ use OCP\Files\IRootFolder;
 use OCP\ISession;
 use PHPUnit\Framework\TestCase;
 use Psr\Log\LoggerInterface;
+use Psr\Log\NullLogger;
 
 /**
  * Composing a stretch of programme out of prepared copies.
@@ -103,6 +105,9 @@ class ProgrammeStreamServiceTest extends TestCase {
 	private static function channel(bool $loop = true): Channel {
 		$channel = new Channel();
 		$channel->setId(7);
+		// The same account the tracks are credited to, so resolving a file opens exactly one
+		// storage — see TrackFilesTest for the cases where those two come apart.
+		$channel->setUserId('alice');
 		$channel->setLoopEnabled($loop);
 		$channel->setShuffle(false);
 		$channel->setAllowVoting(false);
@@ -153,7 +158,9 @@ class ProgrammeStreamServiceTest extends TestCase {
 			$mapper,
 			$this->trackService,
 			$library,
-			$rootFolder,
+			// The real resolver over a mocked root folder: which storage a track is looked up
+			// in is its own decision, and one this test has no business restating.
+			new TrackFiles($rootFolder, new NullLogger()),
 			$this->createMock(ISession::class),
 			$this->createMock(LoggerInterface::class),
 		);
