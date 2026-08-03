@@ -404,7 +404,17 @@ export default {
 				// tuning in. The unlock happens on the play() call itself, not on its
 				// resolution, so giving up early costs nothing.
 				await Promise.race([
-					audio.play().catch(() => {}),
+					// Still swallowed — a refused unlock must not reject the race or hold up
+					// tuning in — but counted. This is the call that decides whether the rest
+					// of the session can start audio on its own, so when it is refused the
+					// diagnostics panel is the only place that can say so; reporting 0
+					// refusals while the listener is looking at a "Tap to play" button sends
+					// whoever reads it looking in the wrong place.
+					audio.play().catch((error) => {
+						if (error?.name === 'NotAllowedError') {
+							this.playRefusals++
+						}
+					}),
 					new Promise((resolve) => setTimeout(resolve, 1000)),
 				])
 				audio.pause()

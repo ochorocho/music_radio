@@ -116,8 +116,11 @@
 			@toggle-disabled="onToggleDisabled"
 			@approve="onApprove" />
 
+		<!-- Always mounted, and hidden from the inside when there is nothing to play. It
+		     owns the <audio> element, which has to outlive any one preview so that the
+		     browser keeps letting it play; see PreviewPlayer. -->
 		<PreviewPlayer
-			v-if="previewTrack"
+			ref="preview"
 			:channel-id="channel.id"
 			:track="previewTrack"
 			@close="previewTrack = null" />
@@ -653,7 +656,19 @@ export default {
 			if (this.tunedIn) {
 				return
 			}
-			this.previewTrack = this.previewTrack?.id === track.id ? null : track
+
+			if (this.previewTrack?.id === track.id) {
+				this.previewTrack = null
+				return
+			}
+
+			this.previewTrack = track
+
+			// Started from here, synchronously, because this method *is* the click.
+			// Leaving it to an `autoplay` attribute meant the browser saw a request from
+			// no one in particular and refused it, which on a phone read as the first tap
+			// doing nothing. Same reason the tune-in watcher runs with `flush: 'sync'`.
+			this.$refs.preview?.play(track)
 		},
 
 		/**

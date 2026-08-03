@@ -854,10 +854,21 @@ export default {
 	cursor: pointer;
 }
 
-.music-radio-onair__diagnostics-toggle:hover,
+/* Keyboard focus is not a pointer and always gets the change. Hover is gated for the
+   same reason as the playlist grip: on a touch screen a first tap that repaints is a
+   first tap that does not click. This one only drops an underline, which is far less
+   likely to trip WebKit than a reveal, but there is no reason for it to be the one
+   place still asking. */
 .music-radio-onair__diagnostics-toggle:focus-visible {
 	background: none;
 	text-decoration: none;
+}
+
+@media (hover: hover) and (pointer: fine) {
+	.music-radio-onair__diagnostics-toggle:hover {
+		background: none;
+		text-decoration: none;
+	}
 }
 
 .music-radio-onair__diagnostics {

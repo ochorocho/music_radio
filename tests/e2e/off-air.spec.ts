@@ -149,7 +149,9 @@ test('a track can be played privately while not tuned in', async ({ page }) => {
 	await openChannel(page, channelTitle)
 	await expect(page.getByTestId('off-air-status')).toBeVisible({ timeout: 20_000 })
 
-	await expect(page.getByTestId('preview-player')).toHaveCount(0)
+	// Hidden rather than absent: the bar stays mounted so its <audio> element outlives
+	// each preview, which is what lets a phone start one from the tap that asks for it.
+	await expect(page.getByTestId('preview-player')).toBeHidden()
 
 	await openRowMenu(page, 0)
 	await page.getByTestId('preview-track').click()
@@ -163,6 +165,14 @@ test('a track can be played privately while not tuned in', async ({ page }) => {
 	await expect
 		.poll(async () => await audio.evaluate((el: HTMLAudioElement) => el.duration), { timeout: 20_000 })
 		.toBeGreaterThan(2.5)
+
+	// And it starts on its own, with nothing else pressed. This used to rest on an
+	// `autoplay` attribute on an element built a tick after the click, which iOS refuses
+	// — leaving the native play control to be pressed as a second tap. It is now a
+	// play() call made inside the click itself.
+	await expect
+		.poll(async () => await audio.evaluate((el: HTMLAudioElement) => !el.paused), { timeout: 20_000 })
+		.toBe(true)
 
 	// And the channel is untouched: this is private listening, not a broadcast change.
 	const state = await api(page, 'GET', `${API}/channels/${channelId}/state`)
@@ -185,8 +195,9 @@ test('private playback stops as soon as the channel is tuned in', async ({ page 
 		.poll(async () => (await readSync(page)).tunedIn, { timeout: 30_000, intervals: [250] })
 		.toBe(true)
 
-	// The private player is gone…
-	await expect(page.getByTestId('preview-player')).toHaveCount(0)
+	// The private player is gone from view — the element stays, silent and empty, which
+	// the audible-count assertion below is what really pins down.
+	await expect(page.getByTestId('preview-player')).toBeHidden()
 
 	// …and exactly one thing ends up audible: the channel. Polled rather than sampled
 	// after a fixed wait, because the channel's audio has to load before it starts.
@@ -220,5 +231,11 @@ test('choosing the same track again stops private playback', async ({ page }) =>
 
 	await openRowMenu(page, 0)
 	await page.getByTestId('preview-track').click()
-	await expect(page.getByTestId('preview-player')).toHaveCount(0)
+	await expect(page.getByTestId('preview-player')).toBeHidden()
+
+	// Hiding the bar is not the point — stopping the sound is. The element is still
+	// there, so assert it actually let go of the track rather than merely going invisible.
+	const audio = page.getByTestId('preview-audio')
+	await expect(audio).not.toHaveAttribute('src', /stream/)
+	expect(await audio.evaluate((el: HTMLAudioElement) => el.paused)).toBe(true)
 })

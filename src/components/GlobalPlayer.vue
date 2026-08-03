@@ -129,8 +129,24 @@ export default {
 		},
 
 
+		/**
+		 * The listener pressed "Tune in".
+		 *
+		 * `flush: 'sync'` for the same reason as `resumeRequest` below: the click only
+		 * writes the channel to the store, and the audio element lives here, so this
+		 * watcher is the rest of the gesture. Deferred to the next tick — the default
+		 * `flush: 'pre'` queues it as a microtask — WebKit no longer counts it as one,
+		 * refuses the unlock, and the listener gets a "Tap to play" button to press
+		 * instead. That was the second tap.
+		 *
+		 * It works because an async function runs synchronously up to its first await:
+		 * `tuneIn` reaches `ensureAudioElement()` and then `unlock()`, whose own body
+		 * reaches `audio.play()` while still on the click's stack. Everything after
+		 * that first await — the clock burst, the state fetch — is unaffected.
+		 */
 		storeChannelId: {
 			immediate: true,
+			flush: 'sync',
 			async handler(next, previous) {
 				// Leaving one channel for another has to stop the first, or both would be
 				// audible at once.

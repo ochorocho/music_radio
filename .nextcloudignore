@@ -21,6 +21,7 @@ playwright-report/**
 test-results/**
 screenshots
 screenshots/**
+worker/**
 package.json
 package-lock.json
 tsconfig.json

@@ -21,11 +21,10 @@
 		@dragover.prevent="onDragOver"
 		@dragleave="dropEdge = null"
 		@drop.prevent="onDrop">
-		<!-- The grip is decoration: the row itself is the drag source, and reordering is
-		     also reachable from the actions menu for anyone not using a pointer. -->
-		<span v-if="canReorder" class="music-radio-track__grip" aria-hidden="true">
-			<DragIcon :size="20" />
-		</span>
+		<!-- There is deliberately no drag handle. The row itself is the drag source, so the
+		     handle only ever advertised that — and it cost a column of every row on a phone
+		     to say something the row already does. Reordering is still reachable from the
+		     actions menu for anyone not using a pointer. -->
 		<!-- Only someone who may drive the broadcast gets a button; for everyone else
 		     this column just shows the position, or a marker for what is on air. There
 		     is deliberately no private playback anywhere — one channel, one song.
@@ -160,7 +159,6 @@ import ArrowUpIcon from 'vue-material-design-icons/ArrowUp.vue'
 import CancelIcon from 'vue-material-design-icons/Cancel.vue'
 import CheckIcon from 'vue-material-design-icons/Check.vue'
 import DeleteIcon from 'vue-material-design-icons/Delete.vue'
-import DragIcon from 'vue-material-design-icons/Drag.vue'
 import HeadphonesIcon from 'vue-material-design-icons/Headphones.vue'
 import HeartIcon from 'vue-material-design-icons/Heart.vue'
 import HeartOutlineIcon from 'vue-material-design-icons/HeartOutline.vue'
@@ -182,7 +180,6 @@ export default {
 		CancelIcon,
 		CheckIcon,
 		DeleteIcon,
-		DragIcon,
 		HeadphonesIcon,
 		HeartIcon,
 		HeartOutlineIcon,
@@ -414,33 +411,20 @@ export default {
 	color: var(--color-text-maxcontrast);
 }
 
-.music-radio-track__grip {
-	flex: none;
-	display: flex;
-	align-items: center;
-	color: var(--color-text-maxcontrast);
-	cursor: grab;
-	opacity: 0;
-	transition: opacity 0.1s ease-in-out;
-}
+/* Nothing in a playlist row may change on :hover.
 
-.music-radio-track__grip:active {
-	cursor: grabbing;
-}
+   There used to be a drag handle here that faded in when the row was hovered, and that
+   one rule was enough to break every button in the row on a phone: WebKit spends the
+   first tap applying :hover whenever doing so changes what is drawn, and withholds the
+   click until a second tap. The handle is gone now, which settles it — but the shape of
+   the mistake is worth naming, because a reveal-on-hover control in a list row is an
+   ordinary thing to reach for. If one is ever wanted back, gate it behind
+   `@media (hover: hover) and (pointer: fine)`. tests/e2e/touch-taps.spec.ts checks. */
 
-/* The row is the drag source, not just the handle, so the closed hand has to follow the
-   whole drag rather than only the few pixels the pointer started on. */
-.music-radio-track--dragging,
-.music-radio-track--dragging .music-radio-track__grip {
-	cursor: grabbing;
-}
-
-.music-radio-track:hover .music-radio-track__grip,
-.music-radio-track:focus-within .music-radio-track__grip {
-	opacity: 1;
-}
-
+/* The row is the drag source, so the closed hand follows the whole drag rather than only
+   the few pixels a handle would have occupied. */
 .music-radio-track--dragging {
+	cursor: grabbing;
 	opacity: 0.4;
 }
 
